@@ -1,0 +1,23 @@
+# Ghidra project and the original binaries -- primary evidence, kept local.
+# The .rep database is live while Ghidra is open; committing it corrupts it.
+decomp/
+
+# Ghidra stray artifacts
+*.gpr
+*.rep/
+*.lock
+*.lock~
+*.gzf
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
