@@ -21,9 +21,9 @@ Preserving this property - composite HID, remapping below the application layer
 
 | Path | What it is |
 | --- | --- |
-| `decomp/wishk201.sys` | Kernel driver. x86 32-bit, image base `0x10000`, 187 functions. HID minidriver over USBD. |
-| `decomp/wishd201.exe` | Configurator / scripting UI. x86 32-bit, image base `0x400000`, 619 functions. |
-| `decomp/wishh201.dll` | System-wide `WH_SHELL` hook DLL for game-launch detection. x86 32-bit, image base `0x10000000`, 112 functions. |
+| `decomp/wishk201.sys` | Kernel driver. x86 32-bit, image base `0x10000`, 196 functions. HID minidriver over USBD. |
+| `decomp/wishd201.exe` | Configurator / scripting UI. x86 32-bit, image base `0x400000`, 683 functions. |
+| `decomp/wishh201.dll` | System-wide `WH_SHELL` hook DLL for game-launch detection. x86 32-bit, image base `0x10000000`, 137 functions. |
 | `decomp/adaptoid.gpr` + `adaptoid.rep/` | Ghidra project holding both binaries. |
 | `docs/` | Findings, as RFC-style ASCII `.txt`. |
 | `tools/` | Ghidra scripts and the documentation formatters. |

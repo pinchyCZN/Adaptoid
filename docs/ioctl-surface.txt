@@ -627,6 +627,25 @@ Table of Contents
    written by the native builtins at devext+0x1708, +0x170C and +0x1710 are
    used instead of the raw controller state and none of this scaling runs.
 
+   devext+0x1640 is a COUNTER, not a flag. drv_ScriptSchedulerDpc, recovered
+   at 00017910, brackets each call to drv_ScriptScheduler with it under the
+   device lock at devext+0x1644: increment before, decrement after. Both
+   guards are one-sided - the increment is skipped while the value is
+   negative, the decrement while it is non-positive.
+
+   drv_AddDevice INITIALISES THE FIELD TO -1, in the same instruction run
+   that registers the DPC:
+
+       0001242c   PUSH 0x17910                     ; KeInitializeDpc
+       00012432   MOV  [ESI + 0x1640], 0xffffffff
+
+   So the field starts latched negative and the DPC cannot lift it, because
+   the increment is exactly what the negative value suppresses. Something
+   else has to drive it non-negative before a script can own the stick, and
+   once negative again it stays there. A replacement should decide
+   deliberately whether to reproduce that latch or to treat the field as a
+   plain nesting count.
+
 8.  Consequences For The Replacement Driver
 
    -  The private channel is the real configuration contract. A

@@ -24,6 +24,7 @@ Abstract
 Table of Contents
 
    1.  Coverage
+   1.1.  The Gap Scan, And Why Symbol Counts Lie
    2.  Entry, PnP And Power
    3.  Dispatch Wrappers
    4.  The Control Device
@@ -40,13 +41,72 @@ Table of Contents
 
 1.  Coverage
 
-   Ghidra reports 187 functions. That count includes import thunks and
-   the two compiler helpers; the driver's own code accounts for about
-   138 of them. All are named.
+   Ghidra reports 196 functions. That count includes import thunks and the
+   two compiler helpers; the driver's own code accounts for about 147 of
+   them. All are named.
 
-   Getting there required creating 21 functions by hand from regions
-   Ghidra had left as orphaned instructions, chiefly the dispatch
-   wrappers, the accessory probe chain and the polling engine.
+   Getting there required creating 30 functions by hand. 21 came from regions
+   Ghidra had left as ORPHANED INSTRUCTIONS - chiefly the dispatch wrappers,
+   the accessory probe chain and the polling engine. The other nine came from
+   a later sweep described in section 1.1, and were a different problem: not
+   orphaned, but never disassembled at all.
+
+1.1.  The Gap Scan, And Why Symbol Counts Lie
+
+   A count of zero remaining FUN_ names does NOT mean a binary is fully
+   covered. It means everything Ghidra found has been named. Code Ghidra
+   never found is not counted, not named, and not missed.
+
+   The check that does work is to walk the executable blocks, skip over every
+   defined function body, and inspect what is left. Trim 0x90, 0xCC and 0x00
+   from both ends of each gap; whatever still has bytes in it is either data
+   or undiscovered code. Run against all three binaries after each had
+   reached zero FUN_, this found code every time:
+
+   +---------------+---------------+-----------+------------------------------+
+   | Binary        | Functions     | Recovered | What they were               |
+   +===============+===============+===========+==============================+
+   | wishh201.dll  | 112 -> 137    | 25        | stdio teardown chain,        |
+   |               |               |           | reached only through a       |
+   |               |               |           | .CRT$XP terminator slot      |
+   +---------------+---------------+-----------+------------------------------+
+   | wishk201.sys  | 187 -> 196    | 9         | IoCompletion, cancel and     |
+   |               |               |           | DPC routines, every one      |
+   |               |               |           | pointer-only                 |
+   +---------------+---------------+-----------+------------------------------+
+   | wishd201.exe  | 619 -> 683    | 64        | a whole dialog procedure,    |
+   |               |               |           | CRT stdio and SEH,           |
+   |               |               |           | static-guard stubs           |
+   +---------------+---------------+-----------+------------------------------+
+
+   THE COMMON CAUSE is that none of the recovered functions is ever the
+   target of a CALL. Each is reached through an address that is only ever
+   stored: a completion routine handed to IoSetCompletionRoutine, a cancel
+   routine handed to IoSetCancelRoutine, a DPC registered at AddDevice, a
+   dialog procedure handed to DialogBoxParamA, a terminator pointer sitting
+   in a NULL-bounded .CRT$XP table, a scope-table thunk named only in an
+   EXCEPTION_REGISTRATION record. Ghidra's recursive-descent disassembler
+   follows calls and jumps; it does not follow data.
+
+   TWO DISTINCT FAILURE MODES appeared, and they need different checks. In
+   wishk201.sys and wishd201.exe the bytes had been disassembled but not
+   gathered into functions, so a gap scan reports them as ORPHANED
+   INSTRUCTIONS. In wishh201.dll they had never been disassembled at all, so
+   there were no instructions to orphan and the same report said only
+   UNDEFINED BYTES. A scan that keys on orphaned instructions alone finds
+   nothing in the DLL.
+
+   The largest single recovery was cfg_GameBindingDlgProc at 0040e870 in
+   wishd201.exe - 1175 bytes, the whole dialog that binds a script to a game
+   executable, and the source of the game_exe, game_dir and game_name header
+   tags. It had been entirely absent from the analysis.
+
+   Most gap content is legitimately data and should stay that way: switch
+   jump tables, the L"\DosDevices\..." strings, the driver's
+   ExAllocatePoolWithTag tags (KeyFet, CdoIoc, HrrPend, PnpFdo, PolRst,
+   PwrFdo, PwrSelf, VenSub, VenCmp), the MSVC "VC20XC00" marker, and the C++
+   EH unwind funclets that belong to a neighbouring function rather than
+   standing alone.
 
 2.  Entry, PnP And Power
 
@@ -310,13 +370,15 @@ Table of Contents
    -  The eleven entries marked [I] above, where the name is an inference
       from call sites rather than a full reading of the body.
 
-   -  RESOLVED. wishd201.exe is now fully named: 619 functions, zero left as
-      FUN_. 269 carry a cfg_ prefix and are the application; the remainder
+   -  RESOLVED. wishd201.exe is now fully named: 683 functions, zero left as
+      FUN_. 270 carry a cfg_ prefix and are the application; the remainder
       are the statically linked MSVC 6 runtime, prefixed crt_, plus import
-      thunks. Nine functions were created by hand from regions Ghidra had
-      left as orphaned instructions - the two window procedures, two dialog
-      procedures, two worker threads and three atexit callbacks. The
-      architecture is written up in configurator-architecture.txt.
+      thunks. 73 functions were created by hand - nine from orphaned
+      instructions (the two window procedures, two dialog procedures, two
+      worker threads and three atexit callbacks) and a further 64 from the
+      gap scan in section 1.1, among them a THIRD dialog procedure,
+      cfg_GameBindingDlgProc. The architecture is written up in
+      configurator-architecture.txt.
 
    -  wishh201.dll, a THIRD binary. wishd201.exe loads it by name and
       resolves five exports from it for game-launch detection. It is not
