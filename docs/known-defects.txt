@@ -7,10 +7,10 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Three arithmetic defects have been found in wishk201.sys during
-   reverse engineering. This note records each one, the exact condition
-   that triggers it, what it would actually do, and whether a user would
-   be likely to notice.
+   Four defects have been found during reverse engineering: three
+   arithmetic ones in wishk201.sys, and a race in wishh201.dll. This note
+   records each one, the exact condition that triggers it, what it would
+   actually do, and whether a user would be likely to notice.
 
    The purpose is not to criticise a driver that shipped in 2001 and
    worked. It is to stop a clean-room replacement from faithfully
@@ -29,7 +29,8 @@ Table of Contents
    2.  Defect 1: Button Map Filler Entries
    3.  Defect 2: Cross-Coupled Stick Acceleration
    4.  Defect 3: Swapped Sine Interpolation Weights
-   5.  What Is Not Affected
+   5.  Defect 4: Race On The Launch-Detection Path Buffer
+   6.  What Is Not Affected
 
 1.  Severity Summary
 
@@ -40,6 +41,8 @@ Table of Contents
        stick acceleration         joystick report  YES
        sine interpolation         effect engine    only if an effect
                                                    slot is running
+       launch-detection race      wishh201.dll     only with Detect
+                                                   Game Launches on
 
 2.  Defect 1: Button Map Filler Entries
 
@@ -160,7 +163,43 @@ Table of Contents
    For a replacement: implement the interpolation correctly. Nothing
    should depend on the sawtooth.
 
-5.  What Is Not Affected
+5.  Defect 4: Race On The Launch-Detection Path Buffer
+
+   Location:  wishh201.dll hook_ShellProc at 10001000
+              the shared buffer hook_g_szLastModulePath at 10005008
+
+   On HSHELL_WINDOWCREATED the hook posts its notification to the
+   configurator FIRST, and only then writes the launching process's image
+   path into a buffer in the DLL's shared .sdata section. There is exactly
+   one such buffer for the whole system, and the configurator reads it
+   asynchronously through GetInfo when it gets round to processing message
+   0x47B.
+
+   Trigger: two processes creating their first window close enough together
+   that the second hook invocation overwrites the buffer before the
+   configurator has drained the first message.
+
+   Effect: the configurator reads the wrong image path. It either activates
+   the script bound to the wrong game, or finds no match at all and logs
+   "Launch detection failed to retrieve...".
+
+   Would it be noticed? Only with DetectGameLaunches enabled, and only when
+   two applications start at once - a login, or a game started through a
+   launcher process. The visible symptom is a profile that silently fails to
+   switch, which a user would retry rather than report.
+
+   Unlike the other three, this one is NOT arithmetic and NOT in the driver.
+   It is a design choice in the smallest of the three binaries.
+
+   For a replacement: do not reproduce it. The path belongs in the message,
+   not beside it - posting a copy, or using WM_COPYDATA, removes the shared
+   buffer entirely. Better still, a modern replacement should not use a
+   global WH_SHELL hook at all. A WMI __InstanceCreationEvent subscription on
+   Win32_Process, or an ETW process-start session, delivers the image path
+   atomically with the event and needs no DLL injected into every process on
+   the machine.
+
+6.  What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original

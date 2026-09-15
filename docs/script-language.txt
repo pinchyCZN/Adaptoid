@@ -30,7 +30,45 @@ Table of Contents
    6.  Operators And Punctuation
    7.  Declarations And Storage
    8.  Rejected Constructs
-   9.  Program Structure
+   8.1. Two Forms The DFA Could Not Show
+   8.1.  Two Forms The DFA Could Not Show
+
+   Reconstructing the scanner gives the token set but not how tokens are
+   used. The sample scripts shipped in the install directory settle two
+   constructs that matter.
+
+   CHARACTER LITERALS CARRY KEY NAMES. A character constant is not limited
+   to one character, and its contents are looked up in the key-name table:
+
+       _key('f',p);
+       _key('down',p);
+       _key('shift',1);
+
+   cfg_yylex resolves these at scan time by calling cfg_KeyNameToCode
+   (wishd201.exe 00413550), which walks the 8-byte-stride table at 00422340
+   and accepts a terminator of either NUL or a single quote. So 'down',
+   'shift', 'alt', 'left' and the rest are ordinary multi-character constants
+   that the scanner maps to HID usages. A single character such as 'f' falls
+   through the same table.
+
+   HANDLERS ARE VARIABLES, AND ARE BOUND BY A DECLARATION INITIALISER.
+   The form is
+
+       int on_b(p) = action_nothing;
+
+   which is a declaration with a parameter list AND an initialiser - not
+   legal C, and a deliberate extension. It stores a tagged code address into
+   the handler's variable slot, which is exactly what drv_ScriptDispatchInput
+   reads back out of the script's variable array. See script-bytecode.txt
+   section 6.5.1.
+
+   Handler bodies are therefore ordinary functions with ordinary names, and
+   the reserved on_* names are the variables that point at them. The
+   configurator recognises three naming conventions for the bodies -
+   action_*, button_* and stick_* - which is how it decides what to show in
+   the UI; see cfg_ScriptHandlerScan.
+
+9.  Program Structure
    10. Worked Example
    11. Open Questions
 
@@ -262,6 +300,7 @@ Table of Contents
       from the grammar at all, or are dead lexical baggage from the
       stock C scanner.
 
-   -  Whether functions may take parameters and return values in
-      practice. The grammar has the productions and the call opcodes
-      exist; no sample exercises them.
+   -  RESOLVED. Functions do take parameters and return values in practice.
+      Every handler body takes a press-state parameter, as in
+      action_Fire(p), and the shipped Relative Mouse scripts use
+      "if (tid = _fork())" and bare "return;" freely.

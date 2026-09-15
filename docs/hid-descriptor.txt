@@ -27,7 +27,15 @@ Table of Contents
 
    1.  Driver Role
    2.  Descriptor Storage
-   3.  Descriptor Selection
+      CORROBORATION. The install directory ships three files, RPD1.bin, RPD2.bin
+   and RPD3.bin, of 185, 64 and 128 bytes. Their contents are byte-for-byte
+   the three descriptors above: RPD1 is the 185-byte Mouse + Keyboard +
+   Joystick, RPD2 the 64-byte Joystick-only, and RPD3 the Mouse + Keyboard,
+   whose 121 descriptor bytes are padded with seven trailing zeroes to 128.
+   They are an independent check on the reading above and on the lengths in
+   the selection table.
+
+3.  Descriptor Selection
    4.  Descriptor A: Mouse + Keyboard + Joystick
    5.  Report Layouts
    6.  Device Identity

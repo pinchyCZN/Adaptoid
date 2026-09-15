@@ -21,8 +21,9 @@ Preserving this property - composite HID, remapping below the application layer
 
 | Path | What it is |
 | --- | --- |
-| `decomp/wishk201.sys` | Kernel driver. x86 32-bit, image base `0x10000`, 163 functions. HID minidriver over USBD. |
-| `decomp/wishd201.exe` | Configurator / scripting UI. x86 32-bit, image base `0x400000`, 610 functions. |
+| `decomp/wishk201.sys` | Kernel driver. x86 32-bit, image base `0x10000`, 187 functions. HID minidriver over USBD. |
+| `decomp/wishd201.exe` | Configurator / scripting UI. x86 32-bit, image base `0x400000`, 619 functions. |
+| `decomp/wishh201.dll` | System-wide `WH_SHELL` hook DLL for game-launch detection. x86 32-bit, image base `0x10000000`, 112 functions. |
 | `decomp/adaptoid.gpr` + `adaptoid.rep/` | Ghidra project holding both binaries. |
 | `docs/` | Findings, as RFC-style ASCII `.txt`. |
 | `tools/` | Ghidra scripts and the documentation formatters. |
@@ -49,8 +50,8 @@ Selector parameters, depending on the tool:
 | `source_program=` / `target_program=` | transfer/merge tools |
 | `program_a=` / `program_b=` | diff and compare tools |
 
-Valid values are exactly `"wishk201.sys"` (driver) and `"wishd201.exe"`
-(configurator).
+Valid values are exactly `"wishk201.sys"` (driver), `"wishd201.exe"`
+(configurator) and `"wishh201.dll"` (launch-detection hook).
 
 ### Why this is strict
 
@@ -75,8 +76,13 @@ consistent bug into an intermittent one. Pass the selector instead.
 | --- | --- |
 | `wishk201.sys` | `00010000`-`0001adff`, plus `ffdff000`-`ffdfffff` (`tdb`/KPCR block) |
 | `wishd201.exe` | `00400000`-`004a1ba4` |
+| `wishh201.dll` | `10000000`-`1000b5ff`, plus `ffdff000`-`ffdfffff` (`tdb` block) |
 
-Entry points are `000115f0` (driver) and `00416540` (configurator).
+Entry points are `000115f0` (driver), `00416540` (configurator) and
+`10001240` (hook DLL).
+
+Note that `wishk201.sys` and `wishh201.dll` both carry a `tdb` block at
+`ffdff000`; that range alone does not identify the binary.
 
 Use this as a free verification after every call: if addresses come back in the
 `004xxxxx` range from a driver query, or `0001xxxx` from a configurator query,

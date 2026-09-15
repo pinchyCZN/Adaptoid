@@ -229,9 +229,21 @@ Table of Contents
    drv_HidKeyEvent, drv_HidMouseButtonEvent and drv_HidMouseMoveEvent. Only
    types it does NOT recognise are queued to user mode at all.
 
-   INFERENCE: the three dead arms are vestigial, left from a design in which
-   injection was done in user mode before the composite HID descriptor
-   existed. Not established.
+   ESTABLISHED, no longer an inference. The change log in the shipped
+   _readme.txt for rev 2.0.0 says, in full:
+
+       * Keypress and mouse movement emulation moved from user mode to
+         kernel mode so it works in games which use DirectInput for their
+         keyboard or mouse input.
+       * Multithreading and timer capabilities added to script engine to
+         support relative mouse movement for FPS type games.
+
+   So the three arms are the 1.3.175 implementation, left in place when the
+   work moved into the driver. The sample scripts confirm the same split by
+   their dates and their own version tags: Sample Absolute Mouse.ac is dated
+   2001-01-05 and declares driver_version = 1.3.175, while the five Relative
+   Mouse scripts are dated 2001-07-21 and use the threading builtins that
+   2.0.0 introduced.
 
    The types that really do arrive:
 
@@ -246,12 +258,19 @@ Table of Contents
    |      | the interpreter status code in wParam.                        |
    | 0x4D | output of the _debug builtin. Posted as message 0x44D.        |
    | 99   | device interface state changed. Posts 0x40A to the hidden     |
-   |      | message window, which starts a device rescan.                 |
+   |      | message window, RECOGNISED AND DISCARDED; see below.          |
    +------+---------------------------------------------------------------+
 
    cfg_FormatDriverEvent renders every one of these as text for the debugging
    log, including all eleven interpreter status codes. It is the
    authoritative naming of those codes and it agrees with the driver.
+
+   CORRECTION on type 99. cfg_MessageWndProc tests "if (msg != 0x40A)" and
+   skips its whole body when the message IS 0x40A, returning 0 without
+   reaching DefWindowProc. So 0x40A is deliberately recognised and then
+   dropped: it does nothing in this build. Device rescan is driven instead by
+   WM_DEVICECHANGE (0x219), which the same procedure does handle, and by
+   message 0x40B, which calls cfg_CompleteDeviceRescan.
 
 7.  Driver Installation
 
@@ -326,16 +345,43 @@ Table of Contents
    switches every port to that game's script and cfg_DownloadAllProfiles
    pushes the compiled bytecode to the driver.
 
+   DEFECT, race on the shared buffer. The message is posted BEFORE the path
+   is written, and there is exactly one buffer for the whole system. Two
+   processes creating windows close together will have the second overwrite
+   the first before the configurator calls GetInfo. The configurator then
+   either activates the wrong game or fails to match and logs "Launch
+   detection failed to retrieve...". A wider buffer would not fix it; the
+   path has to travel with the message rather than beside it. See known-
+   defects.txt.
+
    The feature is gated on a registry value:
 
        HKLM\Software\Wish Technologies\Adaptoid
            DetectGameLaunches   REG_DWORD   0 or 1
 
-   INFERENCE: wishh201.dll is a SetWindowsHookEx-based DLL injected into
-   every process, since that is the only mechanism available in 2001 for
-   system-wide launch notification without a driver. Its export set is
-   consistent with that and with nothing else obvious. NOT ESTABLISHED: the
-   binary has not been examined, and it is not part of this project.
+   ESTABLISHED. The DLL has since been read. It is a WH_SHELL hook, and the
+   mechanism is smaller than the export list suggests.
+
+   InstallHook calls SetWindowsHookExA(WH_SHELL, hook_ShellProc, hinst, 0).
+   The final 0 is the thread id, which makes the hook global, so Windows maps
+   the DLL into every process that owns a message queue and runs the callback
+   THERE. hook_ShellProc handles exactly two notification codes:
+
+       HSHELL_WINDOWCREATED   (1)  PostMessage(target, 0x47B, hwnd, 1)
+                                   then GetModuleFileNameA(NULL, buf, 0x104)
+       HSHELL_WINDOWDESTROYED (2)  PostMessage(target, 0x47B, hwnd, 0)
+
+   and then chains with CallNextHookEx. Because the body runs inside the
+   target process, GetModuleFileNameA with a NULL module handle yields THAT
+   PROCESS'S OWN IMAGE PATH. There is no process enumeration and no toolhelp
+   snapshot anywhere in the product.
+
+   Three globals live in a .sdata section at 10005000, which is shared across
+   every mapping of the DLL: the hook handle, the target window, and a
+   0x104-byte path buffer. GetInfo simply returns the address of that buffer.
+   A shared section is what makes a system-wide hook usable at all, and it is
+   how the path written in one process is read by the configurator in
+   another.
 
 9.  Process And Thread Structure
 
@@ -416,12 +462,20 @@ Table of Contents
 
 11. Open Questions
 
-   - wishh201.dll itself. It is referenced by name and by five exports but is
-   not present in decomp/, so its mechanism is inferred, not read.
+   - RESOLVED. wishh201.dll has been read; see section 8.
 
    - The content of the 64-byte exchange behind control-device fn 0x802 and
    fn 0x803, which no configurator path appears to use.
 
-   - Whether game_prod is compared against the version-resource product name
-   at run time, or is purely informational. No comparison site was found.
+   -  Whether game_prod is compared against the version-resource product name
+      at run time, or is purely informational. No comparison site was found.
+
+   -  TWO FURTHER COMPONENTS are described in the shipped _readme.txt and are
+      not present in decomp/. A shell namespace extension that surfaces
+      Controller Pak contents as an "Adaptoid" folder under My Computer, with
+      its own .a64 hex-text export format and importers for 32768-byte raw
+      and 36928-byte DexDrive .n64 images. And a separate force-feedback or
+      "rumble" driver: the 1.1.63 change log describes removing the mempak
+      driver while leaving the rumble driver installed, so those are distinct
+      binaries from wishk201.sys.
 
