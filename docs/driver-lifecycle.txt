@@ -57,6 +57,10 @@ Table of Contents
 
 2.  AddDevice
 
+   The device extension this section describes is documented field by field
+   in driver-structures.txt, which also records how it hangs off
+   HID_DEVICE_EXTENSION rather than off the device object directly.
+
    drv_AddDevice at 0001236e zeroes a 0x1800-byte device extension and
    initialises the machinery the rest of the driver relies on: two
    events, four spin locks, a DPC and timer for the script and effect
@@ -255,8 +259,8 @@ Table of Contents
    as deep as the current one. Otherwise it completes with
    STATUS_INVALID_DEVICE_STATE (0xC0000184).
 
-   When accepted it sets the pending flag devext+0x2EA, passes the IRP
-   down synchronously, and on return calls FUN_000171c0 and clears the
+   When accepted it sets the pending flag devext+0x2EA, passes the IRP down
+   synchronously, and on return calls drv_UpdateIdlePowerState and clears the
    flag.
 
    4.2.  SET_POWER, minor function 0x02
@@ -302,7 +306,7 @@ Table of Contents
       still has to be right.
 
    -  The whole PnP and power surface is standard WDM with nothing
-      Adaptoid-specific in it except FUN_00016550 at start and the
+      Adaptoid-specific in it except drv_StartDevice at start and the
       polling stop reasons. In KMDF almost all of it collapses into
       EvtDevicePrepareHardware, EvtDeviceD0Entry and EvtDeviceD0Exit.
 

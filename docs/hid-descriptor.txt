@@ -27,15 +27,7 @@ Table of Contents
 
    1.  Driver Role
    2.  Descriptor Storage
-      CORROBORATION. The install directory ships three files, RPD1.bin, RPD2.bin
-   and RPD3.bin, of 185, 64 and 128 bytes. Their contents are byte-for-byte
-   the three descriptors above: RPD1 is the 185-byte Mouse + Keyboard +
-   Joystick, RPD2 the 64-byte Joystick-only, and RPD3 the Mouse + Keyboard,
-   whose 121 descriptor bytes are padded with seven trailing zeroes to 128.
-   They are an independent check on the reading above and on the lengths in
-   the selection table.
-
-3.  Descriptor Selection
+   3.  Descriptor Selection
    4.  Descriptor A: Mouse + Keyboard + Joystick
    5.  Report Layouts
    6.  Device Identity
@@ -97,6 +89,14 @@ Table of Contents
    which is why a naive cross-reference search finds nothing. The two
    cross-references Ghidra reports against 00019b40 are PE section-table
    fields at 000100f0 and 000101ec, not code.
+
+      CORROBORATION. The install directory ships three files, RPD1.bin, RPD2.bin
+   and RPD3.bin, of 185, 64 and 128 bytes. Their contents are byte-for-byte
+   the three descriptors above: RPD1 is the 185-byte Mouse + Keyboard +
+   Joystick, RPD2 the 64-byte Joystick-only, and RPD3 the Mouse + Keyboard,
+   whose 121 descriptor bytes are padded with seven trailing zeroes to 128.
+   They are an independent check on the reading above and on the lengths in
+   the selection table.
 
 3.  Descriptor Selection
 
@@ -287,6 +287,23 @@ Table of Contents
        byte 3    Y, signed, -127..127, relative
        byte 4    Wheel, signed, -127..127, relative
 
+   THE WHEEL BYTE CANNOT BE DRIVEN FROM A SCRIPT. drv_DispatchEvents calls
+   drv_HidMouseMoveEvent with the wheel delta hard-wired to zero, and the
+   _mouse_relative builtin carries only two arguments. The byte exists in the
+   descriptor and in the report, and the driver keeps a running total for it
+   at devext+0x1720, but nothing can ever write a non-zero value. See script-
+   bytecode.txt section 7.2.
+
+   WHICH REPORTS ARE LIVE IS CONFIGURABLE WITHOUT CHANGING THE DESCRIPTOR.
+   drv_SubmitHidReport is the single exit for every report the driver
+   produces, and it drops any report whose ID is not enabled in
+   drv_VirtualDevicesMask, tested as 1 << (reportID - 1): bit 0 joystick, bit
+   1 keyboard, bit 2 mouse. That mask comes from the VirtualDevices registry
+   value read in drv_AddDevice - the same value that selects which of the
+   three descriptors is reported in the first place. So the descriptor choice
+   and the report gating are driven by one setting, and a replacement must
+   apply both halves or it will publish collections it then refuses to feed.
+
    The 12-bit packing in report 1 is CONFIRMED. drv_BuildJoystickReport at
    00015150 writes exactly this layout, little-endian with no padding between
    the two fields:
@@ -338,7 +355,7 @@ Table of Contents
    +=========+====+=======================+=================================+
    | 0xb0003 |  0 | GET_DEVICE_DESCRIPTOR | builds 9-byte HID_DESCRIPTOR    |
    | 0xb0007 |  1 | GET_REPORT_DESCRIPTOR | copies the selected descriptor  |
-   | 0xb000b |  2 | READ_REPORT           | FUN_00015020 under a guard      |
+   | 0xb000b |  2 | READ_REPORT           | drv_HidReadReport, guarded      |
    | 0xb000f |  3 | WRITE_REPORT          | accepted and discarded          |
    | 0xb0013 |  4 | GET_STRING            | manufacturer/product/serial     |
    | 0xb001f |  7 | ACTIVATE_DEVICE       | devext[0x328 + i] = 1, i < 3    |
@@ -347,7 +364,7 @@ Table of Contents
    | other   |  - | unsupported           | STATUS_NOT_SUPPORTED            |
    +---------+----+-----------------------+---------------------------------+
 
-   A guard runs before the switch: FUN_00015f00(devext) returning zero
+   A guard runs before the switch: drv_IsDeviceReady(devext) returning zero
    completes the IRP with STATUS_DEVICE_NOT_CONNECTED (0xC0000056).
 
    WRITE_REPORT returning success without doing anything is worth

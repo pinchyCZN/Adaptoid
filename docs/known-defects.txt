@@ -7,11 +7,12 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Three defects have been found during reverse engineering: two
-   arithmetic ones in wishk201.sys, and a race in wishh201.dll. This note
-   records each one, the exact condition that triggers it, what it would
-   actually do, and whether a user would be likely to notice. It also
-   records one claim that was made here and later RETRACTED, in section 3.
+   Four defects have been found during reverse engineering: two
+   arithmetic ones in wishk201.sys, a pair of unbounded string copies also
+   in the driver, and a race in wishh201.dll. This note records each one,
+   the exact condition that triggers it, what it would actually do, and
+   whether a user would be likely to notice. It also records claims that
+   were made here and later RETRACTED, in sections 3 and 7.
 
    The purpose is not to criticise a driver that shipped in 2001 and
    worked. It is to stop a clean-room replacement from faithfully
@@ -31,7 +32,9 @@ Table of Contents
    3.  RETRACTED: Cross-Coupled Stick Acceleration Is Not A Defect
    4.  Defect 3: Swapped Sine Interpolation Weights
    5.  Defect 4: Race On The Launch-Detection Path Buffer
-   6.  What Is Not Affected
+   6.  Defect 5: Unbounded String Copies Into Fixed Fields
+   7.  RETRACTED: The Script State Field Is Not A Latch Bug
+   8.  What Is Not Affected
 
 1.  Severity Summary
 
@@ -44,6 +47,9 @@ Table of Contents
                                                    slot is running
        launch-detection race      wishh201.dll     only with Detect
                                                    Game Launches on
+       unbounded string copies    device naming    no, needs an
+                                                   over-long name
+       (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
 
@@ -221,7 +227,78 @@ Table of Contents
    atomically with the event and needs no DLL injected into every process on
    the machine.
 
-6.  What Is Not Affected
+6.  Defect 5: Unbounded String Copies Into Fixed Fields
+
+   Location:  drv_RegisterDeviceInterface at 000190a0
+              drv_SetDeviceNameAndSort at 00011e02 via drv_StrCopy
+
+   Two places copy a string into a fixed-size field of the device extension
+   with no bound on the destination.
+
+   drv_RegisterDeviceInterface copies the symbolic link name returned by
+   IoRegisterDeviceInterface into DevExt->InterfaceName. The loop is driven
+   purely by the source Length - dwords, then a 0 to 3 byte tail - and is
+   never compared against the destination size. The field immediately after
+   it is SystemPowerState.
+
+   drv_SetDeviceNameAndSort is worse in shape. It builds a display name and
+   writes it through drv_StrCopy, which is a plain strcpy with no length
+   parameter at all. The destination, DevExt->DeviceName, is TEN BYTES. At
+   offset +10 sits FirmwareRevision, and at +16 GlobalDeviceLink, the
+   LIST_ENTRY that threads this device onto the driver-wide list walked by
+   drv_SetDeviceNameAndSort itself and by drv_DispatchPnp.
+
+   Trigger:   an interface name longer than 0x200 bytes, or a device
+              location name of ten characters or more.
+
+   Effect: the first overruns into a power-state field. The second overruns
+   into a firmware value and then into kernel list pointers, which is a far
+   more serious target.
+
+   Would it be noticed? Almost certainly not, and neither is reachable by an
+   attacker. The names are produced by the system and by this driver, not by
+   user input. A device interface name for this device runs to roughly a
+   hundred bytes against a 0x200 field. The location name is a controller
+   letter followed by a short hub path, well inside ten characters.
+
+   One accident limits the second: drv_SetDeviceNameAndSort reads
+   FirmwareRevision BEFORE it writes the name, so the value it goes on to use
+   cannot be corrupted by its own copy.
+
+   Note also that the SIZE of InterfaceName is itself an inference - 0x200 is
+   the distance to the next field in use, not a figure stated anywhere in the
+   code. The DeviceName size is firmer, being the distance to a field that is
+   genuinely read.
+
+   For a replacement: bound both copies. This costs nothing and removes a
+   whole class of question.
+
+7.  RETRACTED: The Script State Field Is Not A Latch Bug
+
+   An earlier revision of this note, and of ioctl-surface.txt, recorded the
+   field at devext+0x1640 as a counter with a latch defect: drv_AddDevice
+   initialises it to -1, and drv_ScriptSchedulerDpc only increments while it
+   is non-negative, so it appeared that nothing could ever lift it and the
+   script could never own the stick.
+
+   THAT WAS WRONG. The field is a state, not a counter, and IOCTL fn 0x83C
+   writes its distinguished values:
+
+       -1   no script loaded          -2   a load is in progress
+        0   script loaded and idle    -3   also accepted by the load
+       >0   scheduler passes running       path
+
+   So -1 is the correct initial state and the one-sided guards are refusing
+   to count scheduler passes while the engine is unloaded or loading. A load
+   through fn 0x83C moves the field to 0 and the mechanism works.
+
+   LESSON, the same one as section 3: the behaviour looked wrong against an
+   assumed purpose the code never claimed. Naming the field
+   ScriptStickCounter committed to the counter reading before the IOCTL that
+   drives it had been read. Where a field's PURPOSE is inferred from one of
+   its users, a defect in it is only as sound as that inference.
+
+8.  What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original

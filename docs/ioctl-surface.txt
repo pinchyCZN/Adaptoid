@@ -81,14 +81,15 @@ Table of Contents
    The wrappers come in three shapes.
 
    Four-way, for CREATE, CLEANUP, CLOSE and DEVICE_CONTROL: all four routes
-   above. Note that the 'q' handlers for create and close are FUN_00012690
-   and FUN_000126f0, which are the minidriver's ORIGINAL handlers, the ones
-   installed before HidRegisterMinidriver replaced them. The private channel
-   reuses them rather than duplicating the code.
+   above. Note that the 'q' handlers for create and close are
+   drv_HidChannelCreate and drv_HidChannelClose, which are the minidriver's
+   ORIGINAL handlers, the ones installed before HidRegisterMinidriver
+   replaced them. The private channel reuses them rather than duplicating the
+   code.
 
-   Three-way, for READ and WRITE: magic goes to FUN_000113b0, everything else
-   chains. There is no 'q' route, so the private per-device channel is IOCTL-
-   only.
+   Three-way, for READ and WRITE: magic goes to drv_ControlDeviceReadWrite,
+   everything else chains. There is no 'q' route, so the private per-device
+   channel is IOCTL-only.
 
    Two-way, for PNP and POWER: the magic case completes with
    STATUS_NOT_SUPPORTED and everything else chains. The control device is a
@@ -168,9 +169,9 @@ Table of Contents
    | 0xb98c2050 | 0x814 | 0/4 | 0/4 | recognised, falls through to unsupported  |
    | 0xb98c2058 | 0x816 |   4 |   0 | driver-wide enable flag at 00019d70, then |
    |            |       |     |     | flags every device and drains via         |
-   |            |       |     |     | FUN_00014a00                              |
+   |            |       |     |     | drv_SubmitJoystickReport                  |
    | 0xb98c205c | 0x817 | <16 | <16 | get and set drv_ButtonMap, section 7      |
-   | 0xb98c2060 | 0x818 |   0 |  12 | FUN_000159e0, async event fetch           |
+   | 0xb98c2060 | 0x818 |   0 |  12 | drv_IoctlWaitNotification, async          |
    | 0xb98c2084 | 0x821 |   4 |   8 | enumerate: in = previous device id,       |
    |            |       |     |     | out = {next id, device count}             |
    | 0xb98c2088 | 0x822 |   4 |   4 | look up a device id by the value at       |
@@ -234,8 +235,8 @@ Table of Contents
    | 0xb98c20d4 | 0x835 |    0 |  var | NUL-terminated string at devext+0x334    |
    | 0xb98c20d8 | 0x836 |    4 |    4 | read one counter, selector 1..4          |
    | 0xb98c20dc | 0x837 |    4 |    0 | zero counter 2 or 3                      |
-   | 0xb98c20e4 | 0x839 |    4 |    0 | FUN_00018b00 on/off toggle               |
-   | 0xb98c20e8 | 0x83a | var  | var  | FUN_000137c0 raw N64 bus transfer        |
+   | 0xb98c20e4 | 0x839 |    4 |    0 | drv_SetDeviceEnable on/off toggle        |
+   | 0xb98c20e8 | 0x83a | var  | var  | drv_N64Transaction, raw N64 transfer     |
    | 0xb98c20f0 | 0x83c | 8+4n |    0 | DOWNLOAD COMPILED SCRIPT, section 5a     |
    | 0xb98c20f4 | 0x83d |    0 |  var | drain the post-mortem dump of a fault    |
    | 0xb98c20f8 | 0x83e |  0/4 |  0/4 | get and/or set the DWORD at devext+0x3ec |
@@ -466,10 +467,10 @@ Table of Contents
        2   stop the slot
        3   stop all 32 slots
 
-   Every command ends by calling FUN_00013a60(devext), which is the
+   Every command ends by calling drv_EffectKick(devext), which is the
    engine's rescan or reschedule entry point.
 
-   fn 0x855 takes a slot number and returns one byte from FUN_00013e90,
+   fn 0x855 takes a slot number and returns one byte from drv_EffectSlotActive,
    reporting whether the slot is currently running.
 
    5.5.  The Sine Oscillator
@@ -627,24 +628,33 @@ Table of Contents
    written by the native builtins at devext+0x1708, +0x170C and +0x1710 are
    used instead of the raw controller state and none of this scaling runs.
 
-   devext+0x1640 is a COUNTER, not a flag. drv_ScriptSchedulerDpc, recovered
-   at 00017910, brackets each call to drv_ScriptScheduler with it under the
-   device lock at devext+0x1644: increment before, decrement after. Both
-   guards are one-sided - the increment is skipped while the value is
-   negative, the decrement while it is non-positive.
+   devext+0x1640 is the SCRIPT ENGINE STATE, and it is not a counter. IOCTL
+   fn 0x83C, which loads bytecode, shows it as a small state machine:
 
-   drv_AddDevice INITIALISES THE FIELD TO -1, in the same instruction run
-   that registers the DPC:
+       -1   no script loaded; the value drv_AddDevice writes
+        0   script loaded and idle
+       >0   scheduler passes in flight, counted by drv_ScriptSchedulerDpc
+       -2   a load is in progress
+       -3   accepted by the load path alongside 0 and -1
 
-       0001242c   PUSH 0x17910                     ; KeInitializeDpc
-       00012432   MOV  [ESI + 0x1640], 0xffffffff
+   fn 0x83C permits a load only when the value is 0, -1 or -3; anything else
+   means busy, so it writes -2 and returns STATUS_DEVICE_BUSY. On completion
+   it writes (CodeCount != 0) - 1, giving 0 for a real script and -1 for an
+   unload.
 
-   So the field starts latched negative and the DPC cannot lift it, because
-   the increment is exactly what the negative value suppresses. Something
-   else has to drive it non-negative before a script can own the stick, and
-   once negative again it stays there. A replacement should decide
-   deliberately whether to reproduce that latch or to treat the field as a
-   plain nesting count.
+   CORRECTION. An earlier revision of this note called the field a counter
+   and read the one-sided guards in drv_ScriptSchedulerDpc - increment only
+   while non-negative, decrement only while positive - as a latch bug that
+   permanently locks a script out of the stick. THAT WAS WRONG and is
+   retracted. With the state values above the guards are simply refusing to
+   count passes while the engine is unloaded (-1) or loading (-2), which is
+   exactly what they should do. drv_AddDevice initialising the field to -1 is
+   the correct initial state, not a latched fault.
+
+   The LESSON generalises, and is the same one recorded in known-defects.txt
+   section 3: a field read as a counter behaved oddly, and the oddity was in
+   the reading, not the code. Nothing named the field until the IOCTL that
+   writes its distinguished values was read.
 
 8.  Consequences For The Replacement Driver
 
@@ -680,7 +690,7 @@ Table of Contents
       +0x45c, +0x464 and +0x468. These are what the configurator's
       compiler emits, so they are the closest thing to the compiled
       script format.
-   -  What FUN_00013a60 does when a slot starts, and where the slot
+   -  What drv_EffectKick does when a slot starts, and where the slot
       payload is turned into HID reports. That is the other half of the
       macro engine.
    -  Whether the payload stream is a key or button list, given the

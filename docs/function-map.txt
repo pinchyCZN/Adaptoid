@@ -349,6 +349,29 @@ Table of Contents
        00019a80  __alldiv                    compiler helper
        00019b2a  HidRegisterMinidriver       import thunk
 
+13.1.  Declared Arity Was Wrong In Thirteen Functions
+
+   Naming a function does not make its signature right. Thirteen routines in
+   wishk201.sys had a declared parameter count that did not match the stack
+   purge in their own epilogue, so the decompilation silently dropped
+   arguments.
+
+   This mattered more than it sounds. drv_SendVendorRequest was typed with
+   two parameters instead of five, which hid the transfer length, the data
+   buffer AND the completion callback - so the entire vendor-request path
+   appeared to have no continuation, and the callbacks recovered from code
+   gaps looked orphaned. drv_SendIoctlSync was typed as taking nothing at all
+   when it takes seven.
+
+   Every signature in the database is now checked against the RET immediate
+   of the function it describes. The full list is in driver-structures.txt
+   section 6.
+
+   GENERAL LESSON: a wrong prototype is worse than a missing one, because it
+   produces confident, readable, wrong output. The RET immediate of a stdcall
+   function is free ground truth and should be checked before any signature
+   is trusted.
+
 14. What Is Still Not Known
 
    Naming every function is not the same as understanding everything.
@@ -362,10 +385,12 @@ Table of Contents
 
    -  Which accessory kind maps to accessory state 2 versus state 3.
 
-   -  What devext+0x17F4 counts, the sole reason the driver vetoes an
-      IRP_MN_QUERY_STOP_DEVICE.
-
-   -  What is allocated at devext+0x17F8.
+   -  RESOLVED, and both turned out to be dead. devext+0x17F4 is read exactly
+   -  once in the whole image, in drv_DispatchPnp, and is never written
+   -  anywhere - so it is permanently zero and the veto it gates can never
+   -  fire. devext+0x17F8 is read exactly once, to free it, and is never
+   -  assigned - so it is permanently NULL and that ExFreePool never runs.
+   -  See driver-structures.txt section 7.
 
    -  The eleven entries marked [I] above, where the name is an inference
       from call sites rather than a full reading of the body.
@@ -380,7 +405,8 @@ Table of Contents
       cfg_GameBindingDlgProc. The architecture is written up in
       configurator-architecture.txt.
 
-   -  wishh201.dll, a THIRD binary. wishd201.exe loads it by name and
-      resolves five exports from it for game-launch detection. It is not
-      present in decomp/, so its mechanism is inferred rather than read. See
-      configurator-architecture.txt section 8.
+   -  RESOLVED. wishh201.dll, the third binary, is now in decomp/ and fully
+   -  named: 137 functions, zero left as FUN_. It is a system-wide WH_SHELL
+   -  hook DLL for game-launch detection, and its mechanism is read rather
+   -  than inferred. See configurator-architecture.txt section 8 and known-
+   -  defects.txt section 5.

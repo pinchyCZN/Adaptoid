@@ -48,10 +48,10 @@ Table of Contents
 
    Written so far: hid-descriptor.txt, ioctl-surface.txt, script-
    bytecode.txt, script-language.txt, known-defects.txt, usb-transport.txt,
-   driver-lifecycle.txt, function-map.txt, config-format.txt,
-   configurator-architecture.txt and replacement-architecture.txt. The rest
-   are listed so findings land in a predictable place rather than
-   accumulating in one file.
+   driver-lifecycle.txt, driver-structures.txt, function-map.txt,
+   config-format.txt, configurator-architecture.txt and
+   replacement-architecture.txt. The rest are listed so findings land in a
+   predictable place rather than accumulating in one file.
 
    +-----------------------+---------------------------------------------+
    | File                  | Contents                                    |
@@ -75,8 +75,10 @@ Table of Contents
    | script-bytecode.txt   | DONE. The flex/bison compiler and the       |
    |                       | 32-bit opcode format it emits.              |
    +-----------------------+---------------------------------------------+
-   | driver-structure.txt  | Driver object layout, dispatch table, and   |
-   |                       | device extension.                           |
+   | driver-structures.txt | DONE. The 0x1800-byte device extension,     |
+   |                       | the structures embedded in it, the Windows  |
+   |                       | and USB layouts the driver indexes, and     |
+   |                       | what changes on 64-bit.                     |
    +-----------------------+---------------------------------------------+
    | port-notes.txt        | What must change for 64-bit: pointer width, |
    |                       | packing, WDM to KMDF or UMDF2.              |

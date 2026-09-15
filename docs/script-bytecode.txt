@@ -94,8 +94,8 @@ Table of Contents
 
    cfg_CompileScript performs:
 
-       FUN_0040beb0()        reset code generator state
-       FUN_0040b770(text)    point the lexer at the source string
+       cfg_PredeclareSymbols()        reset code generator state
+       cfg_ScriptCompile(text)    point the lexer at the source string
        cfg_yyparse()         parse; grammar actions emit into DAT_0045b5b4
 
    The global DAT_0045b5b8 holds the result: zero on success, non-zero is the
@@ -113,7 +113,7 @@ Table of Contents
        cfg_ConcatCode(prologue, body)
        cfg_ConcatCode(prologue, tail)
 
-   The symbol used in the first epilogue instruction comes from FUN_0040c6e0
+   The symbol used in the first epilogue instruction comes from cfg_ScriptEmit
    looking up the name at 004212a0, and its field [5] is or-ed with
    0x20000000 before being used as the operand. INFERENCE: 0x20000000 is a
    global-storage tag rather than part of the value, since cfg_EmitSymbolRef
@@ -212,8 +212,8 @@ Table of Contents
 
    Note for anyone reading the same code in Ghidra: the constant 0x186A0 is
    stored into devext+0x1670 by drv_ScriptLoad, and Ghidra renders it as
-   FUN_000186a0 because a function happens to exist at that address. It is
-   the number 100000, not a function pointer.
+   drv_ScriptNativeCall because a function happens to exist at that address.
+   It is the number 100000, not a function pointer.
 
 6.2.  Pointer Tags
 
@@ -325,7 +325,7 @@ Table of Contents
 
    On any fault other than 1, 9 and 0xB the interpreter stashes the thread
    context and a full copy of the variable array at devext+0x1684 and
-   devext+0x1688, then reports the fault through FUN_00015e00 with event type
+   devext+0x1688, then reports the fault through drv_QueueEvent with event type
    0x42. Those two buffers are exactly what IOCTL 0xb98c20f4 drains, so that
    command is a post-mortem dump of a faulted script, not a trace buffer.
 
@@ -515,17 +515,18 @@ Table of Contents
    +------+-------------------+---------------------------------------+
    | Type | Posted by         | Meaning                               |
    +======+===================+=======================================+
-   | 3    | native 0x40000006 | arguments clamped to 0..0xFFFF.       |
-   |      |                   | INFERENCE: an absolute pointer        |
-   |      |                   | position, which the relative mouse    |
-   |      |                   | collection cannot express, handed to  |
-   |      |                   | user mode to apply. Not established.  |
+   | 3    | _mouse_absolute   | ABSOLUTE 16-BIT POINTER POSITION,     |
+   |      | (0x40000006)      | 0..0xFFFF with 0x8000 the centre.     |
+   |      |                   | The relative mouse collection cannot  |
+   |      |                   | express this, so it is handed to user |
+   |      |                   | mode to apply. See below.             |
    | 0x42 | drv_ScriptExecute | a script fault; arg1 is the           |
    |      |                   | interpreter status code from          |
    |      |                   | section 6.4                           |
-   | 0x4D | native 0x40000010 | not established                       |
-   | 99   | FUN_00015dc0      | DEVICE INTERFACE STATE CHANGED.       |
-   |      |                   | Posted by both                        |
+   | 0x4D | _debug            | the script print statement; see       |
+   |      | (0x40000010)      | section 6.5                           |
+   | 99   | drv_NotifyInter-  | DEVICE INTERFACE STATE CHANGED.       |
+   |      | faceChange        | Posted by both                        |
    |      |                   | drv_EnableDeviceInterface and         |
    |      |                   | drv_DisableDeviceInterface, so it     |
    |      |                   | signals arrival AND departure. A      |
@@ -533,10 +534,26 @@ Table of Contents
    |      |                   | which.                                |
    +------+-------------------+---------------------------------------+
 
+   TYPE 3 IS ESTABLISHED, and was marked INFERENCE in an earlier revision.
+   Three independent sources agree. The driver clamps both arguments to
+   0..0xFFFF. The shipped script @--Sample Absolute Mouse.ac tracks the
+   pointer in variables declared `static int mx=32768, my=32768`, i.e.
+   centred in that range. And another shipped script computes the argument
+   directly as `x * 65535 / 2400 + 32768`, mapping the +/-1200 stick range
+   onto the full 16-bit span.
+
+   ONE LIMITATION WORTH CARRYING INTO A REPLACEMENT: a script cannot drive
+   the mouse wheel. drv_DispatchEvents calls drv_HidMouseMoveEvent with the
+   wheel delta HARD-WIRED TO ZERO, and _mouse_relative carries only two
+   arguments. The wheel byte in report 3 therefore only ever leaves the
+   driver as zero, and the running total at devext+0x1720 can only ever be
+   written with zero.
+
    Delivery is an inverted call. IOCTL 0xb98c2060, function 0x818, arrives at
-   FUN_000159e0, which parks the IRP on the waiting list at extension+0x68 and
-   returns STATUS_PENDING. drv_CompleteNotificationIrps at 00015ba0 pairs a
-   queued event with a waiting IRP, copies type, arg1 and arg2 as three
+   drv_IoctlWaitNotification, which parks the IRP on the waiting list at
+   extension+0x68 and returns STATUS_PENDING. drv_CompleteNotificationIrps at
+   00015ba0 pairs a queued event with a waiting IRP, copies type, arg1 and
+   arg2 as three
    DWORDs into the system buffer, and completes it with Information = 12.
    That is precisely the 12-byte output recorded for fn 0x818 in ioctl-
    surface.txt.
@@ -599,20 +616,20 @@ Table of Contents
    emit: 0x095, 0x171, 0x181, 0x192, 0x230 and 0x294. Which grammar
    productions reach them, if any.
 
-   - The FUN_00015e00 event types 0, 1, 2, 3 and 0x4D used by the native
+   - The drv_QueueEvent event types 0, 1, 2, 3 and 0x4D used by the native
    builtins. These are how a script actually produces HID input, so decoding
    them closes the last gap between a script and a report.
 
    - The meaning of the flags word at buffer +0x04, sourced from
    DAT_0045b608, and whether the top two bits of the count dword are flags.
 
-   - The symbol table behind FUN_0040c6e0 and the meaning of field [5], which
+   - The symbol table behind cfg_ScriptEmit and the meaning of field [5], which
    is what the epilogue 0x110 instruction carries.
 
    - How the 16 per-button script slots relate to the 32 macro slots in the
    driver, which are programmed by a different IOCTL entirely.
 
-   - The scheduler around drv_ScriptExecute: FUN_000177c0 allocates thread
-   contexts, FUN_00017860 queues them and FUN_00017980 drives the timer at
-   devext+0x1690.
+   -  The scheduler around drv_ScriptExecute: drv_ScriptThreadAlloc allocates
+   -  thread contexts, drv_ScriptThreadQueue queues them and
+   -  drv_ScriptScheduler drives the timer at devext+0x1690.
 

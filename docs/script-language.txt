@@ -30,8 +30,9 @@ Table of Contents
    6.  Operators And Punctuation
    7.  Declarations And Storage
    8.  Rejected Constructs
-   8.1. Two Forms The DFA Could Not Show
    8.1.  Two Forms The DFA Could Not Show
+
+8.1.  Two Forms The DFA Could Not Show
 
    Reconstructing the scanner gives the token set but not how tokens are
    used. The sample scripts shipped in the install directory settle two
