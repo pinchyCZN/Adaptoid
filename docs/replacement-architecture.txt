@@ -27,9 +27,11 @@ Table of Contents
    4.  Why The Existing Virtual Pad Drivers Do Not Solve This
    5.  Candidate Architectures
    6.  Recommended Design
-   7.  Runtime Attach And Device Restart
-   8.  What Carries Over From The Reverse Engineering
-   9.  Open Decisions
+   7.  The Cost Of The Recommended Design
+   8.  Worked Example: Owning A Third-Party HID Gamepad
+   9.  Runtime Attach And Device Restart
+   10. What Carries Over From The Reverse Engineering
+   11. Open Decisions
 
 1.  The Property Worth Preserving
 
@@ -91,8 +93,23 @@ Table of Contents
    driver's private configuration API onto the same dispatch table that
    hidclass owns. It has nothing to do with input.
 
-   This distinction matters because "filter the controller" and "be the
-   controller's driver" lead to completely different replacement designs.
+   To be fair to the intuition, there are two layers here and the answer
+   differs by layer. In the DATA FLOW sense it is reasonable to call the
+   driver a pass-through: raw USB packets arrive from the bus driver below,
+   the driver transforms them, and HID reports go up to the OS. Data really
+   does flow through it and get changed on the way.
+
+   In the WINDOWS ARCHITECTURE sense it is not a filter, and the difference
+   is load-bearing. A filter attaches to a stack that ALREADY has a function
+   driver and watches IRPs go past; it coexists with the original and must
+   not break it. This driver IS the function driver. Nothing else is on that
+   stack. Remove it and hidusb loads instead and behaves completely
+   differently.
+
+   The consequence that matters: because it REPLACES hidusb, the device's own
+   HID personality never reaches the OS at all. That is exactly the double
+   visibility problem architecture 3 has and this one does not; see section
+   7.1.
 
 4.  Why The Existing Virtual Pad Drivers Do Not Solve This
 
@@ -123,7 +140,7 @@ Table of Contents
    | 2 | Lower filter on the      | partly   | with a     | full driver |
    |   | USB stack                |          | device     |             |
    |   |                          |          | restart    |             |
-   | 3 | Virtual composite HID    | yes      | yes        | one driver, |
+   | 3 | Virtual composite HID    | yes      | yes        | two drivers,|
    |   | device plus a user-mode  |          |            | logic       |
    |   | mapper                   |          |            | unsigned    |
    +---+--------------------------+----------+------------+-------------+
@@ -131,10 +148,14 @@ Table of Contents
    5.1.  Per-device minidriver
 
    Reproduce the original: own the device, speak its protocol, present a
-   composite descriptor. Correct, and it is what the original does, but
-   it must be rewritten for every controller, needs an INF per hardware
-   ID, and the whole mapping engine lives in kernel mode where every bug
+   composite descriptor. It must be written per controller, needs an INF per
+   hardware ID, and the mapping engine lives in kernel mode where every bug
    is a bugcheck.
+
+   Those costs are real but they are costs of SCALE, not of correctness. For
+   a single known controller this is the better design, because it is a
+   replacement rather than an addition and therefore has none of the problems
+   in section 7. Section 8 works the case through end to end.
 
    5.2.  Lower filter on the USB stack
 
@@ -164,6 +185,10 @@ Table of Contents
    kernel because in 2001 there was no supported way to create a virtual
    HID device, not because the kernel was required.
 
+   This approach is ADDITIVE rather than a replacement, and that has a
+   significant cost which section 7 sets out in full. Do not read this
+   subsection on its own.
+
 6.  Recommended Design
 
    Architecture 3, built on the Virtual HID Framework.
@@ -187,8 +212,9 @@ Table of Contents
                   - runs the mapping and scripting
                   - submits reports to the virtual device
 
-       optional a device-hiding filter so applications do not also see
-                the original controller and register doubled input
+       required a device-hiding filter so applications do not also see
+                the original controller; see section 7, this is NOT
+                optional in practice
 
    The descriptor from hid-descriptor.txt section 4 can be used
    unchanged. Doing so has a specific benefit beyond convenience: report
@@ -213,8 +239,222 @@ Table of Contents
    effect turns out to need tighter timing, that piece alone can be moved
    into the driver later without disturbing the architecture.
 
-7.  Runtime Attach And Device Restart
+7.  The Cost Of The Recommended Design
 
+   Architecture 3 has one structural weakness that the original does not, and
+   it is worth stating plainly rather than burying in a trade-off table.
+
+7.1.  It Is Additive, Not A Replacement
+
+   The original REPLACES the device's HID personality. The adapter's own
+   descriptor is never used, so exactly one device exists in the system and
+   it is the composite one.
+
+   A virtual HID device ADDS. The real controller continues to enumerate
+   normally as whatever it already was, and the virtual device appears
+   alongside it. Both react to the same physical button press:
+
+       controller --USB--> hidclass --> gamepad PDO --> applications
+                                        |
+                                        v
+                                 user-mode service
+                                        |
+                                   mapping engine
+                                        v
+                                  VHF virtual device
+                                        |
+                              kbdclass / mouclass / gamepad
+
+   It is a tap rather than a splitter, and the path leaves the kernel and
+   comes back.
+
+7.2.  Why Double Visibility Is Worse Than Clutter
+
+   Suppose A is mapped to the W key. An application reading the keyboard sees
+   W, which is correct. But the same application also sees gamepad button 1
+   go down, because the real controller is still there.
+
+   Many games switch to controller mode the moment they detect a gamepad:
+   button glyphs replace key prompts, aim assist and deadzone handling
+   change, and some ignore keyboard input entirely while a pad is present. So
+   the failure is not cosmetic. It can make the remapping useless in exactly
+   the titles it was meant for.
+
+   This is the single largest cost of architecture 3, and the original design
+   does not have it.
+
+7.3.  Mitigation, And Its Price
+
+   The fix is a device-hiding filter: a lower filter that makes the source
+   controller invisible to every process except an allow-listed one, so
+   applications see only the virtual device. With that in place the
+   observable behaviour matches the original.
+
+   The price is honesty about the component count. The design needs TWO
+   kernel components, not one: the VHF driver and the hiding filter. Both are
+   still generic and device-independent, and the hiding filter is simple
+   because it performs no descriptor surgery - it only makes a devnode
+   invisible - but the claim of a single small driver was too optimistic.
+
+   A partial cosmetic improvement is available regardless: VHF_CONFIG accepts
+   a ContainerID. Setting it to the real controller's makes Windows group the
+   two as one physical device in the user interface. That does not stop an
+   application enumerating both, but it avoids presenting the user with two
+   unrelated devices.
+
+7.4.  Other Costs
+
+   LATENCY. The path is USB, then hidclass, then a user-mode read, the
+   mapping, then back into the kernel through VHF and out via kbdclass. Two
+   boundary crossings plus thread scheduling, against the original doing the
+   whole thing inside a completion routine. Typically a millisecond or two:
+   irrelevant for most use, measurable for frame-accurate input.
+
+   LIFETIME. If the mapping service crashes, is terminated, or has not
+   started yet, remapping simply stops. The original cannot fail that way
+   because there is no separate process to fail. The virtual device's reports
+   DO reach the logon screen and the secure desktop, since they are genuine
+   HID input, but only while something is feeding it - which means the mapper
+   must run as a system service rather than a tray application. That is a
+   design requirement, not a detail.
+
+   ANTI-CHEAT. Some titles flag recognised virtual input drivers. A driver
+   presenting itself as real hardware, as the original does, attracts less
+   attention than a well-known virtual bus.
+
+   RE-BIND. The real controller can come and go across sleep, resume and
+   replug while the virtual device persists. The service has to notice and
+   re-attach, which the original got for free from PnP.
+
+7.5.  When To Prefer Another Architecture
+
+   If the replacement is only ever going to target the Adaptoid itself, then
+   architecture 1 - a per-device minidriver, as the original does - avoids
+   every problem in this section. It is more kernel code and it is device-
+   specific, but it is a replacement rather than an addition, and the double-
+   visibility question never arises.
+
+   Architecture 3 earns its complexity only if supporting arbitrary
+   controllers is actually a goal. That is a decision to make deliberately
+   before writing code, not after. Section 8 works the single-device case
+   through end to end, including the comparison that decides it.
+
+8.  Worked Example: Owning A Third-Party HID Gamepad
+
+   Premise: a generic PlayStation-to-USB adapter, of the kind that needs no
+   driver because its firmware presents a standard HID gamepad. The goal is
+   Adaptoid-style behaviour - scripting and remapping to keyboard and mouse -
+   for that one device.
+
+   This is architecture 1 applied to somebody else's hardware, and for a
+   single known target it is the right choice.
+
+8.1.  What Sits Below You
+
+   The common misconception is that such a driver receives HID reports from a
+   lower HID driver and edits them. It does not. There is no HID layer
+   beneath it:
+
+       kbdclass / mouclass / gamepad     per-collection PDOs
+       hidclass.sys                      linked into the same FDO
+       YOUR DRIVER                       the function driver, the FDO
+       ============ IRP / URB boundary ============
+       USB PDO (usbhub)
+       usbport / usbehci / usbxhci
+
+   You submit URBs to the USB BUS DRIVER and receive raw endpoint bytes. For
+   a HID gamepad those bytes happen to be the HID input report its own
+   descriptor defines, but nothing forces you to treat them as HID. They are
+   just bytes, and you decide what they mean.
+
+8.2.  Bring-Up, Step By Step
+
+   Every step below already has a worked reference in these notes, because
+   the Adaptoid driver does the same things.
+
+       1  INF matches USB\VID_xxxx&PID_yyyy. A hardware-ID match
+          outranks the compatible-ID match (USB\Class_03) that would
+          otherwise load hidusb. This is how vendor peripheral drivers
+          routinely take over HID devices.
+
+       2  DriverEntry calls HidRegisterMinidriver so hidclass stacks on
+          top. See driver-lifecycle.txt section 1.
+
+       3  On IRP_MN_START_DEVICE, fetch the device and configuration
+          descriptors, issue SELECT_CONFIGURATION, and keep the
+          interrupt IN pipe handle. See driver-lifecycle.txt section
+          3.1; note the Adaptoid blindly takes Pipes[0], which you
+          should not copy.
+
+       4  Poll with a double-buffered pair of interrupt URBs so one read
+          is always outstanding. See hid-descriptor.txt section 8.1.
+
+       5  Parse the raw bytes into your own state.
+
+       6  Synthesise composite reports and submit them. See
+          script-bytecode.txt section 7 for the report builders.
+
+       7  Serve your own descriptor on
+          IOCTL_HID_GET_REPORT_DESCRIPTOR. The Adaptoid's 185-byte
+          descriptor can be reused verbatim; see hid-descriptor.txt
+          section 4.
+
+8.3.  The One Thing The Reverse Engineering Cannot Give You
+
+   The adapter's input report byte layout. Establish it BEFORE writing the
+   driver, while the device is still an ordinary HID device:
+
+       - dump its report descriptor through HidD_GetPreparsedData and the
+         HID parser API, or capture enumeration with a USB analyser
+       - log its input reports while pressing each button and sweeping
+         each stick
+
+   That gives you the byte and bit position of every control. Check
+   specifically whether the device uses REPORT IDs: if it does, byte 0 of
+   what you read is the report ID and the payload begins at byte 1; if not,
+   the payload begins at byte 0. Its own descriptor answers this.
+
+8.4.  Gotchas
+
+   SIGNING. Windows 10 and 11 on x64 will not load an unsigned driver.
+   Attestation signing through Partner Center covers a non-WHQL driver. For
+   personal use, test-signing mode works but weakens other protections.
+
+   MULTI-PORT ADAPTERS. Many of these expose two controllers, sometimes as
+   two HID collections and sometimes as one collection with a port byte.
+   Determine which before designing your descriptor, because it changes how
+   many top-level collections you declare.
+
+   MULTIPLE INTERFACES. Cheap adapters occasionally expose more than one USB
+   interface. Pick the right one deliberately rather than copying the
+   Adaptoid's assumption that the first pipe is the one you want.
+
+   YOU INHERIT EVERYTHING. Owning the device makes you responsible for PnP,
+   power, surprise removal and selective suspend. driver-lifecycle.txt is a
+   working template for all of it, including the teardown ordering in section
+   3.2 that keeps you from touching USB resources the bus driver has already
+   reclaimed.
+
+8.5.  Which Way To Go
+
+   +-------------------+----------------------+------------------------+
+   | Concern           | Own the device       | VHF plus hiding filter |
+   +===================+======================+========================+
+   | Double visibility | none by construction | needs a hiding filter  |
+   | Per new device    | new INF and protocol | nothing                |
+   |                   | work                 |                        |
+   | Mapping logic     | kernel mode          | user mode              |
+   | Kernel components | one                  | two                    |
+   | Debugging         | bugchecks            | ordinary debugger      |
+   +-------------------+----------------------+------------------------+
+
+   For ONE known adapter, owning it is simpler and strictly better. For "any
+   controller the user plugs in", architecture 3 wins despite section 7. The
+   deciding question is how many devices are actually intended to be
+   supported, and it is worth answering before code is written rather than
+   during.
+
+9.  Runtime Attach And Device Restart
    The question "can it attach to an arbitrary controller at runtime
    without a reboot" has a different answer per architecture.
 
@@ -240,8 +480,7 @@ Table of Contents
    problem. Generic PlayStation-style USB adapters are ordinary HID
    gamepads and need no special handling.
 
-8.  What Carries Over From The Reverse Engineering
-
+10. What Carries Over From The Reverse Engineering
    Under architecture 3, much of the original becomes reference rather
    than specification. What still matters:
 
@@ -271,8 +510,7 @@ Table of Contents
    usb-transport.txt, and therefore a device-specific component. Treat
    them as an optional add-on to the generic design, not as part of it.
 
-9.  Open Decisions
-
+11. Open Decisions
    -  Whether to support the original compiled bytecode at all, or to
       keep only the source language and recompile. Supporting the
       bytecode preserves existing profiles; dropping it removes the need

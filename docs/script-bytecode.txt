@@ -231,68 +231,79 @@ Table of Contents
 
 6.3.  Instruction Set
 
-   Opcodes whose value has bit 0x100 set are followed by a 32-bit operand
-   word. Bit 0x400 marks an unresolved PC-relative operand at compile time
-   and is cleared by the compiler before download.
+   The MNEMONIC column is the original author's own name for each opcode,
+   taken from cfg_OpcodeMnemonics at 00421610 in wishd201.exe - a 43-entry
+   disassembler table the configurator carries. It confirms, independently of
+   the driver, every semantic derived from drv_ScriptExecute.
 
-   +--------+------------------------------------------------------------+
-   | Opcode | Operation                                                  |
-   +========+============================================================+
-   | 0x020  | acc = vars[acc], load variable                             |
-   | 0x021  | t = vars[i]; vars[i]++; acc = t, post-increment            |
-   | 0x022  | t = vars[i]; vars[i]--; acc = t, post-decrement            |
-   | 0x023  | vars[i]++; acc = vars[i], pre-increment                    |
-   | 0x024  | vars[i]--; acc = vars[i], pre-decrement                    |
-   | 0x040  | acc = (acc == 0), logical NOT                              |
-   | 0x041  | acc = ~acc, bitwise NOT                                    |
-   | 0x042  | acc = -acc, negate                                         |
-   | 0x080  | indirect call through acc, dispatched by tag               |
-   | 0x082  | return: pop a return address into PC                       |
-   | 0x093  | push acc                                                   |
-   | 0x095  | swap acc with the top of stack                             |
-   | 0x110  | acc = operand, load immediate                              |
-   | 0x170  | PC += operand, jump                                        |
-   | 0x171  | if acc != 0 then PC += operand, jump if true               |
-   | 0x172  | if acc == 0 then PC += operand, jump if false              |
-   | 0x181  | call the immediate operand, dispatched by tag              |
-   | 0x190  | stack pointer += operand, allocate or release locals       |
-   | 0x192  | acc = (depth + operand) | 0x30000000, address of local     |
-   | 0x230  | pop value; vars[acc] = value, store with reversed operands |
-   | 0x231  | pop index; vars[index] = acc, store                        |
-   | 0x250  | acc = pop << acc                                           |
-   | 0x251  | acc = pop >> acc, arithmetic shift                         |
-   | 0x252  | acc = pop + acc                                            |
-   | 0x253  | acc = pop - acc                                            |
-   | 0x254  | acc = pop * acc                                            |
-   | 0x255  | acc = pop / acc, status 5 if acc is zero                   |
-   | 0x256  | acc = pop % acc, status 5 if acc is zero                   |
-   | 0x257  | acc = pop & acc                                            |
-   | 0x258  | acc = pop | acc                                            |
-   | 0x259  | acc = pop ^ acc                                            |
-   | 0x260  | acc = (pop == acc)                                         |
-   | 0x261  | acc = (pop != acc)                                         |
-   | 0x262  | acc = (pop >  acc)                                         |
-   | 0x263  | acc = (pop <  acc)                                         |
-   | 0x264  | acc = (pop >= acc)                                         |
-   | 0x265  | acc = (pop <= acc)                                         |
-   | 0x266  | acc = (pop && acc)                                         |
-   | 0x267  | acc = (pop || acc)                                         |
-   | 0x294  | acc = pop, discard the top of stack                        |
-   +--------+------------------------------------------------------------+
+   Opcodes with bit 0x100 set are followed by a 32-bit operand word. Bit
+   0x400 marks an unresolved PC-relative operand at compile time and is
+   cleared before download.
 
-   This settles the question left open when the set was recovered from the
-   compiler alone. 0x250 through 0x259 are exactly the ten C operators that
-   have a compound-assignment form, in the order << >> + - * / %% & | ^, and
-   0x260 through 0x267 are the comparison and logical operators, which have
-   none. The compiler-side action numbering matches the standard C grammar
-   ordering of assignment_operator exactly, which is an independent
-   confirmation of both.
+   +-------+-------+------------------------------------------+
+   | Op    | Mnem  | Operation                                |
+   +=======+=======+==========================================+
+   | 0x020 | mem   | acc = vars[acc], load variable           |
+   | 0x021 | mempp | post-increment, mem++                    |
+   | 0x022 | memmm | post-decrement, mem--                    |
+   | 0x023 | ppmem | pre-increment, ++mem                     |
+   | 0x024 | mmmem | pre-decrement, --mem                     |
+   | 0x040 | not   | acc = (acc == 0), logical NOT            |
+   | 0x041 | bnot  | acc = ~acc                               |
+   | 0x042 | neg   | acc = -acc                               |
+   | 0x080 | calla | call through acc, dispatched by tag      |
+   | 0x082 | ret   | pop a return address into PC             |
+   | 0x093 | push  | push acc                                 |
+   | 0x095 | pwap  | swap acc with top of stack (sic)         |
+   | 0x110 | load  | acc = operand, load immediate            |
+   | 0x170 | b     | PC += operand                            |
+   | 0x171 | bt    | branch if acc != 0                       |
+   | 0x172 | bf    | branch if acc == 0                       |
+   | 0x181 | call  | call the immediate operand, by tag       |
+   | 0x190 | stack | stack pointer += operand                 |
+   | 0x191 | bail  | stack pointer += operand, unwind form    |
+   | 0x192 | loc   | acc = (depth + operand) | 0x30000000     |
+   | 0x230 | stors | pop value; vars[acc] = value             |
+   | 0x231 | stora | pop index; vars[index] = acc             |
+   | 0x250 | lshft | acc = pop << acc                         |
+   | 0x251 | rshft | acc = pop >> acc, arithmetic             |
+   | 0x252 | add   | acc = pop + acc                          |
+   | 0x253 | sub   | acc = pop - acc                          |
+   | 0x254 | mul   | acc = pop * acc                          |
+   | 0x255 | div   | acc = pop / acc, status 5 if acc is zero |
+   | 0x256 | mod   | acc = pop % acc, status 5 if acc is zero |
+   | 0x257 | band  | acc = pop & acc                          |
+   | 0x258 | bor   | acc = pop | acc                          |
+   | 0x259 | bxor  | acc = pop ^ acc                          |
+   | 0x260 | eq    | acc = (pop == acc)                       |
+   | 0x261 | ne    | acc = (pop != acc)                       |
+   | 0x262 | gt    | acc = (pop >  acc)                       |
+   | 0x263 | lt    | acc = (pop <  acc)                       |
+   | 0x264 | ge    | acc = (pop >= acc)                       |
+   | 0x265 | le    | acc = (pop <= acc)                       |
+   | 0x266 | and   | acc = (pop && acc)                       |
+   | 0x267 | or    | acc = (pop || acc)                       |
+   | 0x294 | pop   | acc = pop, discard top of stack          |
+   | 0x9f0 | cont  | continue placeholder, backpatched to b   |
+   | 0x9f1 | break | break placeholder, backpatched to b      |
+   | 0xd91 | -     | scope reference, always with bit 0x400   |
+   | 0xd92 | -     | load local, (index) | (depth << 16)      |
+   +-------+-------+------------------------------------------+
 
-   Six opcodes are decoded by the interpreter but were not seen emitted by
-   the compiler: 0x095, 0x171, 0x181, 0x192, 0x230 and 0x294. INFERENCE:
-   these are either reachable only from grammar paths not exercised by the
-   fixed prologue and epilogue, or they are vestigial. Their semantics are
-   still fact, since the interpreter implements them.
+   RESOLVED. Earlier revisions of this note could not say which C operator
+   each code in the 0x250..0x267 block meant, because the bison rule numbers
+   could not be mapped back to tokens. The mnemonic table answers it
+   directly, and the answer matches the inference that was recorded: 0x250
+   through 0x259 are the ten operators with a compound-assignment form, and
+   0x260 through 0x267 are the comparison and logical operators.
+
+   NEW. 0x191, bail, was not separately identified from the driver, because
+   drv_ScriptExecute handles 0x190 and 0x191 in one range test and both
+   adjust the stack pointer. INFERENCE: bail is the unwind used when break or
+   continue leaves a scope, as distinct from the ordinary scope adjust.
+
+   The two 0xd9x opcodes have no entry in the table, so the configurator's
+   disassembler does not cover everything its own code generator emits.
 
 6.4.  Status Codes
 
@@ -322,29 +333,42 @@ Table of Contents
 
    A call whose target carries the 0x40000000 tag is dispatched to
    drv_ScriptNativeCall at 000186a0. This is the scripting language's
-   standard library.
+   standard library, and the NAMES come from cfg_ScriptSymbolNames at
+   004212a0 in wishd201.exe, which the compiler predeclares into its symbol
+   table.
 
-   +------------+-----------------------------------------------------+
-   | Id         | Function                                            |
-   +============+=====================================================+
-   | 0x40000000 | set or clear virtual button 1..16, maintaining the  |
-   |            | 16-bit mask at devext+0x1710                        |
-   | 0x40000001 | set stick absolute, clamped to +/-1200              |
-   | 0x40000002 | move stick relative, same clamp                     |
-   | 0x40000003 | queue event type 0                                  |
-   | 0x40000004 | queue event type 1                                  |
-   | 0x40000005 | queue event type 2                                  |
-   | 0x40000006 | queue event type 3, arguments clamped to 0..0xFFFF  |
-   | 0x40000007 | terminate this thread                               |
-   | 0x40000008 | elapsed milliseconds since the script started       |
-   | 0x40000009 | sleep for n milliseconds, yields with status 9      |
-   | 0x4000000a | restart another thread by id                        |
-   | 0x4000000b | kill a thread by id; killing yourself falls through |
-   |            | to 0x40000007                                       |
-   | 0x4000000c | spawn a thread, at most 30 concurrent               |
-   | 0x4000000d | return this thread's id                             |
-   | 0x40000010 | queue event type 0x4D                               |
-   +------------+-----------------------------------------------------+
+   +------------+-----------------+-------------------------------------+
+   | Id         | Name            | Function                            |
+   +============+=================+=====================================+
+   | 0x40000000 | _button         | set or clear virtual button 1..16   |
+   | 0x40000001 | _stick          | set stick absolute, clamped +/-1200 |
+   | 0x40000002 | _stick_relative | move stick relative, same clamp     |
+   | 0x40000003 | _key            | keyboard event, usage and state     |
+   | 0x40000004 | _mouse_button   | mouse button event                  |
+   | 0x40000005 | _mouse_relative | relative mouse movement             |
+   | 0x40000006 | _mouse_absolute | absolute position, clamped          |
+   |            |                 | 0..0xFFFF                           |
+   | 0x40000007 | _exit           | terminate this thread               |
+   | 0x40000008 | _time           | elapsed milliseconds                |
+   | 0x40000009 | _sleep          | sleep n milliseconds, yields        |
+   | 0x4000000a | _wake           | restart another thread by id        |
+   | 0x4000000b | _kill           | kill a thread by id                 |
+   | 0x4000000c | _fork           | spawn a thread, at most 30          |
+   | 0x4000000d | _getpid         | this thread's id                    |
+   | 0x4000000e | _stick_swap     | NO-OP in this driver                |
+   | 0x4000000f | _set_rumble     | NO-OP in this driver                |
+   | 0x40000010 | _debug          | emits event type 0x4D to user mode  |
+   +------------+-----------------+-------------------------------------+
+
+   _stick_swap and _set_rumble are accepted by the compiler and reach the
+   driver, but drv_ScriptNativeCall falls straight through on ids 0x0E and
+   0x0F. INFERENCE: declared for a revision that implemented them, or
+   reserved and never finished. A script using them compiles and runs and
+   does nothing.
+
+   _debug explains event type 0x4D, which section 7.2 previously recorded as
+   unidentified. It is the script's print statement, delivered to the
+   configurator through IOCTL fn 0x818.
 
    The stick clamp of +/-1200 is the same logical range the joystick
    collection declares in the HID report descriptor, so a script writes
@@ -353,7 +377,35 @@ Table of Contents
    The language is genuinely concurrent. A script can spawn up to 30 threads,
    sleep in milliseconds, and kill or restart its siblings. That is the
    machinery behind behaviour such as "hold A and it emits repeated mouse
-   clicks": a spawned thread loops with sleeps while the parent continues.
+   clicks": _fork a thread that loops with _sleep while the parent continues.
+
+6.5.1.  Event Handlers
+
+   The compiler also predeclares twenty handler names.
+   drv_ScriptDispatchInput at 00017550 reads these out of the script's own
+   variable array and spawns a thread for each one holding a tagged code
+   address.
+
+       variable slots 0x00..0x3F, one per N64 button bit, in bit order:
+
+           on_a    on_b    on_z    on_s        bits 0..3
+           on_du   on_dd   on_dl   on_dr       bits 4..7
+           on_lrs  on_unk  on_l    on_r        bits 8..11
+           on_cu   on_cd   on_cl   on_cr       bits 12..15
+
+       slot +0x40  on_button   any button changed, two button words
+       slot +0x44  on_stick    stick changed, old and new X and Y
+       slot +0x48  on_begin    runs first on any change
+       slot +0x4C  on_end      runs last on any change
+
+   This list CONFIRMS the N64 bit order that ioctl-surface.txt section 7
+   could previously only infer from the driver's button map. Bit 8 is named
+   on_lrs, that is L plus R plus Start, the combination the controller itself
+   reports as its reset bit, and bit 9 is on_unk. Those are exactly the two
+   positions holding filler zeros in the button map.
+
+   The entry point symbol is main. cfg_CompileScript looks it up and emits a
+   call to it in the fixed epilogue.
 
 6.6.  Language Features Rejected By The Compiler
 

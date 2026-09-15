@@ -27,7 +27,7 @@ Table of Contents
 
    1.  Severity Summary
    2.  Defect 1: Button Map Filler Entries
-   3.  Defect 3: Cross-Coupled Stick Acceleration
+   3.  Defect 2: Cross-Coupled Stick Acceleration
    4.  Defect 3: Swapped Sine Interpolation Weights
    5.  What Is Not Affected
 
@@ -59,7 +59,8 @@ Table of Contents
 
    Trigger:  the N64 controller asserts its Reset bit when L + R + Start
              are pressed together. That is the only realistic way bit 8
-             becomes set.
+             becomes set, and it is confirmed by the configurator, which
+             names the bit 8 script handler on_lrs - L, R, Start.
 
    Effect:   while L + R + Start is held, the gamepad reports button 1
              as pressed even though A is not.
@@ -73,7 +74,7 @@ Table of Contents
    button", or better, give the table a sentinel such as 0xFF for "not a
    button" and test for it.
 
-3.  Defect 3: Cross-Coupled Stick Acceleration
+3.  Defect 2: Cross-Coupled Stick Acceleration
 
    Location:  drv_BuildJoystickReport, the acceleration block
 

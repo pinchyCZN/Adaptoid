@@ -1,0 +1,190 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishd201.exe                                                 2001 config tool
+
+
+                  SAVED PROFILE AND SCRIPT STORAGE
+
+
+Abstract
+
+   Where the configurator keeps user work: the script source files, the
+   database that indexes them, and the record format both databases
+   share.
+
+   This is what a replacement must read if existing user profiles are to
+   survive. The scripting language itself is in script-bytecode.txt and
+   the download path to the driver is in ioctl-surface.txt section 5a.
+
+   Everything here is read out of the Ghidra database for wishd201.exe.
+   Statements not directly supported by an instruction or a byte are
+   marked INFERENCE.
+
+Table of Contents
+
+   1.  Files And Locations
+   2.  Script Source Files
+   3.  The Record Format
+   4.  Field Tags
+   5.  Scanning And Rebuilding
+   6.  Consequences For The Replacement
+
+1.  Files And Locations
+
+   The base directory is the configurator's own location. cfg_GetBaseDir
+   calls GetModuleFileNameA on the running module and strips the file
+   name, so everything lives beside wishd201.exe rather than in a user
+   profile or a shared data directory.
+
+   +---------------------+--------------------+------------------------+
+   | Path                | Mode               | Contents               |
+   +=====================+====================+========================+
+   | <exedir>\scripts\   | directory          | *.ac script sources    |
+   | <exedir>\script.db  | rb+                | index of known scripts |
+   | <exedir>\script_n.db| wb                 | rebuild temporary      |
+   | <exedir>\active.db  | rb                 | which scripts are      |
+   |                     |                    | assigned and active    |
+   +---------------------+--------------------+------------------------+
+
+   Paths are assembled by cfg_BaseDirPath for the databases and
+   cfg_ScriptsDirPath for anything under scripts.
+
+   Configuration that is not script related lives in the registry under
+
+       Software\Wish Technologies\Adaptoid
+
+   which is the user-mode side of the same key the driver reads
+   VirtualDevices from; see hid-descriptor.txt section 3.
+
+2.  Script Source Files
+
+   Scripts are ORDINARY TEXT, not a binary or proprietary container. The
+   directory is scanned with the mask *.ac, so that is the extension.
+
+   A newly created script is seeded with
+
+       // Adaptoid Script
+
+       main() {}
+
+   and the configurator also carries fragments used to generate handler
+   stubs, including "int rumble", "int stick_", "int button_" and the
+   "on_" handler prefix. INFERENCE: the UI can write handler skeletons
+   into a script from templates rather than requiring the user to type
+   them. Not established.
+
+   Because the sources are plain text, they are the durable artefact. The
+   databases below are a CACHE and an index over them, not the primary
+   store, which means a replacement can ignore both and simply read the
+   .ac files if it does not need the assignment state.
+
+3.  The Record Format
+
+   script.db and active.db share one format: a flat stream of
+   tag-length-value fields. cfg_DbReadRecord at 004010c0 is the reader
+   and cfg_DbWriteField at 004015f0 the symmetric writer.
+
+   Every field is
+
+       tag    1 byte
+       len    1 byte
+       data   len bytes
+
+   The single length byte caps any field at 255 bytes, which matters for
+   long file names and for the string lists.
+
+   Two tags are control rather than data:
+
+       0x33   end of record
+       0x32   end of file
+
+   Both are written with a length of zero. Any tag not in the table in
+   section 4 is a hard error; the reader cannot skip an unknown field
+   because without a type it does not know whether the payload is a
+   pointer it would later have to free.
+
+   An in-memory record is 13 dwords. cfg_DbRecordInit zeroes it and
+   cfg_DbRecordFree releases the members that were heap allocated.
+
+4.  Field Tags
+
+   +------+-------+---------+--------------------------------------+
+   | Tag  | Field | Reader  | Meaning                              |
+   +======+=======+=========+======================================+
+   | 0x3D | 0     | string  | script name, the table key           |
+   | 0x3E | 1, 2  | fixed   | last-write FILETIME, low then high   |
+   | 0x46 | 3     | string  | not yet identified                   |
+   | 0x47 | 4     | string  | directory component                  |
+   | 0x48 | 5     | string  | file component                       |
+   | 0x49 | 6     | string  | not yet identified                   |
+   | 0x4A | 7     | fixed   | not yet identified                   |
+   | 0x4B | 8     | strlist | not yet identified                   |
+   | 0x4C | 9     | strlist | not yet identified                   |
+   | 0x50 | 10    | string  | not yet identified                   |
+   | 0x5B | 11    | fixed   | slot or index, tracked as a maximum  |
+   | 0x5C | 12    | fixed   | not yet identified                   |
+   +------+-------+---------+--------------------------------------+
+
+   The three readers behave differently and a parser must match them:
+
+       string   allocate len+1, read len bytes, NUL terminate
+       fixed    read len bytes into a fixed buffer in the record
+       strlist  allocate an 8-byte node {string, next}, read the string,
+                and PREPEND it, so repeated tags build a list in reverse
+                order of appearance
+
+   Fields 4 and 5 are a directory and a file name that cfg_CheckInstall
+   joins and probes with FindFirstFileA, so a record can point at a file
+   outside the scripts directory. INFERENCE: this supports scripts
+   installed alongside a game rather than in the shared directory. Not
+   established.
+
+   Field 11 is read into a slot the scanner compares against a running
+   maximum, which reads as an index or an assignment number.
+
+   Tag numbering is sparse and out of order, which suggests tags were
+   assigned as fields were added over time rather than renumbered.
+
+5.  Scanning And Rebuilding
+
+   cfg_ScanScriptDir at 00407690 reconciles the directory with the
+   database on startup and whenever the directory changes. The
+   configurator watches for that with FindFirstChangeNotificationA, so
+   editing a .ac file in another editor is noticed without a restart.
+
+       1  enumerate <exedir>\scripts\*.ac, recording each file name and
+          its last-write FILETIME into an in-memory table
+       2  open script.db and read it record by record
+       3  for each record, compare the stored FILETIME against the file
+          on disk
+       4  unchanged records are kept as they are
+       5  the first changed or missing record switches the scan into
+          rebuild mode: everything read so far is copied into
+          script_n.db and the rest of the scan writes there
+       6  on success, delete script.db and rename script_n.db over it
+       7  finally read active.db into a second table
+
+   The rebuild is all-or-nothing and goes through a temporary file, so an
+   interrupted scan leaves the original script.db intact. That is worth
+   preserving.
+
+6.  Consequences For The Replacement
+
+   -  The .ac sources are the real user data. Any replacement should read
+      and write those, and treat the databases as a rebuildable cache.
+
+   -  Storing everything beside the executable does not work on a modern
+      Windows install, where Program Files is not writable by a normal
+      user. A port must move the data to a per-user location, and should
+      migrate an existing installation's files rather than stranding
+      them.
+
+   -  The record format is trivially portable: byte tags, byte lengths,
+      no alignment, no pointer-sized fields. It survives a 64-bit port
+      untouched. Whether it is worth keeping is a different question,
+      since a replacement that regenerates its own index has no reason to
+      keep a 255-byte field limit.
+
+   -  Seven of the thirteen fields are not yet identified. They can be
+      settled by dumping a real script.db and matching field contents
+      against a known set of scripts, which is faster than reading more
+      code.

@@ -47,9 +47,10 @@ Table of Contents
 2.  Planned Documents
 
    Written so far: hid-descriptor.txt, ioctl-surface.txt, script-
-   bytecode.txt, known-defects.txt, usb-transport.txt, driver-lifecycle.txt,
-   function-map.txt and replacement-architecture.txt. The rest are listed so
-   findings land in a predictable place rather than accumulating in one file.
+   bytecode.txt, script-language.txt, known-defects.txt, usb-transport.txt,
+   driver-lifecycle.txt, function-map.txt, config-format.txt and replacement-
+   architecture.txt. The rest are listed so findings land in a predictable
+   place rather than accumulating in one file.
 
    +-----------------------+---------------------------------------------+
    | File                  | Contents                                    |

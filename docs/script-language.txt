@@ -1,0 +1,267 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishd201.exe                                                 2001 config tool
+
+
+                    SCRIPT SOURCE LANGUAGE
+
+
+Abstract
+
+   The surface language a user actually writes, as opposed to the
+   bytecode it compiles to. script-bytecode.txt covers the compiler, the
+   instruction set and the runtime; this note covers the syntax.
+
+   The headline finding is that there is NO keyword table to read. The
+   lexer is flex-generated and the keywords exist only as paths through
+   its DFA. The complete token set below was recovered by reconstructing
+   that automaton and walking it.
+
+   Everything here is read out of the Ghidra database for wishd201.exe.
+   Statements not directly supported by an instruction or a byte are
+   marked INFERENCE.
+
+Table of Contents
+
+   1.  There Is No Keyword Table
+   2.  Recovering The Token Set
+   3.  Keywords
+   4.  What Is Missing From C
+   5.  Constants And Identifiers
+   6.  Operators And Punctuation
+   7.  Declarations And Storage
+   8.  Rejected Constructs
+   9.  Program Structure
+   10. Worked Example
+   11. Open Questions
+
+1.  There Is No Keyword Table
+
+   Searching wishd201.exe for keyword strings finds nothing: the only
+   match for "while" anywhere in the image is the message "while loading
+   script". There is no yytname either, so the parser was not built with
+   a token-name table.
+
+   That is not an omission. flex compiles keywords directly into the
+   scanner's transition tables, so "while" exists only as a path through
+   a state machine. Recovering the keyword set therefore means
+   reconstructing the automaton.
+
+2.  Recovering The Token Set
+
+   cfg_yylex at 0040aa80 contains the standard flex inner loop, and its
+   table references give the addresses:
+
+       yy_accept  00420528  words
+       yy_ec      00420640  32-bit entries, low byte used
+       yy_meta    00420a40  32-bit entries, low byte used
+       yy_base    00420b18  words
+       yy_def     00420c38  words
+       yy_nxt     00420d58  words
+       yy_chk     00420f00  words
+
+   The tables tile exactly, and yy_chk ends at 004210a8 where the string
+   "parse error" begins, which is a useful confirmation that the extents
+   are right. The automaton has 144 states and 54 equivalence classes.
+
+   tools/lexdfa.py embeds those tables, simulates the flex loop and
+   walks the automaton, visiting each state once with its shortest
+   spelling. It reports 131 reachable states and 68 distinct accepting
+   rules. Everything in sections 3 to 6 is its output.
+
+   The equivalence classes are themselves informative before any
+   simulation: the letters a, b, c, d, e, f, g, h, i, k, l, n, o, r, s,
+   t, u, w and x each get their own class, while j, m, p, q, v, y, z and
+   underscore share one. Only letters that can begin or distinguish a
+   keyword need to be told apart.
+
+   CAVEAT: only yy_ec for printable ASCII was extracted, so rules keyed
+   on newline or tab are not enumerated. Rules 2, 70 and 71 are
+   consequently unaccounted for. INFERENCE: one of them is the
+   line-comment or newline rule.
+
+3.  Keywords
+
+   Sixteen, and that is the complete set.
+
+       auto      break     case      continue
+       default   do        else      extern
+       for       goto      if        int
+       return    static    switch    while
+
+   Rules 3 through 18 in scanner order, which is alphabetical, so they
+   were almost certainly written as a simple alphabetical block in the
+   .l file.
+
+4.  What Is Missing From C
+
+   The absences define the language as much as the keywords do. None of
+   the following is a keyword:
+
+       char     const    double   enum     float    long
+       register short    signed   sizeof   struct   typedef
+       union    unsigned void     volatile
+
+   So int is the ONLY type. There are no structs, unions, enums,
+   typedefs, floating point, or type qualifiers, and no void - a function
+   with no useful result simply returns int.
+
+   This matches the runtime exactly. The interpreter in wishk201.sys is a
+   32-bit integer stack machine with no floating point and no aggregate
+   types; see script-bytecode.txt section 6.1.
+
+5.  Constants And Identifiers
+
+       rule 19   identifier
+       rule 20   hexadecimal constant, 0x or 0X prefix
+       rule 21   octal constant, leading 0
+       rule 22   decimal constant
+       rule 23   character constant, single quotes
+       rule 69   string literal, double quotes
+
+   Both 0x and 0X are accepted: uppercase X has its own equivalence
+   class purely so the hex prefix can be recognised either way.
+
+   INFERENCE: string literals are lexed but there is no obvious use for
+   them in a language with no string type and no builtin that takes one.
+   They may exist only because the .l file was adapted from a stock C
+   scanner. Not established.
+
+6.  Operators And Punctuation
+
+   Compound assignment, ten forms:
+
+       +=   -=   *=   /=   %=   &=   ^=   |=   <<=   >>=
+
+   Two-character operators:
+
+       ++   --   &&   ||   <<   >>   <=   >=   ==   !=
+
+   Single characters:
+
+       ;   {   }   ,   :   =   (   )   [   ]   .
+       &   !   ~   -   +   *   /   %   <   >   ^   |   ?
+
+   Comments open with /* and whitespace is rule 68.
+
+   The ten compound-assignment forms line up exactly with the ten
+   operators in the 0x250..0x259 block of the instruction set, which is
+   what settled that block's meaning; see script-bytecode.txt section
+   6.3.
+
+   Note that [ ] and . are lexed, so array subscripting and member
+   selection are syntactically available even though there are no
+   aggregate types to use them on. & is present both as bitwise AND and,
+   potentially, as address-of. INFERENCE: inherited from the stock C
+   grammar rather than deliberately supported. The presence of ? and :
+   confirms the conditional operator, which the compiler implements with
+   the branch opcodes rather than a dedicated instruction.
+
+7.  Declarations And Storage
+
+   Three storage classes are lexed: auto, static and extern. The
+   compiler's diagnostics show how they are treated:
+
+       "symbol cannot be both auto and static"
+       "extern keyword not supported"
+       "symbol already declared before"
+       "undeclared symbol"
+       "cannot modify an expression"
+       "you must be in a loop to use this"
+
+   So auto and static are real, extern is rejected, and variables must be
+   declared before use. static gives a variable that persists across
+   invocations of a handler, which is what makes stateful behaviour such
+   as smoothing possible.
+
+   "you must be in a loop to use this" is the diagnostic for break or
+   continue outside a loop.
+
+8.  Rejected Constructs
+
+   switch, case, default and goto are all KEYWORDS - the lexer returns
+   them and the grammar has productions for them - but the corresponding
+   parser actions raise an error instead of emitting code:
+
+       "switch keyword not supported"     grammar action 0x69
+       "case keyword not supported"       grammar action 0x58
+       "default keyword not supported"    grammar action 0x59
+       "goto keyword not supported"       grammar action 0x76
+       "labels not supported"             grammar action 0x57
+
+   This is the signature of a stock C grammar that was adopted whole and
+   then had the unwanted parts disabled at the action level rather than
+   removed from the grammar. It is why the keyword list looks more
+   complete than the language actually is.
+
+   What remains for control flow: if, else, while, for, do, break,
+   continue and return.
+
+9.  Program Structure
+
+   A script is a set of functions. The entry point is main, which
+   cfg_CompileScript looks up by name and calls from the fixed epilogue;
+   see script-bytecode.txt section 3.
+
+   Event handlers are ordinary functions with reserved names, predeclared
+   by the compiler. There are twenty: sixteen per-button handlers in N64
+   bit order plus on_button, on_stick, on_begin and on_end. The runtime
+   spawns a thread for each handler a script defines. Builtins are the
+   seventeen underscore-prefixed functions. Both lists are in
+   script-bytecode.txt section 6.5.
+
+   A newly created script is seeded with
+
+       // Adaptoid Script
+
+       main() {}
+
+10. Worked Example
+
+   The configurator carries real script text used to assemble handlers
+   from UI settings. This fragment is quoted verbatim from 0041e4a4 and
+   is the best available sample of idiomatic source:
+
+       // smooth mouse position
+       {
+           int decel = 100;
+           static int mx=32768, my=32768;
+           static int ox=0, oy=0;
+
+           if (x < -1200) x = -1200;
+           if (x >  1200) x =  1200;
+           if (y < -1200) y = -1200;
+           if (y >  1200) y =  1200;
+
+           if (x > -1150 && x < 1150 && y > -1150 && y < 1150)
+               decel = ...
+
+   and elsewhere in the same block:
+
+       // linear mouse position
+       _mouse_absolute( x * 65535 / 2400 + 32768, y * 65535 / 2400 + 32768);
+
+       _stick( x,-y);  // flip y axis
+
+   Note the idiom: the stick range of +/-1200 appears directly as a
+   literal, and absolute mouse position is computed by mapping that range
+   onto 0..65535 centred at 32768. Both match the clamps the driver
+   applies in drv_ScriptNativeCall.
+
+   The templates also show the compiler accepts a declaration list with
+   multiple initialisers, block-local scopes, and // line comments
+   alongside the /* form the DFA reports.
+
+11. Open Questions
+
+   -  Scanner rules 2, 70 and 71, which were not reachable because only
+      printable ASCII was extracted from yy_ec. One is probably the
+      line-comment or newline rule, given that // comments appear
+      throughout the sample source.
+
+   -  Whether string literals and the [ ] and . operators are reachable
+      from the grammar at all, or are dead lexical baggage from the
+      stock C scanner.
+
+   -  Whether functions may take parameters and return values in
+      practice. The grammar has the productions and the call opcodes
+      exist; no sample exercises them.
