@@ -17,7 +17,13 @@ Abstract
    the driver.
 
    This note records the location of the compiler, the compile pipeline, the
-   download buffer format, the instruction encoding, and the opcode set.
+   download buffer format, the instruction encoding, the complete opcode set
+   and the native builtin library.
+
+   The opcode set was recovered from the compiler and then confirmed
+   instruction by instruction against the driver-side interpreter, so the
+   semantics in section 6 are read out of executing code rather than deduced
+   from code generation.
 
    Everything here is read out of the Ghidra database for wishd201.exe, with
    driver-side cross-checks against wishk201.sys. Statements not directly
@@ -31,8 +37,9 @@ Table of Contents
    4.  Download Buffer Format
    5.  Instruction Encoding
    6.  Opcodes
-   7.  Consequences For The Replacement Driver
-   8.  Open Questions
+   7.  Input Events
+   8.  Consequences For The Replacement Driver
+   9.  Open Questions
 
 1.  Evidence That It Is Flex And Bison
 
@@ -176,95 +183,179 @@ Table of Contents
 
 6.  Opcodes
 
-   Recovered by enumerating every caller of cfg_EmitWord and
-   cfg_EmitOpOperand: 30 and 21 call sites respectively, across the
-   cfg_yyparse action switch and five code generation helpers.
+   The opcode set was first recovered from the compiler by enumerating every
+   caller of cfg_EmitWord and cfg_EmitOpOperand in wishd201.exe. It has since
+   been confirmed against the driver-side interpreter, drv_ScriptExecute at
+   00017b90 in wishk201.sys, which decodes every one of them. The semantics
+   below are read out of that interpreter and are FACT, not inference.
 
-6.1.  Instructions With An Operand
+   The machine is a stack machine with a register accumulator. Below, "acc"
+   is the accumulator and "pop" is the value taken off the operand stack.
 
-   +--------+---------------------------------------------------+
-   | Opcode | Operand and meaning                               |
-   +========+===================================================+
-   | 0x110  | Push a symbol value. Operand is the symbol field  |
-   |        | +0x14. Globals are tagged by or-ing 0x20000000    |
-   |        | into the operand.                                 |
-   | 0x170  | Unconditional jump. Operand is a signed word      |
-   |        | displacement.                                     |
-   | 0x172  | Conditional jump, taken when the tested value is  |
-   |        | false.                                            |
-   | 0x190  | Scope adjust. Emitted with +N on entry and -N on  |
-   |        | exit by cfg_CloseScopeAndBackpatch. Local frame   |
-   |        | allocation.                                       |
-   | 0x9f0  | continue placeholder. Backpatched to 0x170        |
-   |        | targeting the loop increment section.             |
-   | 0x9f1  | break placeholder. Backpatched to 0x170 targeting |
-   |        | the loop exit.                                    |
-   | 0xd91  | Scope reference, always emitted with bit 0x400    |
-   |        | set. Operand high half is the scope id. Precedes  |
-   |        | 0x9f0 and 0x9f1.                                  |
-   | 0xd92  | Load a local. Operand is (index & 0xFFFF) or-ed   |
-   |        | with (depth << 16).                               |
-   +--------+---------------------------------------------------+
+6.1.  Machine State
 
-6.2.  Instructions Without An Operand
+   +-------------+-------------------+----------------------------+
+   | Item        | Location          | Notes                      |
+   +=============+===================+============================+
+   | code        | devext+0x1650     | devext+0x1648 words        |
+   | variables   | devext+0x1654     | devext+0x164c dwords       |
+   | stack       | vars + varcount*4 | hard limit 200 dwords      |
+   | accumulator | register          | working value              |
+   | PC          | register          | word index into code       |
+   | budget      | devext+0x1670     | starts at 0x186A0 = 100000 |
+   +-------------+-------------------+----------------------------+
 
-   +--------+----------------------------------------------------+
-   | Opcode | Context                                            |
-   +========+====================================================+
-   | 0x020  | Emitted in actions 1, 7 and 0x38, and in the       |
-   |        | epilogue.                                          |
-   | 0x021  | Action 8.                                          |
-   | 0x022  | Action 9.                                          |
-   | 0x023  | Action 0x0F.                                       |
-   | 0x024  | Action 0x10.                                       |
-   | 0x040  | Value of action 0x17.                              |
-   | 0x041  | Value of action 0x16.                              |
-   | 0x042  | Value of action 0x15.                              |
-   | 0x080  | Emitted after 0x020 in action 7 and in the         |
-   |        | epilogue.                                          |
-   | 0x082  | Final instruction of the epilogue and of actions   |
-   |        | 0x79, 0x7A and 0x81. INFERENCE: return or end of   |
-   |        | script.                                            |
-   | 0x093  | Emitted between a left and a right operand in      |
-   |        | every binary construction, and counted by the      |
-   |        | argument counter at DAT_0045b480 when building a   |
-   |        | call argument list. INFERENCE: push or operand     |
-   |        | separator.                                         |
-   | 0x231  | Terminates a call sequence: callee, 0x093,         |
-   |        | arguments, 0x231. Emitted by cfg_EmitStoreToSymbol |
-   |        | and actions 0x37, 0x38, 0x4C and 0x83.             |
-   |        | INFERENCE: call.                                   |
-   +--------+----------------------------------------------------+
+   The instruction budget is decremented once per instruction and the quantum
+   ends with status 10 when it reaches zero. That is the runaway-script
+   guard, and it is the reason an infinite loop in a script does not hang the
+   machine.
 
-6.3.  The Operator Block, 0x250 To 0x267
+   Note for anyone reading the same code in Ghidra: the constant 0x186A0 is
+   stored into devext+0x1670 by drv_ScriptLoad, and Ghidra renders it as
+   FUN_000186a0 because a function happens to exist at that address. It is
+   the number 100000, not a function pointer.
 
-   A contiguous family of 18 operator opcodes, all emitted with no operand,
-   after the pattern: left, 0x093, right, operator.
+6.2.  Pointer Tags
 
-   Ten are produced by actions 0x39 through 0x42, whose values are consumed
-   by action 0x13 as a plain binary operator:
+   Values that denote an address carry a 4-bit tag in the high nibble. The
+   interpreter switches on it in opcodes 0x080 and 0x181.
 
-       action  0x39  0x3A  0x3B  0x3C  0x3D  0x3E  0x3F  0x40  0x41  0x42
-       opcode  0x254 0x255 0x256 0x252 0x253 0x250 0x251 0x257 0x259 0x258
+   +------------+----------------------------------------------------+
+   | Tag        | Meaning                                            |
+   +============+====================================================+
+   | 0x10000000 | address of code, a script function                 |
+   | 0x20000000 | global variable slot, emitted by the compiler      |
+   | 0x30000000 | address of a stack local, produced by opcode 0x192 |
+   | 0x40000000 | native builtin id, see section 6.5                 |
+   +------------+----------------------------------------------------+
 
-   The same ten plus eight more are produced by the compound-assignment
-   actions 0x19 through 0x33:
+6.3.  Instruction Set
 
-       action  0x19  0x1A  0x1B  0x1D  0x1E  0x20  0x21  0x23  0x24
-       opcode  0x254 0x255 0x256 0x252 0x253 0x250 0x251 0x263 0x262
+   Opcodes whose value has bit 0x100 set are followed by a 32-bit operand
+   word. Bit 0x400 marks an unresolved PC-relative operand at compile time
+   and is cleared by the compiler before download.
 
-       action  0x25  0x26  0x28  0x29  0x2B  0x2D  0x2F  0x31  0x33
-       opcode  0x265 0x264 0x260 0x261 0x257 0x259 0x258 0x266 0x267
+   +--------+------------------------------------------------------------+
+   | Opcode | Operation                                                  |
+   +========+============================================================+
+   | 0x020  | acc = vars[acc], load variable                             |
+   | 0x021  | t = vars[i]; vars[i]++; acc = t, post-increment            |
+   | 0x022  | t = vars[i]; vars[i]--; acc = t, post-decrement            |
+   | 0x023  | vars[i]++; acc = vars[i], pre-increment                    |
+   | 0x024  | vars[i]--; acc = vars[i], pre-decrement                    |
+   | 0x040  | acc = (acc == 0), logical NOT                              |
+   | 0x041  | acc = ~acc, bitwise NOT                                    |
+   | 0x042  | acc = -acc, negate                                         |
+   | 0x080  | indirect call through acc, dispatched by tag               |
+   | 0x082  | return: pop a return address into PC                       |
+   | 0x093  | push acc                                                   |
+   | 0x095  | swap acc with the top of stack                             |
+   | 0x110  | acc = operand, load immediate                              |
+   | 0x170  | PC += operand, jump                                        |
+   | 0x171  | if acc != 0 then PC += operand, jump if true               |
+   | 0x172  | if acc == 0 then PC += operand, jump if false              |
+   | 0x181  | call the immediate operand, dispatched by tag              |
+   | 0x190  | stack pointer += operand, allocate or release locals       |
+   | 0x192  | acc = (depth + operand) | 0x30000000, address of local     |
+   | 0x230  | pop value; vars[acc] = value, store with reversed operands |
+   | 0x231  | pop index; vars[index] = acc, store                        |
+   | 0x250  | acc = pop << acc                                           |
+   | 0x251  | acc = pop >> acc, arithmetic shift                         |
+   | 0x252  | acc = pop + acc                                            |
+   | 0x253  | acc = pop - acc                                            |
+   | 0x254  | acc = pop * acc                                            |
+   | 0x255  | acc = pop / acc, status 5 if acc is zero                   |
+   | 0x256  | acc = pop % acc, status 5 if acc is zero                   |
+   | 0x257  | acc = pop & acc                                            |
+   | 0x258  | acc = pop | acc                                            |
+   | 0x259  | acc = pop ^ acc                                            |
+   | 0x260  | acc = (pop == acc)                                         |
+   | 0x261  | acc = (pop != acc)                                         |
+   | 0x262  | acc = (pop >  acc)                                         |
+   | 0x263  | acc = (pop <  acc)                                         |
+   | 0x264  | acc = (pop >= acc)                                         |
+   | 0x265  | acc = (pop <= acc)                                         |
+   | 0x266  | acc = (pop && acc)                                         |
+   | 0x267  | acc = (pop || acc)                                         |
+   | 0x294  | acc = pop, discard the top of stack                        |
+   +--------+------------------------------------------------------------+
 
-   INFERENCE: the ten shared codes are the operators that have a compound-
-   assignment form in C, and there are exactly ten of those: *= /= %= += -=
-   <<= >>= &= ^= |=. The codes appearing only in the second group would then
-   be the comparison and logical operators, which have no compound form. The
-   specific opcode-to-operator assignment is NOT established, because the
-   grammar rule numbers cannot be mapped back to C tokens without the
-   original .y file.
+   This settles the question left open when the set was recovered from the
+   compiler alone. 0x250 through 0x259 are exactly the ten C operators that
+   have a compound-assignment form, in the order << >> + - * / %% & | ^, and
+   0x260 through 0x267 are the comparison and logical operators, which have
+   none. The compiler-side action numbering matches the standard C grammar
+   ordering of assignment_operator exactly, which is an independent
+   confirmation of both.
 
-6.4.  Language Features Rejected By The Compiler
+   Six opcodes are decoded by the interpreter but were not seen emitted by
+   the compiler: 0x095, 0x171, 0x181, 0x192, 0x230 and 0x294. INFERENCE:
+   these are either reachable only from grammar paths not exercised by the
+   fixed prologue and epilogue, or they are vestigial. Their semantics are
+   still fact, since the interpreter implements them.
+
+6.4.  Status Codes
+
+   +------+------------------------------+
+   | Code | Meaning                      |
+   +======+==============================+
+   | 0    | still running                |
+   | 1    | thread terminated            |
+   | 2    | bad variable index           |
+   | 3    | stack underflow              |
+   | 4    | stack overflow               |
+   | 5    | divide by zero               |
+   | 6    | PC or address out of range   |
+   | 7    | illegal opcode               |
+   | 8    | unknown native builtin       |
+   | 9    | sleeping, reschedule         |
+   | 10   | instruction budget exhausted |
+   +------+------------------------------+
+
+   On any fault other than 1, 9 and 0xB the interpreter stashes the thread
+   context and a full copy of the variable array at devext+0x1684 and
+   devext+0x1688, then reports the fault through FUN_00015e00 with event type
+   0x42. Those two buffers are exactly what IOCTL 0xb98c20f4 drains, so that
+   command is a post-mortem dump of a faulted script, not a trace buffer.
+
+6.5.  Native Builtins
+
+   A call whose target carries the 0x40000000 tag is dispatched to
+   drv_ScriptNativeCall at 000186a0. This is the scripting language's
+   standard library.
+
+   +------------+-----------------------------------------------------+
+   | Id         | Function                                            |
+   +============+=====================================================+
+   | 0x40000000 | set or clear virtual button 1..16, maintaining the  |
+   |            | 16-bit mask at devext+0x1710                        |
+   | 0x40000001 | set stick absolute, clamped to +/-1200              |
+   | 0x40000002 | move stick relative, same clamp                     |
+   | 0x40000003 | queue event type 0                                  |
+   | 0x40000004 | queue event type 1                                  |
+   | 0x40000005 | queue event type 2                                  |
+   | 0x40000006 | queue event type 3, arguments clamped to 0..0xFFFF  |
+   | 0x40000007 | terminate this thread                               |
+   | 0x40000008 | elapsed milliseconds since the script started       |
+   | 0x40000009 | sleep for n milliseconds, yields with status 9      |
+   | 0x4000000a | restart another thread by id                        |
+   | 0x4000000b | kill a thread by id; killing yourself falls through |
+   |            | to 0x40000007                                       |
+   | 0x4000000c | spawn a thread, at most 30 concurrent               |
+   | 0x4000000d | return this thread's id                             |
+   | 0x40000010 | queue event type 0x4D                               |
+   +------------+-----------------------------------------------------+
+
+   The stick clamp of +/-1200 is the same logical range the joystick
+   collection declares in the HID report descriptor, so a script writes
+   directly in report units.
+
+   The language is genuinely concurrent. A script can spawn up to 30 threads,
+   sleep in milliseconds, and kill or restart its siblings. That is the
+   machinery behind behaviour such as "hold A and it emits repeated mouse
+   clicks": a spawned thread loops with sleeps while the parent continues.
+
+6.6.  Language Features Rejected By The Compiler
 
    The grammar is a full C expression and statement grammar, but several
    productions raise an error in their action rather than emitting code.
@@ -279,14 +370,14 @@ Table of Contents
        004210b4  "goto keyword not supported"       action 0x76
        00421490  "undeclared symbol"                cfg_EmitSymbolRef
 
-   So the language has if, while, for, do, break, continue, function calls
-   and the full C operator set, but no switch, no goto and no labels.
+   So the language has if, while, for, do, break, continue, function calls,
+   threads and the full C operator set, but no switch, no goto and no labels.
    Variables must be declared before use.
 
-6.5.  Control Flow Construction
+6.7.  Control Flow Construction
 
-   cfg_EmitLoop at 0040c800 builds every loop from four code fragments,
-   namely init, condition, increment and body:
+   cfg_EmitLoop at 0040c800 in wishd201.exe builds every loop from four code
+   fragments, namely init, condition, increment and body:
 
        [init]
        if a condition is present:
@@ -298,42 +389,167 @@ Table of Contents
        [increment]
        0x170  negative displacement back to the top
 
-   The conditional expression forms in actions 0x35, 0x67 and 0x68 use the
-   same two opcodes: 0x172 to skip a branch and 0x170 to jump over the
-   alternative.
+   break and continue are compiled as the placeholders 0x9f1 and 0x9f0 and
+   rewritten into real 0x170 jumps by cfg_CloseScopeAndBackpatch once the
+   loop extent is known. Neither placeholder survives into the downloaded
+   stream, which is why the interpreter has no case for them.
+7.  Input Events
 
-7.  Consequences For The Replacement Driver
+   A script never writes a HID report directly. The native builtins post
+   events onto a list, and once the quantum ends the scheduler drains that
+   list through drv_DispatchEvents at 00015e70. This is the last link in the
+   chain from script source to bytes on the wire.
 
+   Events are 0x14-byte nodes appended by drv_QueueEvent at 00015e00:
+
+       +0x00  flink      +0x04  blink
+       +0x08  type       +0x0C  arg1        +0x10  arg2
+
+   The type splits into two disjoint classes.
+
+7.1.  Types 0 To 2 Become Real HID Input
+
+   These are handled entirely inside the driver and never reach user mode.
+   They are the mechanism by which an N64 button press becomes genuine
+   keyboard or mouse input.
+
+   +------+-------------------------+-----------------------+
+   | Type | Handler                 | Produces              |
+   +======+=========================+=======================+
+   | 0    | drv_HidKeyEvent         | keyboard report, ID 2 |
+   | 1    | drv_HidMouseButtonEvent | mouse report, ID 3    |
+   | 2    | drv_HidMouseMoveEvent   | mouse report, ID 3    |
+   +------+-------------------------+-----------------------+
+
+   Type 0 takes a HID usage and a down flag. Usages 0xE0 to 0xE7 set or clear
+   a bit in the modifier byte at devext+0x1724. Usages 0x04 to 0xA4 are
+   inserted into or removed from the pressed-key array at devext+0x1725,
+   whose count lives at devext+0x17CA. Usage 0 clears everything. The emitted
+   report is:
+
+       0x0D  0x02  <modifiers>  0x00  <ten key bytes>
+
+   The leading 0x0D is a length, so the report proper is 13 bytes: report ID
+   2 followed by the 12-byte payload. That matches the keyboard collection in
+   hid-descriptor.txt exactly. If more than ten keys are held, all ten slots
+   are filled with 0x01, which is the HID ErrorRollOver usage - so the
+   descriptor's unusual ten-slot array is honoured, and overflow is signalled
+   the standard way.
+
+   Type 1 maintains three button bits at devext+0x1714. Type 2 accumulates
+   running totals at devext+0x1718 for X, +0x171C for Y and +0x1720 for the
+   wheel. Both emit the same five-byte form:
+
+       0x05  0x03  <buttons>  <dx>  <dy>  <wheel>
+
+   Again the first byte is a length, so the report is report ID 3 plus four
+   bytes, matching the mouse collection. Both paths share the button byte, so
+   a movement report carries the current button state and a button report
+   carries zero movement.
+
+   Reports leave through drv_SubmitHidReport at 00014de8, which takes a
+   buffer whose first byte is its length.
+
+7.2.  Every Other Type Is A User-Mode Notification
+
+   drv_QueueUserNotification at 00015ae0 appends the node to a queue that
+   lives on the singleton control device, reached as the Wish_NA1 symbolic
+   link, not on the calling adapter and not per handle:
+   drv_AcquireControlDeviceExt returns that one extension to every caller.
+   The queue head is at extension+0x60, counted at +0x5C and capped at 99
+   with the oldest dropped. Every controller posts into it and any waiter can
+   receive any event. See ioctl-surface.txt section 1.2.
+
+   +------+-------------------+---------------------------------------+
+   | Type | Posted by         | Meaning                               |
+   +======+===================+=======================================+
+   | 3    | native 0x40000006 | arguments clamped to 0..0xFFFF.       |
+   |      |                   | INFERENCE: an absolute pointer        |
+   |      |                   | position, which the relative mouse    |
+   |      |                   | collection cannot express, handed to  |
+   |      |                   | user mode to apply. Not established.  |
+   | 0x42 | drv_ScriptExecute | a script fault; arg1 is the           |
+   |      |                   | interpreter status code from          |
+   |      |                   | section 6.4                           |
+   | 0x4D | native 0x40000010 | not established                       |
+   | 99   | FUN_00015dc0      | DEVICE INTERFACE STATE CHANGED.       |
+   |      |                   | Posted by both                        |
+   |      |                   | drv_EnableDeviceInterface and         |
+   |      |                   | drv_DisableDeviceInterface, so it     |
+   |      |                   | signals arrival AND departure. A      |
+   |      |                   | listener must re-enumerate to learn   |
+   |      |                   | which.                                |
+   +------+-------------------+---------------------------------------+
+
+   Delivery is an inverted call. IOCTL 0xb98c2060, function 0x818, arrives at
+   FUN_000159e0, which parks the IRP on the waiting list at extension+0x68 and
+   returns STATUS_PENDING. drv_CompleteNotificationIrps at 00015ba0 pairs a
+   queued event with a waiting IRP, copies type, arg1 and arg2 as three
+   DWORDs into the system buffer, and completes it with Information = 12.
+   That is precisely the 12-byte output recorded for fn 0x818 in ioctl-
+   surface.txt.
+
+7.3.  The Complete Chain
+
+   Putting every stage together, a single line of script becomes application
+   input by this route:
+
+       script source
+         -> cfg_yylex / cfg_yyparse        (wishd201.exe)
+         -> 32-bit opcode stream
+         -> IOCTL 0xb98c20f0               download
+         -> drv_ScriptLoad                 (wishk201.sys)
+         -> drv_ScriptExecute              interpreter quantum
+         -> drv_ScriptNativeCall           builtin, e.g. 0x40000003
+         -> drv_QueueEvent                 event {type, arg1, arg2}
+         -> drv_DispatchEvents             type 0, 1 or 2
+         -> drv_HidKeyEvent etc.           build the report
+         -> drv_SubmitHidReport            hand to hidclass.sys
+         -> the application
+
+   Nothing above the driver is involved, which is the property the
+   replacement must preserve.
+8.  Consequences For The Replacement Driver
    The bytecode is the real configuration format. A replacement driver must
    implement the same interpreter, or the existing configurator cannot drive
    it. Conversely, a replacement configurator must emit the same encoding.
 
    Instructions are 32-bit words with an optional 32-bit operand. Nothing in
    the stream is pointer-sized, so the format itself survives a 64-bit port
-   unchanged, and so does the two-DWORD buffer header.
+   unchanged, and so does the two-DWORD buffer header. The pointer tags in
+   the high nibble, however, assume a 32-bit value: 0x10000000, 0x20000000,
+   0x30000000 and 0x40000000 partition a 32-bit word, and a 64-bit port must
+   keep script values 32-bit rather than widening them.
 
    Branch displacements are 16 bits and relative to the emit point, in words.
    A script long enough to exceed that range would break silently; the
    compiler does not appear to check it.
 
-   The interpreter runs in kernel mode on downloaded data with no signing and
-   no validation visible beyond the length check. A modern port must validate
-   the opcode stream before executing it, because a malformed script is
-   otherwise a kernel-mode fault. In particular a decoder that trusts bit
-   0x100 for stride can be walked off the end of the buffer by a crafted
-   final instruction. This is the single most important security difference
-   between the original design and anything shipped today.
+   On validation, the original is better than a first reading of the IOCTL
+   suggested. The interpreter bounds-checks as it runs: PC outside the code
+   array gives status 6, stack underflow and overflow give 3 and 4, an out-
+   of-range variable index gives 2, division by zero gives 5, an unrecognised
+   opcode gives 7, and an instruction budget of 100000 per quantum bounds a
+   runaway loop with status 10. The operand stack is capped at 200 dwords. A
+   faulted script is stopped and dumped rather than allowed to continue.
 
-8.  Open Questions
+   What is NOT checked is the stream itself at load time. drv_ScriptLoad
+   copies the opcode array in and begins executing it; there is no
+   verification pass, no signing, and no check that the final instruction
+   does not claim an operand. A decoder that trusts bit 0x100 for stride can
+   therefore be walked one word past the end of the buffer by a crafted last
+   instruction, and the per-instruction PC check only catches the jump that
+   follows. Any modern port should validate the whole stream once at load
+   time, which is cheap and removes the entire class.
 
-   - The specific C operator behind each code in the 0x250..0x267 block.
-   Recoverable by matching the bison rule numbers against a standard C
-   grammar, or by compiling known scripts and diffing the output.
+9.  Open Questions
+   - The six opcodes the interpreter decodes but the compiler was not seen to
+   emit: 0x095, 0x171, 0x181, 0x192, 0x230 and 0x294. Which grammar
+   productions reach them, if any.
 
-   - The driver-side interpreter. The load entry is FUN_00017310 in
-   wishk201.sys; the execution loop has not been located yet. Reading it
-   against this table would confirm the inferred semantics of 0x082, 0x093
-   and 0x231.
+   - The FUN_00015e00 event types 0, 1, 2, 3 and 0x4D used by the native
+   builtins. These are how a script actually produces HID input, so decoding
+   them closes the last gap between a script and a report.
 
    - The meaning of the flags word at buffer +0x04, sourced from
    DAT_0045b608, and whether the top two bits of the count dword are flags.
@@ -343,3 +559,8 @@ Table of Contents
 
    - How the 16 per-button script slots relate to the 32 macro slots in the
    driver, which are programmed by a different IOCTL entirely.
+
+   - The scheduler around drv_ScriptExecute: FUN_000177c0 allocates thread
+   contexts, FUN_00017860 queues them and FUN_00017980 drives the timer at
+   devext+0x1690.
+

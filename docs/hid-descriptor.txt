@@ -32,8 +32,9 @@ Table of Contents
    5.  Report Layouts
    6.  Device Identity
    7.  Minidriver IOCTL Surface
-   8.  Consequences For The Replacement Driver
-   9.  Open Questions
+   8.  The Controller Poll
+   9.  Consequences For The Replacement Driver
+   10.  Open Questions
 
 1.  Driver Role
 
@@ -47,12 +48,13 @@ Table of Contents
    descriptor below is what every application sees. Nothing above the
    driver is aware that the bytes originated on an N64 controller.
 
-   drv_DriverEntry installs its dispatch table, calls
-   HidRegisterMinidriver (which replaces that table with the hidclass
-   entry points), saves the replaced pointers to 00019d98..00019db4,
-   and then installs its own wrappers over them. INFERENCE: this is a
-   deliberate interception of the hidclass dispatch path; the purpose
-   of the wrappers is not yet established.
+   drv_DriverEntry installs its dispatch table, calls HidRegisterMinidriver
+   (which replaces that table with the hidclass entry points), saves the
+   replaced pointers to 00019d98..00019db4, and then installs its own
+   wrappers over them. Those wrappers let one driver object serve the private
+   control device and the private per-device channel alongside real HID
+   traffic, which is chained through to hidclass untouched. See ioctl-
+   surface.txt section 1.
 
 2.  Descriptor Storage
 
@@ -228,15 +230,16 @@ Table of Contents
        81 01          Input (Const)
        C0           End Collection
 
-   Fourteen buttons is exactly the N64 button count: A, B, Z, Start, L,
-   R, four C buttons and four D-pad directions. INFERENCE: the mapping
-   of N64 button to HID button number is not established here; it must
-   be read out of the input report builder.
+   Fourteen buttons is exactly the N64 button count: A, B, Z, Start, L, R,
+   four C buttons and four D-pad directions. The mapping is CONFIRMED and is
+   covered in ioctl-surface.txt section 7.
 
    The stick is reported as a 12-bit signed value in the range -1200 to
-   +1200. The raw N64 stick is 8-bit signed, so the driver scales it.
-   INFERENCE: the scale factor and any dead zone are not established
-   here.
+   +1200. The raw N64 stick is 8-bit signed and drv_BuildJoystickReport
+   scales it: Y is negated to convert N64 up-positive into HID down-positive,
+   both axes are multiplied by 16, optional acceleration and sensitivity are
+   applied, and the result is clamped to +/-1200. There is no dead zone. The
+   scaling is detailed in ioctl-surface.txt section 7.1.
 
    Descriptor C at 00019c00 is byte-for-byte this joystick collection on
    its own. Descriptor B at 00019c40 is the mouse and keyboard
@@ -276,9 +279,25 @@ Table of Contents
        byte 3    Y, signed, -127..127, relative
        byte 4    Wheel, signed, -127..127, relative
 
-   INFERENCE: the 12-bit packing in report 1 follows the HID rule that
-   fields are packed with no padding between them. It has not been
-   confirmed against the report builder in the driver.
+   The 12-bit packing in report 1 is CONFIRMED. drv_BuildJoystickReport at
+   00015150 writes exactly this layout, little-endian with no padding between
+   the two fields:
+
+       +0  X bits 0..7
+       +1  X bits 8..11 low nibble, Y bits 0..3 high nibble
+       +2  Y bits 4..11
+       +3  buttons 1..8
+       +4  buttons 9..16
+
+   Reports 2 and 3 are confirmed too: drv_HidKeyEvent and
+   drv_HidMouseButtonEvent assemble them byte for byte as described above,
+   including the ten-slot key array and its ErrorRollOver overflow behaviour.
+   See script-bytecode.txt section 7.
+
+   The layouts for reports 2 and 3 ARE confirmed. drv_HidKeyEvent and
+   drv_HidMouseButtonEvent in wishk201.sys assemble them byte for byte
+   as described above, including the ten-slot key array and its
+   ErrorRollOver overflow behaviour. See script-bytecode.txt section 7.
 
 6.  Device Identity
 
@@ -332,8 +351,118 @@ Table of Contents
    three top-level collections. INFERENCE: the index order has not been
    confirmed against the descriptor.
 
-8.  Consequences For The Replacement Driver
+8.  The Controller Poll
 
+   drv_BuildJoystickReport at 00015150 turns a raw 5-byte controller poll
+   into HID report 1. The raw layout is X, Y, a status byte, then the two
+   button bytes.
+
+8.1.  The Polling Engine
+
+   Controller state arrives as a continuous double-buffered USB interrupt
+   read. Two IRPs are kept in flight at all times, so one read is always
+   outstanding while the other is being processed. There is no timer in this
+   path.
+
+   Two slots of 0x14 bytes are based at devext+0x2f4:
+
+       slot n at devext + n * 0x14
+         +0x2f0  cancel-in-progress latch
+         +0x2f4  the IRP
+         +0x2f8  the URB
+         +0x2fc  5-byte data buffer
+         +0x301  slot active flag
+
+       devext+0x318  stop-reason bitmask; polling runs only while it is 0
+       devext+0x320  restart pending flag
+       devext+0x324  work item used to restart after an error
+
+   drv_PollStart at 00016a70 clears one bit from the stop mask and, once no
+   reasons remain, marks both slots active and submits both IRPs.
+
+   drv_PollSubmit at 00016940 builds each read as a 0x48-byte URB, exactly
+   sizeof(_URB_BULK_OR_INTERRUPT_TRANSFER), with function 0x09
+   (URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER):
+
+       PipeHandle            from devext+0x290 +0x18
+       TransferBufferLength  5
+       TransferFlags         3   IN | SHORT_TRANSFER_OK
+       TransferBuffer        the slot's own buffer at +0x2fc
+
+   It is sent down as IOCTL_INTERNAL_USB_SUBMIT_URB (0x220003) with
+   drv_PollComplete as the completion routine. Five bytes is the entire
+   controller state and matches the raw layout in section 8 exactly.
+
+   drv_PollComplete at 00016c47 validates three things before accepting a
+   packet: IoStatus.Status is zero, the URB status is not negative, and
+   URB->TransferBufferLength is exactly 5. Anything else counts as an error.
+   On success it calls drv_BuildJoystickReport with the slot buffer and
+   immediately resubmits that slot.
+
+   drv_PollStop at 00016b00 ORs a reason into the stop mask, cancels
+   whichever IRPs are outstanding with IoCancelIrp, and frees them.
+
+   ERROR RECOVERY. A failed read queues the work item at devext+0x324, whose
+   routine is drv_PollRestartWorker at 00016da7. That worker tries up to
+   THREE times to reset the pipe and restart polling. If all three fail it
+   takes a give-up path. The retry loop also aborts early on one specific
+   status, 0xC0012345, whose meaning is not established.
+
+   A string "PolRst" sits at 00016c40 and is referenced from inside
+   drv_PollComplete. INFERENCE: a name for the restart work item or a debug
+   tag. Not established.
+
+8.2.  The Status Byte
+
+   The whole function is gated on status & 0xFC == 0x80, so bit 7 is a
+   validity marker and bits 6 through 2 must be clear. Only the low two bits
+   carry data, and they follow the N64 controller status convention:
+
+       bit 0   accessory (Pak) currently present
+       bit 1   accessory removed since the last status query
+
+   The previous value is kept at devext+0x16F5 so transitions can be
+   detected. When bit 1 falls from 1 to 0, devext+0x3E4 is reset to 0, which
+   sends the accessory probe state machine back to the start: 0 means probe
+   needed, 1 means probing, 2 or more means ready. IOCTL fn 0x836 selector 4
+   reads that state. When bit 0 changes, FUN_00013D00 queues a work item with
+   0x34 for inserted and 0x35 for removed.
+
+8.3.  On-Controller Tuning Mode
+
+   The driver implements a live adjustment mode entered from the controller
+   itself, with no user-mode involvement. The entry test is L + R + Z held
+   together with Start. Pressing L + R + Start also makes the controller
+   assert its own Reset bit, which the code accepts as an alternative to
+   Start.
+
+   While the mode is active the stick and D-pad act as controls:
+
+       stick X   devext+0x15E0 = 1e9 / (2400000 / v)^2, where v is the
+                 clamped X plus 1200, giving 0..2400. About 250 at
+                 centre and 1000 at full right.
+       stick Y   devext+0x15DC = (clamped Y + 1200) / 24, giving 0..100
+                 devext+0x15D8 = 100 minus that
+       D-pad     devext+0x15E8 from a fixed set:
+                     D-down              -> 0
+                     D-down + left/right -> 12
+                     D-left or D-right   -> 25
+                     D-up + left/right   -> 50
+                     D-up                -> 100
+
+   Releasing every button in the combination clears bit 1 of devext+0x15E4,
+   leaving 1. The next poll sees exactly 1, zeroes it and calls FUN_00013A60,
+   the effect engine rescan, committing the values.
+
+   devext+0x15E8 then gates a scan of the 32 effect slots for one whose
+   header field equals 0x40 and which is running.
+
+   INFERENCE: a period, a duty cycle and a strength preset, committed to the
+   effect engine on release, reads as live tuning of a Rumble Pak feedback
+   effect from the controller. Not established. See ioctl-surface.txt section
+   5.
+
+9.  Consequences For The Replacement Driver
    The descriptor in section 4 is the contract. A replacement that
    reproduces it byte-for-byte will be indistinguishable to every
    application, which is the stated goal of this project.
@@ -360,17 +489,15 @@ Table of Contents
       AddDevice is workable but coarse. It is recorded here as the
       original behaviour, not as a recommendation.
 
-9.  Open Questions
+10.  Open Questions
+   - The button-combination handler in drv_BuildJoystickReport that sets
+   devext+0x15E4 to 3, and the rate values 0, 12, 25, 50 and 100 it selects
+   from the D-pad. INFERENCE: an on-controller configuration mode.
 
-   -  Which N64 button maps to which HID button number, and where the
-      input report is assembled. Report 1 is built somewhere under the
-      READ_REPORT path at FUN_00015020.
-   -  The stick scaling from 8-bit raw to the -1200..+1200 range, and
-      any dead zone or response curve. A monotonic run of 16-bit values
-      rising to 0x3E8 sits just past the descriptor table near 00019d10;
-      INFERENCE, not confirmed, that this is a response curve.
-   -  What the dispatch wrappers installed after HidRegisterMinidriver
-      actually do, and why the hidclass handlers are saved and chained.
-   -  Whether the remapping bytecode from the configurator arrives via
-      IRP_MJ_DEVICE_CONTROL on drv_DispatchDeviceControl at 00013780.
-      That is the natural next target.
+   - The status byte at raw offset +2, which gates accessory detection and
+   the devext+0x3E4 state machine.
+
+   - The exact payload drv_EffectEvaluate builds for vendor command 0x36, and
+   therefore what the effect slots physically drive. See ioctl-surface.txt
+   section 5.
+

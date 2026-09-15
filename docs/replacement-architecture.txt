@@ -1,0 +1,290 @@
+Adaptoid Reverse Engineering                                 Design Note
+
+
+                  REPLACEMENT ARCHITECTURE
+
+
+Abstract
+
+   The reverse engineering notes in this directory describe what the 2001
+   driver does. This note is different in kind: it records the design
+   decisions for the replacement, and the reasoning behind them, before
+   any code is written.
+
+   The central finding is that the property worth preserving is narrower
+   than it first appears, and it can be had without reproducing the
+   original architecture at all.
+
+   Statements about Windows behaviour here are design reasoning, not
+   reverse engineering. Where something was verified against the
+   binaries, the relevant note is cited.
+
+Table of Contents
+
+   1.  The Property Worth Preserving
+   2.  How The Original Achieves It
+   3.  Why It Is Not A Filter Driver
+   4.  Why The Existing Virtual Pad Drivers Do Not Solve This
+   5.  Candidate Architectures
+   6.  Recommended Design
+   7.  Runtime Attach And Device Restart
+   8.  What Carries Over From The Reverse Engineering
+   9.  Open Decisions
+
+1.  The Property Worth Preserving
+
+   The Adaptoid's distinguishing feature is not that it remaps buttons.
+   Plenty of software does that. It is that the remapped output is
+   indistinguishable from real hardware to every application, including
+   ones that ignore injected input.
+
+   User-mode remappers call SendInput or post messages. Games that read
+   through DirectInput, RawInput or a polling loop on GetAsyncKeyState
+   frequently do not see that input at all. The Adaptoid does, because
+   its keystrokes arrive through kbdclass exactly as a real keyboard's
+   would.
+
+   THAT is the property to preserve. Everything else - the scripting
+   language, the effect engine, the Controller Pak access - is valuable
+   but secondary, and none of it depends on the driver architecture.
+
+2.  How The Original Achieves It
+
+   wishk201.sys is the FUNCTION DRIVER for the device. wishna1.inf
+   matches the hardware ID USB\VID_06F7&PID_0001, and a hardware-ID match
+   outranks the generic HID compatible-ID match that would otherwise load
+   the inbox hidusb path. So PnP loads this driver instead of the inbox
+   one. The configurator also references \inf\input.inf, consistent with
+   it displacing that install.
+
+   drv_DriverEntry then calls HidRegisterMinidriver, which stacks
+   hidclass.sys above it. From there:
+
+       1. hidclass requests a report descriptor
+          (IOCTL_HID_GET_REPORT_DESCRIPTOR)
+       2. the minidriver returns its OWN composite descriptor - mouse,
+          keyboard and joystick, see hid-descriptor.txt section 4
+       3. hidclass creates one child PDO per top-level collection
+       4. kbdhid and kbdclass attach to the keyboard PDO, mouhid and
+          mouclass to the mouse PDO
+
+   Meanwhile the driver reads 5-byte raw packets off the interrupt pipe
+   and SYNTHESISES new HID reports from them; see hid-descriptor.txt
+   section 8.1 for the polling engine and script-bytecode.txt section 7
+   for the report builders.
+
+   The device's own HID personality - the one that makes the adapter work
+   driverless on a modern machine - is simply not used. It is replaced.
+
+3.  Why It Is Not A Filter Driver
+
+   It is tempting to describe the driver as intercepting the controller's
+   USB data and rewriting it. That is a reasonable guess and it is wrong.
+
+   There is nothing above it to intercept and nothing below it producing
+   HID data. It owns the device, speaks the adapter's vendor protocol
+   directly (usb-transport.txt), and manufactures HID reports that have
+   no relationship to what the hardware would have reported on its own.
+
+   The wrapper layer documented in ioctl-surface.txt section 1 IS an
+   interception, but of a different thing entirely: it multiplexes the
+   driver's private configuration API onto the same dispatch table that
+   hidclass owns. It has nothing to do with input.
+
+   This distinction matters because "filter the controller" and "be the
+   controller's driver" lead to completely different replacement designs.
+
+4.  Why The Existing Virtual Pad Drivers Do Not Solve This
+
+   The obvious modern shortcut is an existing virtual controller driver.
+   It does not work, for a structural reason.
+
+   vJoy creates a virtual DirectInput JOYSTICK. ViGEmBus emulates an Xbox
+   360 pad over XUSB, which is not even HID, or a DualShock 4. Both are
+   gamepad emulators by design. Neither emits keyboard or mouse reports.
+
+   The "keyboard and mouse support" visible in those ecosystems runs the
+   other way: mapping a real keyboard and mouse as an input SOURCE onto a
+   virtual gamepad, for playing controller-only games with mouse and
+   keyboard. That is the reverse of what is needed here.
+
+   The missing capability is precisely the one the Adaptoid has: a single
+   virtual device declaring MULTIPLE top-level collections, so that
+   keyboard, mouse and gamepad input can all originate from it.
+
+5.  Candidate Architectures
+
+   +---+--------------------------+----------+------------+-------------+
+   | # | Approach                 | Generic? | Runtime    | Signing     |
+   |   |                          |          | attach     | burden      |
+   +===+==========================+==========+============+=============+
+   | 1 | Per-device HID           | no       | no         | full driver |
+   |   | minidriver, as 2001      |          |            |             |
+   | 2 | Lower filter on the      | partly   | with a     | full driver |
+   |   | USB stack                |          | device     |             |
+   |   |                          |          | restart    |             |
+   | 3 | Virtual composite HID    | yes      | yes        | one driver, |
+   |   | device plus a user-mode  |          |            | logic       |
+   |   | mapper                   |          |            | unsigned    |
+   +---+--------------------------+----------+------------+-------------+
+
+   5.1.  Per-device minidriver
+
+   Reproduce the original: own the device, speak its protocol, present a
+   composite descriptor. Correct, and it is what the original does, but
+   it must be rewritten for every controller, needs an INF per hardware
+   ID, and the whole mapping engine lives in kernel mode where every bug
+   is a bugcheck.
+
+   5.2.  Lower filter on the USB stack
+
+   Sit below hidusb, rewrite the GET_DESCRIPTOR(Report) response to
+   advertise extra collections, and rewrite the interrupt-in data. This
+   is the architecture most people imagine, and it is buildable.
+
+   The costs are real: HID report descriptors must be parsed and rebuilt
+   per device, and the descriptor is consumed when hidclass starts the
+   device, so changing it requires restarting that device rather than
+   flipping a flag.
+
+   5.3.  Virtual composite HID device
+
+   Leave the real controller entirely alone. Create a software-only HID
+   device that declares keyboard, mouse and gamepad collections, and feed
+   it reports from a user-mode service that reads the real controller and
+   runs the mapping.
+
+   Because the virtual device is a genuine HID device, its reports travel
+   the same kbdclass and mouclass path as real hardware. The property
+   from section 1 is preserved in full, even though the mapping logic
+   runs in user mode.
+
+   That is the key realisation: the guarantee comes from the OUTPUT path,
+   not from where the logic runs. The original put the logic in the
+   kernel because in 2001 there was no supported way to create a virtual
+   HID device, not because the kernel was required.
+
+6.  Recommended Design
+
+   Architecture 3, built on the Virtual HID Framework.
+
+   VHF is the supported Windows mechanism for a driver to create a HID
+   device with no hardware behind it. VHF_CONFIG takes a pointer to a raw
+   HID report descriptor and its length, so an arbitrary descriptor -
+   including a multi-collection one - can be supplied verbatim.
+   VhfReadReportSubmit pushes input reports up.
+
+   In outline:
+
+       kernel   a small VHF-based driver whose only job is to create the
+                virtual device from a descriptor handed to it, and to
+                pass input reports through
+
+       user     a service that
+                  - enumerates real controllers
+                  - reads the chosen one (HID or RawInput for HID pads,
+                    XInput for Xbox-family pads, which are not HID)
+                  - runs the mapping and scripting
+                  - submits reports to the virtual device
+
+       optional a device-hiding filter so applications do not also see
+                the original controller and register doubled input
+
+   The descriptor from hid-descriptor.txt section 4 can be used
+   unchanged. Doing so has a specific benefit beyond convenience: report
+   IDs 1, 2 and 3 and the button numbering stay identical, so profiles
+   and muscle memory built on the original still behave the same way.
+
+   Kernel code is then small, generic and stable. It contains no device
+   protocol, no scripting, no timing. Only the virtual device driver
+   needs signing; the mapping engine, including a port of the flex and
+   bison front end, is an ordinary user-mode program that can be
+   developed and debugged normally.
+
+   6.1.  Where the original's timing guarantees go
+
+   The original runs scripts in kernel mode on a timer, with a
+   100000-instruction budget per quantum; see script-bytecode.txt
+   section 6.1. A user-mode service can be descheduled, so its timing is
+   less deterministic.
+
+   In practice this matters far less than it sounds: the script time base
+   is 1/64 second, which a normal thread meets comfortably. If a specific
+   effect turns out to need tighter timing, that piece alone can be moved
+   into the driver later without disturbing the architecture.
+
+7.  Runtime Attach And Device Restart
+
+   The question "can it attach to an arbitrary controller at runtime
+   without a reboot" has a different answer per architecture.
+
+   Architecture 3 - YES, fully dynamic. Nothing touches the source
+   device's driver stack. The service enumerates controllers, the user
+   picks one, and mapping starts. Plugging in a different pad is picked
+   up immediately. No INF per device, no device restart, no reboot.
+
+   Architecture 2 - possible but awkward. One CLASS-WIDE filter can be
+   installed once, with a user-mode app telling it which VID and PID to
+   act on, which avoids an INF per device. But since the advertised
+   report descriptor changes, the target device must be restarted for
+   hidclass to re-read it. That can be triggered programmatically, so the
+   user sees a brief disconnect rather than a reboot.
+
+   Architecture 1 - NO. A new device means a new INF and a driver
+   install.
+
+   Note for Xbox-family controllers specifically: the original Xbox, 360
+   and One pads use XUSB rather than HID, so no HID filter will see them.
+   Under architecture 3 they are simply read through XInput instead,
+   which is a detail of the user-mode service rather than a structural
+   problem. Generic PlayStation-style USB adapters are ordinary HID
+   gamepads and need no special handling.
+
+8.  What Carries Over From The Reverse Engineering
+
+   Under architecture 3, much of the original becomes reference rather
+   than specification. What still matters:
+
+   -  The HID report descriptor and the three report layouts, which
+      should be reproduced exactly. See hid-descriptor.txt.
+
+   -  The bytecode instruction set and the native builtin library, if
+      existing compiled scripts are to keep working. See
+      script-bytecode.txt sections 6 and 7. The interpreter moves to
+      user mode but the semantics do not change.
+
+   -  The button map, because it defines which N64 button becomes which
+      HID button. See ioctl-surface.txt section 7.
+
+   -  The three defects in known-defects.txt, each of which is a
+      deliberate decision rather than an automatic fix. The stick
+      acceleration in particular shaped how the original felt.
+
+   What does NOT carry over: the USB vendor protocol, the accessory
+   probe, the polling engine, the PnP and power paths, and the whole
+   private IOCTL surface. Those exist to talk to Adaptoid hardware, and
+   under architecture 3 the inbox HID driver does that job.
+
+   The one case where they DO still matter is Adaptoid-specific
+   functionality that no generic path provides: Controller Pak read and
+   write, and Rumble Pak feedback. Those need the vendor protocol in
+   usb-transport.txt, and therefore a device-specific component. Treat
+   them as an optional add-on to the generic design, not as part of it.
+
+9.  Open Decisions
+
+   -  Whether to support the original compiled bytecode at all, or to
+      keep only the source language and recompile. Supporting the
+      bytecode preserves existing profiles; dropping it removes the need
+      to reimplement the interpreter exactly.
+
+   -  Whether to reproduce the stick acceleration defect, make it an
+      option, or fix it silently.
+
+   -  Whether the Adaptoid-specific add-on is worth building at all, or
+      whether Controller Pak access and rumble are better left to the
+      original hardware on an original machine.
+
+   -  Whether to hide the source controller from applications by default.
+      Hiding avoids doubled input but surprises users who expect the pad
+      to still work normally in other software.

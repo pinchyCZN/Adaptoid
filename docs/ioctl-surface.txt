@@ -36,46 +36,100 @@ Table of Contents
 
 1.  How User Mode Reaches The Driver
 
-   drv_DriverEntry installs drv_DispatchDeviceControl (00013780) into
-   MajorFunction[0x0E] before calling HidRegisterMinidriver, so
-   hidclass.sys takes ownership of that entry. When the call returns,
-   DriverEntry saves the hidclass handler to 00019dac and installs
-   drv_DeviceControlTriage (00011a80) over the top.
+   drv_DriverEntry fills the dispatch table, calls HidRegisterMinidriver -
+   which overwrites it with the hidclass.sys entry points - then saves those
+   pointers to 00019d98..00019db4 and installs its own wrappers on top.
 
-   The consequence is that every user-mode DeviceIoControl arrives at
-   drv_DeviceControlTriage first, and hidclass.sys only sees the ones
-   the minidriver chooses to forward. The triage is:
+   The effect is that one driver object serves three different kinds of
+   client from a single dispatch table, with no filter driver and no second
+   driver. Every wrapper performs the same triage.
 
-   +---+--------------------------------------+--------------------------+
-   | # | Test                                 | Target                   |
-   +===+======================================+==========================+
-   | 1 | devext starts 3E178AA3 7625F013      | drv_IoctlControlDevice   |
-   |   | ED739374                             | (00 01 06 1f)            |
-   | 2 | FileName.Length == 4 and             | drv_IoctlViaHidHandle    |
-   |   | FileName.Buffer[1] == 0x71 ('q')     | (00 01 27 10)            |
-   | 3 | neither                              | chain to 00019dac        |
-   | 4 | chain pointer null                   | STATUS_NOT_SUPPORTED     |
-   +---+--------------------------------------+--------------------------+
+   +---+----------------------------------------+-------------------------------------+
+   | # | Test                                   | Routed to                           |
+   +===+========================================+=====================================+
+   | 1 | device extension begins with the magic | the private control device handlers |
+   |   | 3E178AA3 7625F013 ED739374             |                                     |
+   | 2 | FileObject->FileName.Length == 4 and   | the private per-device handlers     |
+   |   | FileName.Buffer[1] == 0x71, 'q'        |                                     |
+   | 3 | neither                                | the saved hidclass.sys handler      |
+   | 4 | saved pointer is null                  | STATUS_NOT_SUPPORTED                |
+   +---+----------------------------------------+-------------------------------------+
 
-   Test 1 identifies a separate global control device object by a
-   12-byte magic value at the head of its device extension. It is not
-   tied to any one controller, and it owns the enumeration and
-   driver-wide commands in section 3.
+   Test 2 is an open of the ordinary HID device interface path with a two-
+   character suffix, claimed by the minidriver before hidclass can see it.
+   Only Buffer[1] is actually tested. INFERENCE: the first character is
+   almost certainly a backslash, giving a relative open of "\q", but the code
+   does not check it, so any first character works.
 
-   Test 2 is the more interesting one. User mode opens the ordinary HID
-   device interface path with a two-character suffix whose second
-   character is 'q', and the minidriver claims the handle before
-   hidclass can see it. Only Buffer[1] is actually tested.
+1.1.  The Wrapper Table
 
-   INFERENCE: the first character is almost certainly a backslash,
-   giving a relative open of "\q" against the HID interface path. The
-   code does not test it, so any first character works.
+   +--------+----------------+-------------------------+---------------+
+   | Offset | Major function | Wrapper                 | Saved pointer |
+   +========+================+=========================+===============+
+   | 0x38   | CREATE         | drv_CreateTriage        | 00019d98      |
+   | 0x40   | CLOSE          | drv_CloseTriage         | 00019da0      |
+   | 0x44   | READ           | drv_ReadTriage          | 00019da4      |
+   | 0x48   | WRITE          | drv_WriteTriage         | 00019da8      |
+   | 0x70   | DEVICE_CONTROL | drv_DeviceControlTriage | 00019dac      |
+   | 0x80   | CLEANUP        | drv_CleanupTriage       | 00019d9c      |
+   | 0x90   | POWER          | drv_PowerTriage         | 00019db4      |
+   | 0xa4   | PNP            | drv_PnpTriage           | 00019db0      |
+   +--------+----------------+-------------------------+---------------+
 
-   Both private paths converge on drv_IoctlDeviceCommand (00012bc0).
-   The control-device path carries a 4-byte device id at the front of
-   the input buffer and strips it before forwarding; the 'q' path has
-   the device implied by the file object and forwards the buffer
-   unchanged. That is the only difference between them.
+   The wrappers come in three shapes.
+
+   Four-way, for CREATE, CLEANUP, CLOSE and DEVICE_CONTROL: all four routes
+   above. Note that the 'q' handlers for create and close are FUN_00012690
+   and FUN_000126f0, which are the minidriver's ORIGINAL handlers, the ones
+   installed before HidRegisterMinidriver replaced them. The private channel
+   reuses them rather than duplicating the code.
+
+   Three-way, for READ and WRITE: magic goes to FUN_000113b0, everything else
+   chains. There is no 'q' route, so the private per-device channel is IOCTL-
+   only.
+
+   Two-way, for PNP and POWER: the magic case completes with
+   STATUS_NOT_SUPPORTED and everything else chains. The control device is a
+   plain IoCreateDevice object with no PnP or power stack beneath it, so
+   refusing is correct. Note however that the power path completes without
+   calling PoStartNextPowerIrp, which is a rule violation should a power IRP
+   ever reach the control device.
+
+1.2.  The Control Device
+
+   drv_CreateControlDevice at 000103be creates it, called from drv_AddDevice
+   and reference counted under a fast mutex, so it appears on the first
+   device arrival and is shared by every adapter thereafter.
+
+       RtlInitUnicodeString(&name, L"\Device\Wish_NA1")
+       IoCreateDevice(drv, 0x78, &name, 0xB98C, 0, FALSE, &dev)
+       RtlInitUnicodeString(&link, L"\DosDevices\Wish_NA1")
+       IoCreateSymbolicLink(...)
+
+   So user mode reaches it as \\.\Wish_NA1. The device type 0xB98C is the
+   same value the private IOCTL codes encode. DO_BUFFERED_IO is set, matching
+   the METHOD_BUFFERED in every private code.
+
+   Device extension, 0x78 bytes:
+
+       +0x00  magic 3E178AA3 7625F013 ED739374
+       +0x0C  back pointer to the device object
+       +0x5C  queued event count, capped at 99
+       +0x60  event list head        (LIST_ENTRY)
+       +0x68  waiting IRP list head  (LIST_ENTRY)
+       +0x70  delivery-in-progress flag
+       +0x74  spin lock
+
+   The event queue at +0x5C..+0x70 is DRIVER-WIDE. Per-controller code
+   reaches it through drv_AcquireControlDeviceExt at 000105a7, which simply
+   returns this singleton's extension, so every adapter posts into the same
+   queue and any waiter can receive any event. A replacement that supports
+   more than one adapter should consider whether that is acceptable.
+
+   Both private paths converge on drv_IoctlDeviceCommand. The control-device
+   path carries a 4-byte device id at the front of the input buffer and
+   strips it; the 'q' path has the device implied by the file object and
+   forwards the buffer unchanged.
 
 2.  IOCTL Encoding
 
@@ -152,7 +206,7 @@ Table of Contents
    | 0xb98c20e4 | 0x839 |    4 |    0 | FUN_00018b00 on/off toggle               |
    | 0xb98c20e8 | 0x83a | var  | var  | FUN_000137c0 raw N64 bus transfer        |
    | 0xb98c20f0 | 0x83c | 8+4n |    0 | DOWNLOAD COMPILED SCRIPT, section 5a     |
-   | 0xb98c20f4 | 0x83d |    0 |  var | drain and free the two script buffers    |
+   | 0xb98c20f4 | 0x83d |    0 |  var | drain the post-mortem dump of a fault    |
    | 0xb98c20f8 | 0x83e |  0/4 |  0/4 | get and/or set the DWORD at devext+0x3ec |
    | 0xb98c20fc | 0x83f |  0/4 |  0/4 | get and/or set the DWORD at devext+0x3f0 |
    | 0xb98c2100 | 0x840 |    0 |    1 | 3-byte status read, returns one byte     |
@@ -163,6 +217,10 @@ Table of Contents
    | 0xb98c2154 | 0x855 |    1 |    1 | query whether a macro slot is running    |
    +------------+-------+------+------+------------------------------------------+
 
+   Selector 1 of fn 0x836 is not a counter: it returns bcdDevice from the USB
+   device descriptor cached at devext+0x28C, which the configurator reports
+   as the firmware revision. See driver-lifecycle.txt section 3.1.
+
    An unrecognised code gives STATUS_NOT_SUPPORTED (0xC00000BB). A
    recognised code with the wrong buffer sizes gives
    STATUS_INVALID_PARAMETER (0xC000000D). The distinction is useful when
@@ -172,98 +230,148 @@ Table of Contents
    STATUS_DEVICE_BUSY (0x80000011) if a script load is already in
    progress.
 
-5.  The Macro Slot Engine
+   0x83d is the companion to a script fault. When drv_ScriptExecute stops a
+   thread on an error it stashes the thread context at devext+0x1684 and a
+   full copy of the variable array at devext+0x1688; this command hands both
+   to user mode and frees them. See script-bytecode.txt section 6.4.
 
-   This is the mechanism behind behaviour like "hold A and it emits
-   repeated mouse clicks". The driver holds 32 independently programmed,
-   independently started slots. The configurator compiles a script and
-   downloads the result here; the driver executes the timing in kernel
-   mode, which is why the output is indistinguishable from real input.
+5.  The Effect Slot Engine
 
-   This slot engine is a parameterised repeat engine. It is NOT the
-   compiled-script path: that is IOCTL 0xb98c20f0, described in section
-   5a, which carries a real 32-bit bytecode stream. The two mechanisms
-   are separate and coexist.
+   The driver holds 32 independently programmed, independently started slots.
+   Each carries a set of parameters and up to two short payload streams, and
+   each can be started, stopped and queried on its own.
+
+   These slots are a TIME-DRIVEN WAVEFORM GENERATOR that drives the
+   controller. drv_EffectEvaluate at 00013f10 walks the slot array at
+   devext+0x448, evaluates a sine over the current time, and drv_EffectTick
+   at 00013ac0 sends the four-byte result to the controller as a vendor
+   transaction with command byte 0x36. The sine machinery is described in
+   section 5.5.
+
+   CORRECTION. An earlier revision of this note described these slots as the
+   mechanism behind behaviour like "hold A and it emits repeated mouse
+   clicks". That was wrong. Autofire and repeat behaviour are implemented by
+   the script interpreter, which spawns a thread and sleeps - see script-
+   bytecode.txt section 6.5, builtins 0x4000000C and 0x40000009. The slot
+   engine and the script engine are separate subsystems that coexist.
+
+   Neither is the compiled-script download path, which is IOCTL 0xb98c20f0
+   described in section 5a.
+
+   This is a FORCE-FEEDBACK EFFECT ENGINE, and that is now established rather
+   than inferred: drv_EffectEvaluate implements the DirectInput effect set -
+   constant, ramp, and periodic square, sine, triangle and sawtooth - with a
+   DirectInput-style attack and fade envelope, and converts magnitude to
+   motor pulses by delta-sigma modulation. Section 5.3 gives the output
+   encoding. The only remaining inference is that the actuator on the far end
+   is a Rumble Pak, which for an N64 controller is the only candidate.
 
    5.1.  Programming a slot, fn 0x852
 
-   Input is a 28-byte header followed by up to two payload streams:
+   Input is a 28-byte header followed by one parameter block per axis. The
+   fields map onto a DirectInput DIEFFECT almost one for one.
 
        offset  size   meaning
        +0x00   dword  bits  0..15  slot index, must be < 0x20
-                      bits 16..23  flags
-                      bits 24..31  stored at slot+0x448
-       +0x04   dword  stored at slot+0x458
-       +0x08   dword  stored at slot+0x45c
-       +0x0C   dword  stored at devext + (slot + 0x14) * 0x38
-       +0x10   dword  stored at slot+0x464
-       +0x14   dword  stored at slot+0x468
-       +0x18   dword  per-stream payload length, stored at slot+0x46c
-       +0x1C   ...    one payload stream per set flag bit
+                      bits 16..23  flags, see below
+                      bits 24..31  EFFECT TYPE, stored at slot+0x448
+       +0x04   dword  duration in ticks, -1 for infinite   -> slot+0x458
+       +0x08   dword  attack level                         -> slot+0x45c
+       +0x0C   dword  attack time                          -> slot+0x460
+       +0x10   dword  fade level                           -> slot+0x464
+       +0x14   dword  fade time                            -> slot+0x468
+       +0x18   dword  per-axis block length                -> slot+0x46c
+       +0x1C   ...    one 8-byte parameter block per axis
 
-   Flag bits 0 and 1 each indicate one payload stream is present. The
-   required input length is 0x1C plus the payload length once per set
-   bit. Bits 0x40 and 0xC0 of the flags gate whether the slot's start
-   timestamp is reset.
+   Flag bits 0 and 1 each indicate one axis block is present, so the required
+   input length is 0x1C plus the block length once per set bit. Bits 0x40 and
+   0xC0 of the flags gate whether the slot's start timestamp is reset, which
+   is how an effect is restarted versus merely reparameterised.
 
-   5.2.  Slot control block
+   Earlier revisions of this note described the +0x0C field as landing at
+   devext + (slot + 0x14) * 0x38. That is the same address as slot+0x460; the
+   decompiler simply factored it differently.
 
-   Slot n occupies 0x38 bytes at devext + 0x448 + n * 0x38:
+   Each axis parameter block is 8 bytes:
 
-       +0x448   header byte field from bits 24..31
-       +0x44c   running flag, non-zero while the slot is active
-       +0x450   QWORD start timestamp
-       +0x458   parameter
-       +0x45c   parameter
-       +0x464   parameter
-       +0x468   parameter
-       +0x46c   payload length
-       +0x470   payload bytes
+       +0  magnitude, signed byte
+       +1  offset, signed byte
+       +2  phase, 16 bits, scaled against a 36000 circle
+       +4  period, 32 bits, in 1/64-second ticks
 
-   Payload bytes land at devext + 0x470 + (n * 7 + stream) * 8, and the
-   copy loop breaks once the byte index exceeds 7. So a stream is capped
-   at 8 bytes regardless of the declared length.
+   5.2.  Effect Types
 
-   INFERENCE: the stride of 7 implies room for seven streams per slot,
-   but fn 0x852 only ever writes streams 0 and 1.
+   The type occupies bits 24..31 of the header word and is stored at
+   slot+0x448. drv_EffectEvaluate switches on it:
 
-   5.3.  Timing
+       0x10  constant force      value = magnitude
+       0x20  ramp force          linear from magnitude to offset across
+                                 the whole duration
+       0x30  periodic, square    +/-10000 either side of the half period
+       0x31  periodic, sine      quadrant folded onto drv_SineLerp
+       0x32  periodic, triangle
+       0x33  periodic, sawtooth up
+       0x34  periodic, sawtooth down
+       0x40  tuning/test effect  magnitude scaled by devext+0x15E8, the
+                                 D-pad preset from the on-controller
+                                 tuning mode
 
-   Timestamps are KeQueryInterruptTime divided by 0x2625A (156250).
-   KeQueryInterruptTime is in 100ns units and 10,000,000 / 156,250 = 64,
-   so slot timestamps are in 1/64-second ticks, about 15.625 ms.
+   Periodic types evaluate ((phase * period) / 36000 + t) % period, scale
+   the waveform by magnitude / 10000 and add the offset. Every type is then
+   passed through the envelope and clamped to +/-0x7F.
 
-   INFERENCE: 1/64 s is therefore the natural granularity of any repeat
-   rate the scripting language can express.
+   The envelope is applied exactly as DirectInput specifies: while t is below
+   the attack time the value is interpolated up from the attack level, and
+   within the fade time of the end it is interpolated down to the fade level.
+   A duration of -1 disables the fade, since there is no end to fade towards.
 
-   5a.  The Compiled Script Path, fn 0x83c
+   5.3.  Output Encoding, Vendor Command 0x36
 
-   IOCTL 0xb98c20f0 is how wishd201.exe loads a compiled script into the
-   driver. cfg_DownloadScript (00404700 in wishd201.exe) issues it:
+   The engine does not send a magnitude. It sends a bitmap of motor states.
 
-       CreateFileA(interface_path, GENERIC_READ|GENERIC_WRITE, ...)
-       DeviceIoControl(h, 0xb98c20f0, buf, buf[0] * 4 + 8, &out, 4, ...)
+   drv_EffectEvaluate pre-computes results into a 96-entry ring of 0x1C-byte
+   records based at devext+0xb58, then packs 32 consecutive entries into four
+   bytes, one bit per entry:
 
-   The trace string it prints is "Loading %d opcode script into device
-   %s", and passing a null script prints "Unloading script from device
-   %s" instead, so a count of zero unloads.
+       for i in 0..31:
+           if ring[(i + base) % 0x60].pulse != 0:
+               payload[i >> 3] |= 1 << (i & 7)
 
-   Buffer layout, produced by cfg_CompileScript (0040bc00):
+   Each bit is one 1/64-second tick, so the four bytes cover the next half
+   second. drv_EffectTick re-arms at now + 0x20 ticks, exactly consuming what
+   it just sent. The four bytes are not a data stage: they are packed
+   straight into the setup packet of a USB vendor control transfer, which is
+   why the payload is exactly four bytes wide. See usb-transport.txt section
+   3.1.
 
-       +0x00  dword         opcode count
-       +0x04  dword         flags/metadata word
-       +0x08  dword[count]  the opcode stream
+       bmRequestType  0x40     vendor, device, host to device
+       bRequest       0x36
+       wValue         motor samples for ticks 0..15
+       wIndex         motor samples for ticks 16..31
 
-   This is exactly the length test the driver applies:
-   input length must equal *input * 4 + 8. On the driver side the load is
-   performed by FUN_00017310(devext, count) and the state word at
-   devext+0x1640 is left at (count != 0) - 1, i.e. 0 when a script is
-   loaded and -1 when it was unloaded.
+   Magnitude becomes pulse DENSITY rather than pulse width, through a delta-
+   sigma (Bresenham) modulator: an accumulator gains the computed intensity
+   every tick and emits a pulse whenever it crosses 100, subtracting 100 as
+   it goes. drv_EffectDitherState, a PRNG stirred with the timestamp,
+   perturbs how bursts are spread so that a steady effect does not produce an
+   audible regular beat.
 
-   GetLastError of 0xAA (ERROR_BUSY) is treated as a soft failure and
-   returns -1 rather than an error.
+   This is the mechanism that gives an on/off Rumble Pak a proportional
+   strength, and it is why the engine works a full half second ahead of real
+   time.
 
-   The instruction encoding is documented in script-bytecode.txt.
+   The ring record layout, for anyone tracing the pre-computation:
+
+       +0x00  pulse bit for this tick
+       +0x04  computed intensity
+       +0x08  filtered X, a 5/6 decay low-pass
+       +0x0c  filtered Y
+       +0x10  delta-sigma accumulator
+       +0x14  dither burst counter
+       +0x18  tuning-mode counter
+
+   96 records of 0x1C bytes span devext+0xb58 to devext+0x15D8, ending
+   exactly where the on-controller tuning values begin.
 
    5.4.  Starting and stopping, fn 0x853
 
@@ -279,6 +387,44 @@ Table of Contents
 
    fn 0x855 takes a slot number and returns one byte from FUN_00013e90,
    reporting whether the slot is currently running.
+
+   5.5.  The Sine Oscillator
+
+   drv_SineTable at 00019d00 is a quarter-wave sine lookup: 20 entries of 16
+   bits, where
+
+       table[i] = round(1000 * sin(i * 5 degrees)),  i = 0..18
+
+       0, 87, 174, 259, 342, 423, 500, 574, 643, 707, 766, 819, 866,
+       906, 940, 966, 985, 996, 1000
+
+   Entry 19 duplicates 1000 so the interpolation can always read table[idx+1]
+   without a bounds test. The exact values at 30, 45, 60 and 90 degrees -
+   500, 707, 866 and 1000 - identify it beyond doubt.
+
+   Angles are in HUNDREDTHS OF A DEGREE, so a full circle is 36000 and the
+   table covers 0 to 9000. drv_SineLerp at 000149a0 interpolates within the
+   table and returns 10000 * sin. drv_EffectEvaluate folds the full circle
+   into the first quadrant through a four-entry jump table at 00014984:
+
+       Q0  0..9000       sin(x)
+       Q1  9000..18000   sin(18000 - x)
+       Q2  18000..27000  -sin(x - 18000)
+       Q3  27000..36000  -sin(36000 - x)
+
+   This table is NOT the analog stick response curve, which is what an
+   earlier revision of hid-descriptor.txt guessed. drv_BuildJoystickReport
+   scales the stick arithmetically and never consults a lookup.
+
+   BUG in drv_SineLerp, confirmed at instruction level rather than from the
+   decompiler. The interpolation weights are swapped: table[idx+1] is paired
+   with (500 - rem) and table[idx] with rem, the reverse of normal linear
+   interpolation. Within each 5-degree cell the result therefore runs
+   backwards. Observed: f(0) = 870, f(250) = 435, f(499) = 1, then f(500)
+   jumps to 1740. The output is a rising sawtooth, not a sine, and is correct
+   only where adjacent table entries are equal, that is at the top of the
+   quarter wave. A replacement should implement the interpolation correctly
+   and treat anything that depended on the sawtooth as accidental.
 
 6.  Controller Pak Access
 
@@ -310,39 +456,62 @@ Table of Contents
 
 7.  The Button Map
 
-   drv_ButtonMap at 00019d80 is a 16-byte driver-wide table, read and
-   written by control-device IOCTL fn 0x817. Input bytes with a value of
-   0x0E or greater are ignored, which caps entries at 0..13 - exactly
-   the 14 buttons in the joystick collection.
+   drv_ButtonMap at 00019d80 is a 16-byte driver-wide table, read and written
+   by control-device IOCTL fn 0x817, which ignores any input byte of 0x0E or
+   greater - the button count of the joystick collection.
 
    drv_DriverEntry initialises it to:
 
        index  0  1  2  3   4   5   6   7   8  9  10 11 12 13 14 15
        value  0  3  9  8  10  11  12  13   0  0   6  7  5  1  4  2
 
-   The 14 non-filler values are a permutation of 0..13, each appearing
-   exactly once, and the two zeros fall at indices 8 and 9.
+   CONFIRMED by drv_BuildJoystickReport at 000153a3. It walks the two raw
+   button bytes MSB first and accumulates
 
-   INFERENCE: the index is the bit position in the N64 controller's
-   16-bit button word, whose conventional order is
+       mask |= 1 << drv_ButtonMap[index]
 
-       0 A       1 B        2 Z        3 Start
-       4 D-up    5 D-down   6 D-left   7 D-right
-       8 Reset   9 unused  10 L       11 R
-      12 C-up   13 C-down  14 C-left  15 C-right
-
-   Bits 8 and 9 are the only two positions in that order that are not
-   buttons, and they are exactly where the filler zeros sit. On that
-   reading the default mapping, as 1-based HID button numbers, is:
+   for index 0 to 15, where index 0 is bit 7 of the first button byte and
+   index 15 is bit 0 of the second. The stored value is the destination HID
+   button, zero based. With the conventional N64 bit order the default map
+   is, as 1-based HID button numbers:
 
        A -> 1        B -> 4        Z -> 10       Start -> 9
        D-up -> 11    D-down -> 12  D-left -> 13  D-right -> 14
        L -> 7        R -> 8
        C-up -> 6     C-down -> 2   C-left -> 5   C-right -> 3
 
-   This is a strong inference but it is still an inference. It closes the
-   first open question in hid-descriptor.txt only once confirmed against
-   the report builder under FUN_00015020.
+   Indices 8 and 9 are the Reset and unused bit positions and hold 0. The
+   builder does not special-case them, so either bit being set asserts HID
+   button 1, the same bit as A. INFERENCE: a latent bug rather than intent. A
+   replacement should treat those two slots as "no button".
+
+7.1.  Stick Scaling
+
+   drv_BuildJoystickReport converts the raw 8-bit signed axes to the 12-bit
+   +/-1200 range the descriptor declares, in this order:
+
+       1. negate Y, converting N64 up-positive to HID down-positive
+       2. X = rawX * 16,  Y = rawY * 16
+       3. if devext+0x3F0 != 0, the acceleration set by IOCTL fn 0x83f:
+              X += (|Y| * accel * X) / 256
+              Y += (|X| * accel * Y) / 256
+       4. if devext+0x3EC is neither 0 nor 0x4B, the sensitivity set by
+          IOCTL fn 0x83e:
+              value = value * 0x4B / sens
+       5. clamp both axes to +/-0x4B0
+
+   So 75 is the neutral sensitivity and larger values reduce travel. There is
+   no dead zone anywhere in the path.
+
+   Note the cross coupling in step 3: each axis is boosted by the OTHER
+   axis's magnitude, so pure horizontal or pure vertical motion receives no
+   acceleration at all. INFERENCE: the operands look swapped, that is, a bug.
+   A replacement should decide deliberately whether to reproduce it, since
+   scripts and profiles tuned on the original will have been tuned around it.
+
+   When a script owns the stick, indicated by devext+0x1640 >= 0, the values
+   written by the native builtins at devext+0x1708, +0x170C and +0x1710 are
+   used instead of the raw controller state and none of this scaling runs.
 
 8.  Consequences For The Replacement Driver
 

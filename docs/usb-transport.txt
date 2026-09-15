@@ -1,0 +1,278 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishk201.sys                                                 2001 driver
+
+
+                    USB VENDOR TRANSPORT
+
+
+Abstract
+
+   Below the HID contract and below the private IOCTL surface there is a
+   third interface: the vendor control requests wishk201.sys sends to the
+   Adaptoid's own firmware. This is the driver-to-device contract, and it
+   is the one a replacement driver must speak to make the hardware do
+   anything at all.
+
+   This note records the request framing, the asynchronous chaining
+   mechanism, the vendor requests observed so far, and the accessory
+   probe sequence that uses them.
+
+   Everything here is read out of the Ghidra database for wishk201.sys.
+   Statements not directly supported by an instruction or a byte are
+   marked INFERENCE.
+
+Table of Contents
+
+   1.  Request Framing
+   2.  Asynchronous Chaining
+   3.  Known Vendor Requests
+   4.  The Accessory Probe
+   5.  Accessory State
+   6.  Notes For The Replacement Driver
+   7.  Open Questions
+
+1.  Request Framing
+
+   Several places in the driver build what looks like a six-byte command
+   buffer and hand it to drv_SendVendorRequest at 000193df. That buffer
+   is literally a USB setup packet:
+
+       devext+0x3A4  bmRequestType
+       devext+0x3A5  bRequest
+       devext+0x3A6  wValue, little endian
+       devext+0x3A8  wIndex, little endian
+       devext+0x3AA  four-byte response buffer, for IN transfers
+
+   drv_SendVendorRequest validates bmRequestType and accepts only 0x40 or
+   0xC0, that is vendor/device host-to-device and the same with the
+   direction bit set. It then allocates a 0x50-byte URB, which is exactly
+   sizeof(_URB_CONTROL_VENDOR_OR_CLASS_REQUEST), sets the function code to
+   0x17 (URB_FUNCTION_VENDOR_DEVICE), and copies the fields through:
+
+       buffer +1     -> URB +0x49   Request
+       buffer +2..3  -> URB +0x4A   Value
+       buffer +4..5  -> URB +0x4C   Index
+       TransferFlags -> 3 when bmRequestType bit 7 is set, else 0
+                        (USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK)
+
+   drv_SubmitVendorUrb at 00019527 then allocates an IRP, sets the stack
+   location to IRP_MJ_INTERNAL_DEVICE_CONTROL with control code 0x220003
+   (IOCTL_INTERNAL_USB_SUBMIT_URB), installs drv_VendorUrbComplete as the
+   completion routine, and calls down the stack.
+
+   So the 0x40 that appears at the head of every one of these buffers was
+   never a magic constant. It is the USB bmRequestType for a vendor OUT.
+
+2.  Asynchronous Chaining
+
+   Requests are chained. Each step fills the descriptor, submits, and
+   returns 1 meaning "another transfer is now in flight". A step
+   returning 0 ends the chain.
+
+   drv_VendorUrbComplete at 00019747 runs at completion. It stores the
+   URB status at devext+0x390 and the transferred byte count at
+   devext+0x394, recovers the continuation, calls it, and returns
+   STATUS_MORE_PROCESSING_REQUIRED. devext+0x378 is the in-flight state:
+   0 idle, 1 claimed, 3 submitted.
+
+   CAUTION for anyone reading the same code: Ghidra mis-tracks the
+   calling convention of drv_SendVendorRequest and drv_SubmitVendorUrb
+   and renders real arguments as unaff_retaddr. The callers visibly push
+   a continuation address and a transfer buffer before the descriptor, so
+   the true signatures have more parameters than the pseudocode shows.
+   Read the disassembly before relying on the argument list.
+
+3.  Known Vendor Requests
+
+       bRequest  dir  meaning
+       --------  ---  -------------------------------------------------
+       0x20      OUT  N64 transaction, long form. Command and data go
+                      out as a data stage; wValue lo is the expected
+                      reply length.
+       0x21      IN   N64 transaction, short form, 1 command byte
+       0x22      IN   N64 transaction, short form, 2 command bytes
+       0x23      IN   N64 transaction, short form, 3 command bytes
+       0x24      IN   N64 transaction, short form, 4 command bytes
+       0x36      OUT  force-feedback motor bitmap, see section 3.2
+       0x71      IN   collect the reply to a long-form transaction,
+                      wValue 0x0030
+       0x72      OUT  probe/configure step, wValue and wIndex carry the
+                      parameters
+       0x74      OUT  accessory select or power state, wValue 0x00C6 and
+                      0x00A6 observed
+
+   Controller state does NOT arrive through any of these. It is read
+   continuously from a USB interrupt pipe by the polling engine, described in
+   hid-descriptor.txt section 8.1; the vendor requests above are only for
+   configuration, accessory access and force feedback.
+
+   3.1.  N64 Transactions, requests 0x20 to 0x24 and 0x71
+
+   drv_N64Transaction at 000137c0 wraps one N64 controller-bus transaction.
+   It blocks on an event, so it runs at PASSIVE_LEVEL only, and it is guarded
+   by the same in-flight flag at devext+0x378 as everything else here.
+
+   It chooses one of two encodings by the transmit length.
+
+   SHORT FORM, up to four command bytes. The command is packed into the setup
+   packet and the reply comes back as the data stage. bRequest is 0x20 plus
+   the command length, which is why the request codes run 0x21 to 0x24:
+
+       bmRequestType  0xC0
+       bRequest       0x20 + txLen
+       wValue         command bytes 0 and 1, zero-filled past txLen
+       wIndex         command bytes 2 and 3
+
+   LONG FORM, five bytes or more. Split in two. First the command and its
+   payload go out, then the reply is collected separately:
+
+       bmRequestType  0x40        bmRequestType  0xC0
+       bRequest       0x20        bRequest       0x71
+       wValue lo      rxLen       wValue         0x0030
+       wValue hi      cmd[0]      wIndex         0
+       wIndex         cmd[1..2]
+       data stage     remainder
+
+   BYTE ORDER. Received bytes are REVERSED in place before the function
+   returns, so the adapter delivers N64 replies last byte first and this
+   undoes it. Code that calls drv_SendVendorRequest directly, such as the
+   accessory probe, sees the raw reversed order instead. That detail matters
+   for reading the probe.
+
+   The three N64 commands the driver actually issues:
+
+       cmd 0x00   request info    1 byte out, 3 back
+                                  identifier 0x05 0x00, then the status
+                                  byte
+       cmd 0x02   read accessory  3 bytes out, 33 back
+                                  address encoded by drv_N64PakAddrCrc5,
+                                  32 data bytes plus a CRC checked with
+                                  drv_N64PakDataCrc8
+       cmd 0x03   write accessory 35 bytes out, 1 back
+                                  the echoed CRC
+
+   These are the genuine N64 accessory protocol commands, and the CRCs are
+   the genuine algorithms. The adapter is a transparent bridge onto the
+   controller bus rather than a translator.
+
+   3.2.  Request 0x36, the force-feedback payload
+
+   The effect engine's output is not sent as a data stage. It is packed into
+   the setup packet itself:
+
+       bmRequestType  0x40
+       bRequest       0x36
+       wValue         motor samples for ticks 0..15
+       wIndex         motor samples for ticks 16..31
+
+   That is the 32-bit bitmap described in ioctl-surface.txt section 5.3, one
+   bit per 1/64-second tick. Four bytes fit exactly in wValue and wIndex,
+   which is presumably why the design needs no data stage.
+
+4.  The Accessory Probe
+
+   Entered from drv_BuildJoystickReport whenever devext+0x3E4 is 0, which
+   happens at first poll and again whenever the controller status byte
+   reports that the accessory was removed. See hid-descriptor.txt section
+   8.1.
+
+   drv_AccessoryProbeStart at 00018d30 is a re-entrancy guard: it latches
+   devext+0x378 from 0 to 1 and starts the chain, or resets devext+0x3E4 to 0
+   so the probe retries later if a transfer is already in flight.
+
+   The chain, in order:
+
+       1  drv_AccessoryProbeStep1    OUT 0x72  wValue 0x0038  wIndex 0x0015
+       2  drv_AccessoryProbeStep2    OUT 0x72  wValue 0x0039  wIndex 0x0012
+       3  drv_AccessoryProbeStep3    OUT 0x72  wValue 0x003A  wIndex 0x0023
+       4  drv_AccessoryProbeStep4    OUT 0x72  wValue 0xFF20  wIndex 0x0004
+       5  drv_AccessoryProbeStep5    OUT 0x72  wValue 0xFD23  wIndex 0x0000
+       6  drv_AccessoryProbeRead     IN  0x21  wValue 0      wIndex 0
+       7  drv_AccessoryProbeClassify
+       8  drv_AccessoryProbeRead2    IN  0x21   only if 7 did not conclude
+       9  drv_AccessoryProbeClassify2
+
+   INFERENCE: steps 1 to 3 write consecutive values 0x38, 0x39, 0x3A with
+   differing wIndex, which reads as three register writes. Steps 4 and 5 use
+   a different form. Not established.
+
+   Steps 6 and 8 are now intelligible in light of section 3.1. Request 0x21
+   is the short-form N64 transaction with ONE command byte, and wValue is
+   zero, so the command byte is 0x00 - the N64 request-info command. These
+   steps read the controller identity.
+
+   Because they call drv_SendVendorRequest directly rather than going through
+   drv_N64Transaction, the reply is NOT byte-reversed. The four bytes at
+   devext+0x3AA are therefore:
+
+       [0]  0x03, the number of N64 reply bytes that follow
+       [1]  the N64 status byte
+       [2]  0x00   }  the 0x05 0x00 controller identifier,
+       [3]  0x05   }  in reverse order
+
+   which is exactly what both classify steps test: [0] must be 0x03, then [3]
+   == 0x05 and [2] == 0x00 confirms an N64 controller replied, and [1] is
+   kept at devext+0x3E8. So the value stored as the "accessory id" is the N64
+   controller status byte, whose bit 0 means a Pak is present and bit 1 means
+   one was removed since the last query.
+
+   If [0] is not 0x03 the probe is abandoned and devext+0x3E4 returns to 0
+   for a later retry. Between the two attempts a vendor OUT 0x74 is issued,
+   with wValue 0x00C6 after the first failure and 0x00A6 on the final one.
+
+   INFERENCE: the 0x74 request puts the accessory port into a different
+   select or power state, and the two attempts exist so that a device needing
+   the second state is still found. Which accessory kind ends up in state 2
+   versus state 3 is NOT established from this binary.
+
+5.  Accessory State
+
+   devext+0x3E4 holds the result:
+
+       0  no probe done yet, or probe abandoned; retried on a later poll
+       1  probe in progress
+       2  accessory identified on the first attempt
+       3  accessory identified on the second attempt
+       4  no accessory found
+
+   devext+0x3E8 holds the accessory id byte from a successful probe.
+
+   Two consumers matter. IOCTL fn 0x836 selector 4 reports devext+0x3E4
+   to user mode, which is how the configurator knows what is plugged in.
+   And drv_BuildJoystickReport refuses to build any report until
+   devext+0x3E4 is 2 or more, so the probe gates all controller input.
+
+6.  Notes For The Replacement Driver
+
+   -  This is the layer that actually talks to the hardware. A
+      replacement can change the HID descriptor, the IOCTL surface and
+      the script format freely, but these vendor requests are fixed by
+      the firmware in the adapter and must be reproduced exactly.
+
+   -  Nothing here is pointer-sized or packing-sensitive. The setup
+      packet is four fields of fixed width, so the transport survives a
+      64-bit port unchanged. Only the URB and IRP plumbing around it
+      changes, and in a KMDF driver that becomes
+      WdfUsbTargetDeviceSendControlTransferSynchronously or its
+      asynchronous equivalent.
+
+   -  The probe gating is worth preserving. Refusing to emit reports
+      until the accessory state is known avoids a burst of garbage input
+      at plug-in time.
+
+7.  Open Questions
+
+   - The meaning of the wValue and wIndex pairs in probe steps 1 to 5, and of
+   request 0x74's 0x00C6 and 0x00A6. These are firmware register semantics
+   and may not be recoverable from the driver alone.
+
+   - Which accessory kind corresponds to devext+0x3E4 state 2 versus state 3.
+   The status byte kept at devext+0x3E8 tells the driver whether a Pak is
+   present, but not which kind.
+
+   - Whether request 0x20's long form has a size limit beyond the 35 bytes
+   the Controller Pak write uses.
+
+   - Whether any further vendor requests exist in the PnP and power paths,
+   which have not been examined.
+

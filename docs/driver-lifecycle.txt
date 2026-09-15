@@ -1,0 +1,322 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishk201.sys                                                 2001 driver
+
+
+                      DRIVER LIFECYCLE
+
+
+Abstract
+
+   This note records how wishk201.sys comes up, how it handles PnP and
+   power, and how it tears down. It is the plumbing rather than the
+   contract, but a replacement driver has to reproduce the behaviour that
+   is visible from outside: what the device declares to the PnP manager,
+   when polling starts and stops, and the fact that the adapter can wake
+   the machine.
+
+   The dispatch table itself, and the wrapper layer installed over
+   hidclass.sys, are documented in ioctl-surface.txt section 1. The
+   control device is in section 1.2 of that note. This note covers what
+   happens after.
+
+   Everything here is read out of the Ghidra database for wishk201.sys.
+   Statements not directly supported by an instruction or a byte are
+   marked INFERENCE.
+
+Table of Contents
+
+   1.  Two Sets Of Handlers
+   2.  AddDevice
+   3.  The PnP Dispatcher
+   4.  The Power Dispatcher
+   5.  Consequences For The Replacement Driver
+   6.  Open Questions
+
+1.  Two Sets Of Handlers
+
+   drv_DriverEntry installs handlers twice, and which set a given IRP
+   reaches depends on who sends it.
+
+   The handlers installed BEFORE HidRegisterMinidriver are the
+   minidriver's own. HidRegisterMinidriver takes them over, and
+   hidclass.sys calls them when it needs the minidriver to act:
+
+       MajorFunction[0x1B]  drv_DispatchPnp     at 0001619f
+       MajorFunction[0x16]  drv_DispatchPower   at 00016e47
+
+   The handlers installed AFTER are the triage wrappers, which see
+   user-mode traffic first and chain anything that is not private down to
+   hidclass:
+
+       MajorFunction[0x1B]  drv_PnpTriage       at 00011b10
+       MajorFunction[0x16]  drv_PowerTriage     at 00011b70
+
+   Confusing the two is easy and leads to reading the wrong dispatcher.
+   The triage wrappers do almost nothing; the real work is in the pair
+   hidclass owns.
+
+2.  AddDevice
+
+   drv_AddDevice at 0001236e zeroes a 0x1800-byte device extension and
+   initialises the machinery the rest of the driver relies on: two
+   events, four spin locks, a DPC and timer for the script and effect
+   engines, the thread and event lists, and the work item used to restart
+   polling.
+
+   It sets the tunables the joystick path reads:
+
+       devext+0x3EC  sensitivity    0x4B, the neutral value
+       devext+0x3F0  acceleration   10, which is why the acceleration
+                                    path is live out of the box; see
+                                    known-defects.txt section 3
+
+   It reads the registry value "VirtualDevices" into
+   g_dwVirtualDevicesMask, which selects the HID report descriptor; see
+   hid-descriptor.txt section 3.
+
+   Finally it creates the singleton control device through
+   drv_CreateControlDevice, links itself into the driver-wide device list
+   guarded by the spin lock at 00019d7c, and assigns itself an id.
+
+3.  The PnP Dispatcher
+
+   A switch on IO_STACK_LOCATION.MinorFunction. Anything unhandled is
+   passed down with IoSkipCurrentIrpStackLocation, which appears in the
+   decompilation as CurrentLocation++ and CurrentStackLocation += 0x24.
+   Entry is guarded by a remove-lock style acquire on devext+0x60.
+
+   +------+------------------------+------------------------------------+
+   | Code | Minor function         | Action                             |
+   +======+========================+====================================+
+   | 0x00 | START_DEVICE           | pass down synchronously, then      |
+   |      |                        | drv_StartDevice brings it up       |
+   | 0x01 | QUERY_REMOVE_DEVICE    | devext+0x2E8 = 1, succeed          |
+   | 0x02 | REMOVE_DEVICE          | full teardown, see below           |
+   | 0x03 | CANCEL_REMOVE_DEVICE   | devext+0x2E8 = 0, succeed          |
+   | 0x04 | STOP_DEVICE            | stop polling, release resources    |
+   | 0x05 | QUERY_STOP_DEVICE      | VETO if devext+0x17F4 is non-zero  |
+   | 0x06 | CANCEL_STOP_DEVICE     | devext+0x2E9 = 0, succeed          |
+   | 0x09 | QUERY_CAPABILITIES     | pass down, then OR 0x210 into the  |
+   |      |                        | capabilities bitfield              |
+   | 0x17 | SURPRISE_REMOVAL       | succeed, then pass down            |
+   +------+------------------------+------------------------------------+
+
+   START_DEVICE copies the stack location down, installs
+   drv_SignalEventComplete, passes down and WAITS. Only on success does it
+   call drv_StartDevice, the bring-up sequence described in section 3.1.
+
+   QUERY_CAPABILITIES sets two bits at offset 4 of DEVICE_CAPABILITIES:
+   0x10 Removable and 0x200 SurpriseRemovalOK. That is the correct
+   declaration for a device a user can unplug mid-operation, and it is
+   what lets Windows tear the stack down without complaint.
+
+   QUERY_STOP_DEVICE is the only veto in the driver. When devext+0x17F4
+   is non-zero it returns STATUS_UNSUCCESSFUL (0xC0000001), refusing to
+   let the device be stopped. INFERENCE: that counter tracks outstanding
+   work that cannot be abandoned. Not established.
+
+   REMOVE_DEVICE is the interesting one. In order it sets the removed
+   flag, drains both locks, unlinks from the driver-wide device list,
+   decrements the control-device reference count under the fast mutex and
+   tears down \Device\Wish_NA1 if this was the last adapter, stops
+   polling with reason 8, releases the USB resources, passes the IRP down,
+   waits for the remaining lock, and only then finishes cleanup.
+
+   Note the ordering asymmetry. START and QUERY_CAPABILITIES act on the
+   way back UP the stack, after passing down. STOP and REMOVE act on the
+   way DOWN, tearing their own state apart before the bus driver sees the
+   IRP. That is what stops the polling engine from touching USB resources
+   the bus driver has already reclaimed.
+
+3.1.  Device Bring-Up
+
+   drv_StartDevice at 00016550 is where the USB configuration is selected and
+   the pipe the polling engine reads from is discovered.
+
+   1. GET DEVICE DESCRIPTOR. A 0x50-byte URB, function 0x0B
+   (GET_DESCRIPTOR_FROM_DEVICE), DescriptorType 1, TransferBufferLength 0x12.
+   The 18 bytes are cached at devext+0x28C. That cache is what IOCTL fn 0x836
+   selector 1 reads: it returns the word at descriptor+0x0C, which is
+   bcdDevice - what the configurator calls the firmware revision.
+
+   2. GET CONFIGURATION DESCRIPTOR, drv_GetConfigDescriptor at 00016620. The
+   same URB function with DescriptorType 2, in a grow-and-retry loop: it
+   starts at 0x209 bytes and, if wTotalLength is larger than the buffer,
+   reallocates to that size and asks again. Cached at devext+0x288.
+
+   3. SELECT CONFIGURATION, drv_SelectConfiguration at 000166f0.
+   USBD_CreateConfigurationRequest builds the URB from the configuration
+   descriptor, the function is set to 0 (SELECT_CONFIGURATION), and it is
+   submitted. The ConfigurationHandle is stored at devext+0x284 and the
+   USBD_INTERFACE_INFORMATION that follows it is copied into a fresh
+   allocation at devext+0x290.
+
+   That copy is where the poll pipe comes from. In USBD_INTERFACE_INFORMATION
+   the pipe array starts at +0x10 and USBD_PIPE_INFORMATION holds PipeHandle
+   at +0x08, so devext+0x290 +0x18 is Pipes[0].PipeHandle - exactly the value
+   drv_PollSubmit uses. The driver polls the FIRST pipe of the interface
+   without inspecting its type or endpoint address.
+
+   4. MARK STARTED. devext+0x0D = 1, the flag the PnP query and cancel paths
+   test.
+
+   5. NAME AND SORT. drv_SetDeviceNameAndSort builds a display name at
+   devext+0x334 - the string IOCTL fn 0x835 returns - then re-sorts the
+   driver-wide device list alphabetically by it, so enumeration order is
+   stable and matches what the user sees. If the name cannot be built, "?" is
+   stored.
+
+   6. START POLLING. drv_PollStart(devext, 4) clears the stop reason that
+   IRP_MN_STOP_DEVICE sets and starts the double-buffered read loop described
+   in hid-descriptor.txt section 8.1.
+
+   7. PUBLISH. drv_EnableDeviceInterface calls
+   IoSetDeviceInterfaceState(devext+0x80, TRUE), making the interface visible
+   to user mode, then posts event type 99. Its mirror
+   drv_DisableDeviceInterface posts the SAME event on the way out, so 99
+   means the interface state changed, not specifically that a device arrived.
+   See section 3.2.
+
+   All three descriptor fetches go through drv_SubmitUrbSync at 000160f0.
+   INFERENCE for that name: it is called immediately after each URB is built
+   and returns an NTSTATUS the caller tests, which is the shape of a
+   synchronous submit-and-wait helper. Not read in detail.
+
+3.2.  Teardown
+
+   The STOP and REMOVE paths share a vocabulary of four helpers. The ordering
+   between them is the part a replacement has to reproduce.
+
+       IRP_MN_STOP_DEVICE
+           drv_PollStop(devext, 4, 2)   stop the read loop
+           drv_QuiesceIo                cancel pending reads and any
+                                        in-flight vendor request
+           drv_UnconfigureDevice        unconfigure on the bus
+           devext+0x0D = 0              no longer started
+
+       IRP_MN_REMOVE_DEVICE
+           drv_PollStop(devext, 8, 2)
+           drv_QuiesceIo
+           drv_AbortPipes               ABORT_PIPE on every open pipe
+           ... pass the IRP down, wait for the remaining lock ...
+           drv_FreeDeviceResources      free cached descriptors and the
+                                        work item
+
+   Everything that touches the bus happens BEFORE the IRP is passed down;
+   everything that only frees memory happens after. That is what keeps the
+   driver from issuing URBs against a stack the bus driver has already torn
+   down, and it is the single most important ordering constraint in the PnP
+   path.
+
+   drv_QuiesceIo at 000167a0 drains the queue of pending
+   IOCTL_HID_READ_REPORT IRPs, completing each with STATUS_CANCELLED
+   (0xC0000120), then clears the pending vendor-request slot at devext+0x380.
+
+   drv_UnconfigureDevice at 000167c0 builds a 0x3C-byte URB, which is
+   sizeof(_URB_SELECT_CONFIGURATION) with no interfaces, function 0, and sets
+   ConfigurationDescriptor to NULL. A NULL descriptor is the documented way
+   to unconfigure a USB device.
+
+   drv_AbortPipes at 00016890 walks the USBD_INTERFACE_INFORMATION cached at
+   devext+0x290 and submits a 0x18-byte URB, sizeof(_URB_PIPE_REQUEST),
+   function 2 (ABORT_PIPE), for every pipe whose PipeFlags field is non-zero.
+   It then clears that field and decrements the open-pipe count at
+   devext+0x17E4. Note that the driver repurposes PipeFlags as its own "this
+   pipe is open" marker rather than tracking that separately.
+
+   drv_FreeDeviceResources at 00016820 disables the interface and frees the
+   device descriptor at devext+0x28C, the interface information at +0x290,
+   the configuration descriptor at +0x288, an allocation at +0x17F8, and the
+   poll-restart work item at +0x324.
+
+   drv_DisableDeviceInterface at 00019160 is the exact mirror of
+   drv_EnableDeviceInterface, guarded so its body runs only on the 1 to 0
+   transition. Besides withdrawing the interface it calls drv_ScriptLoad with
+   an opcode count of zero, which UNLOADS any running script, so a script
+   does not survive the device going away. It then posts event type 99 and,
+   once the last device is gone, flushes the control device's pending
+   notification IRPs.
+
+4.  The Power Dispatcher
+
+   The driver is the power policy owner for its own device: it maps
+   system power states to device power states itself rather than letting
+   something above do it. Every path calls PoStartNextPowerIrp before
+   PoCallDriver.
+
+   4.1.  WAIT_WAKE, minor function 0x00
+
+   The adapter supports remote wakeup. devext+0x32C is armed from
+   devext+0x2C4, the deepest system state the device can wake from.
+
+   The request is accepted only when the device is not already in D0,
+   that is devext+0x280 is not 1, and the wake-capable state is at least
+   as deep as the current one. Otherwise it completes with
+   STATUS_INVALID_DEVICE_STATE (0xC0000184).
+
+   When accepted it sets the pending flag devext+0x2EA, passes the IRP
+   down synchronously, and on return calls FUN_000171c0 and clears the
+   flag.
+
+   4.2.  SET_POWER, minor function 0x02
+
+   Parameters.Power.Type at stack+8 selects the kind.
+
+   Type 0, a SYSTEM power transition. The driver picks the matching
+   device state:
+
+       system state 1, working      ->  D0
+       wait-wake not armed          ->  D3
+       otherwise                    ->  devext[0x2A4 + state * 4], the
+                                        DeviceState mapping taken from
+                                        DEVICE_CAPABILITIES
+
+   If that differs from the current state at devext+0x280, the system IRP
+   is parked at devext+0x2D4 and a device power IRP is requested with
+   PoRequestPowerIrp, completing through drv_SystemPowerRequestComplete.
+   The system IRP finishes only after the device IRP has, which is the
+   correct sequencing.
+
+   Type 1, a DEVICE power transition. FUN_000170B0 decides whether the
+   transition needs post-processing, and if so drv_DevicePowerComplete is
+   installed before passing down. INFERENCE: that is where polling is
+   stopped entering a low state and restarted on return to D0. Consistent
+   with drv_PollStop taking a reason bitmask, but not confirmed.
+
+5.  Consequences For The Replacement Driver
+
+   -  The two capability bits matter. Declaring Removable and
+      SurpriseRemovalOK is what makes unplugging the adapter a clean
+      operation rather than an error dialog.
+
+   -  Wait-wake is real and easy to lose. A 2001 game controller that can
+      wake the machine is unusual, and a replacement that simply omits
+      IRP_MN_WAIT_WAKE will silently drop the capability. If it is not
+      wanted, drop it deliberately.
+
+   -  The teardown ordering is load-bearing. Stopping polling and
+      releasing USB resources BEFORE passing REMOVE down is what prevents
+      a use-after-free against the bus driver. A KMDF port gets much of
+      this for free through EvtDeviceReleaseHardware, but the ordering
+      still has to be right.
+
+   -  The whole PnP and power surface is standard WDM with nothing
+      Adaptoid-specific in it except FUN_00016550 at start and the
+      polling stop reasons. In KMDF almost all of it collapses into
+      EvtDevicePrepareHardware, EvtDeviceD0Entry and EvtDeviceD0Exit.
+
+6.  Open Questions
+
+   - What devext+0x17F4 counts, since it is the sole reason the driver ever
+   vetoes a stop. Note it is adjacent to devext+0x17E4, the open-pipe count
+   maintained by drv_AbortPipes, but is not the same field.
+
+   - Whether drv_DevicePowerComplete stops and restarts polling, which is
+   inferred from context rather than read.
+
+   - What is allocated at devext+0x17F8, freed by drv_FreeDeviceResources but
+   not yet traced to whatever creates it.
+
+   - drv_SubmitUrbSync itself, and FUN_00011D40, which runs alongside the
+   device naming at bring-up.
+

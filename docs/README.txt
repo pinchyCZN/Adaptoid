@@ -18,6 +18,10 @@ Abstract
 
 Table of Contents
 
+   Note that replacement-architecture.txt is a DESIGN note rather than a
+   reverse engineering note: it records decisions and reasoning for the
+   port, not findings about the binaries.
+
    1.  Format
    2.  Planned Documents
    3.  Conventions
@@ -42,9 +46,10 @@ Table of Contents
 
 2.  Planned Documents
 
-   Written so far: hid-descriptor.txt, ioctl-surface.txt and
-   script-bytecode.txt. The rest are listed so findings land in a
-   predictable place rather than accumulating in one file.
+   Written so far: hid-descriptor.txt, ioctl-surface.txt, script-
+   bytecode.txt, known-defects.txt, usb-transport.txt, driver-lifecycle.txt,
+   function-map.txt and replacement-architecture.txt. The rest are listed so
+   findings land in a predictable place rather than accumulating in one file.
 
    +-----------------------+---------------------------------------------+
    | File                  | Contents                                    |

@@ -1,0 +1,315 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishk201.sys                                                 2001 driver
+
+
+                        FUNCTION MAP
+
+
+Abstract
+
+   Every function in wishk201.sys, grouped by subsystem. No function in
+   the image carries a default FUN_ name any more, so this note is a
+   complete inventory rather than a sample.
+
+   Names are the ones in the Ghidra database. Where a function has a
+   plate comment recording its evidence, that comment is authoritative
+   and this note is only an index.
+
+   Confidence is marked per entry:
+
+       (no mark)  behaviour read directly out of the code
+       [I]        name is an inference from call sites and effects
+                  rather than from reading the body in full
+
+Table of Contents
+
+   1.  Coverage
+   2.  Entry, PnP And Power
+   3.  Dispatch Wrappers
+   4.  The Control Device
+   5.  Private IOCTL Handlers
+   6.  HID Minidriver
+   7.  Input Path
+   8.  Script Engine
+   9.  Effect Engine
+   10. N64 Bus And Accessory
+   11. USB Transport
+   12. Synchronisation And Deferred Work
+   13. Utility
+   14. What Is Still Not Known
+
+1.  Coverage
+
+   Ghidra reports 187 functions. That count includes import thunks and
+   the two compiler helpers; the driver's own code accounts for about
+   138 of them. All are named.
+
+   Getting there required creating 21 functions by hand from regions
+   Ghidra had left as orphaned instructions, chiefly the dispatch
+   wrappers, the accessory probe chain and the polling engine.
+
+2.  Entry, PnP And Power
+
+       000115f0  drv_DriverEntry            installs both handler sets
+       000117e0  drv_Unload
+       0001236e  drv_AddDevice
+       0001619f  drv_DispatchPnp            hidclass calls this one
+       00016e47  drv_DispatchPower          hidclass calls this one
+       00016550  drv_StartDevice            bring-up, see lifecycle 3.1
+       00016620  drv_GetConfigDescriptor
+       000166f0  drv_SelectConfiguration    finds the poll pipe
+       000167a0  drv_QuiesceIo
+       000167c0  drv_UnconfigureDevice
+       00016820  drv_FreeDeviceResources
+       00016890  drv_AbortPipes
+       000190a0  drv_RegisterDeviceInterface
+       00019100  drv_EnableDeviceInterface
+       00019160  drv_DisableDeviceInterface
+       000125d0  drv_QueryDeviceCapabilities
+       00011e02  drv_SetDeviceNameAndSort
+       00011f5e  drv_BuildDeviceLocationName
+       000120ea  drv_FindDeviceOnHub
+       00011590  drv_ResetAllDeviceState        [I]
+       00011d40  drv_QueryFirmwareInfo          [I]
+       00011c3c  drv_RegQueryDword
+       00015f30  drv_SignalEventComplete
+       000170b0  drv_PrepareDevicePowerChange
+       000170f7  drv_DevicePowerComplete
+       00017157  drv_SystemPowerRequestComplete
+       000171c0  drv_UpdateIdlePowerState
+       00017250  drv_RequestDevicePower
+
+   drv_BuildDeviceLocationName walks \DosDevices\HCD0 through HCD5 and,
+   through drv_FindDeviceOnHub, descends the hub tree looking for VID
+   0x06F7 PID 0x0001. The result is a short topology string like a host
+   controller letter followed by port digits, which becomes the device
+   display name returned by IOCTL fn 0x835.
+
+3.  Dispatch Wrappers
+
+       000117f0  drv_CreateTriage
+       00011880  drv_CleanupTriage
+       00011910  drv_CloseTriage
+       000119a0  drv_ReadTriage
+       00011a10  drv_WriteTriage
+       00011a80  drv_DeviceControlTriage
+       00011b10  drv_PnpTriage
+       00011b70  drv_PowerTriage
+       00013780  drv_DispatchDeviceControl   pre-registration handler
+
+   See ioctl-surface.txt section 1.
+
+4.  The Control Device
+
+       000103be  drv_CreateControlDevice     \Device\Wish_NA1
+       000104fa  drv_DeleteControlSymlink
+       00010540  drv_DeleteControlDevice
+       00010570  drv_FreeControlDeviceLists
+       000105a7  drv_AcquireControlDeviceExt
+       000105e7  drv_ReleaseControlDeviceExt
+       0001061f  drv_IoctlControlDevice
+       00011230  drv_ControlDeviceCreate
+       00011300  drv_ControlDeviceCleanup
+       00011330  drv_ControlDeviceClose
+       000113b0  drv_ControlDeviceReadWrite
+       00010c30  drv_ProcessCommandBlock
+       00010e20  drv_ExecuteRawCommand
+
+   drv_ControlDeviceReadWrite is the READ and WRITE path on the control
+   device, and it exchanges a fixed 0x40-byte block. drv_ProcessCommandBlock
+   parses that block as a sequence of packed sub-commands, each dispatched
+   to drv_ExecuteRawCommand, which either emulates a Controller Pak read
+   or write locally or forwards the bytes as an N64 transaction.
+
+   This is the same 64-byte exchange the control IOCTLs fn 0x802 and
+   0x803 declare, which earlier revisions of ioctl-surface.txt recorded
+   as an unexplained transfer length.
+
+5.  Private IOCTL Handlers
+
+       00012710  drv_IoctlViaHidHandle       the 'q' channel
+       00012bc0  drv_IoctlDeviceCommand      the per-device command set
+       00012690  drv_HidChannelCreate
+       000126f0  drv_HidChannelClose
+       000159e0  drv_IoctlWaitNotification   fn 0x818, inverted call
+
+6.  HID Minidriver
+
+       000128d2  drv_DispatchInternalDeviceControl
+       00015020  drv_HidReadReport
+       00014ec0  drv_CompleteReadReport
+       00014fa0  drv_DequeuePendingRead
+       00014d90  drv_CancelPendingReads
+       00014de8  drv_SubmitHidReport
+
+7.  Input Path
+
+       00016940  drv_PollSubmit
+       00016a70  drv_PollStart
+       00016b00  drv_PollStop
+       00016c47  drv_PollComplete
+       00016da7  drv_PollRestartWorker
+       00015150  drv_BuildJoystickReport
+       00014a00  drv_SubmitJoystickReport
+       00015850  drv_SendControllerReset        [I]
+       00014ad0  drv_HidKeyEvent
+       00014c80  drv_HidMouseButtonEvent
+       00014d10  drv_HidMouseMoveEvent
+       00015e00  drv_QueueEvent
+       00015e70  drv_DispatchEvents
+       00015ae0  drv_QueueUserNotification
+       00015ba0  drv_CompleteNotificationIrps
+       00015ce0  drv_CancelNotificationIrps
+       00015dc0  drv_NotifyInterfaceChange
+
+8.  Script Engine
+
+       00017310  drv_ScriptLoad
+       00017b90  drv_ScriptExecute           the bytecode interpreter
+       000186a0  drv_ScriptNativeCall        the builtin library
+       00018640  drv_ScriptCheckVarIndex
+       00017980  drv_ScriptScheduler
+       000177c0  drv_ScriptThreadAlloc
+       00017860  drv_ScriptThreadQueue
+       00017550  drv_ScriptDispatchInput
+
+   drv_ScriptDispatchInput is how a script hooks input. On every change
+   in controller state it reads handler addresses out of the script's own
+   variable array and spawns a thread for each one that holds a tagged
+   code address: sixteen slots for the individual buttons at offsets
+   0x00..0x3F, then further slots at +0x40, +0x44, +0x48 and +0x4C for
+   the aggregate button word, the stick and related events.
+
+   INFERENCE: the exact meaning of the four aggregate slots is taken from
+   the arguments each spawned thread receives, not from documentation.
+
+   drv_ScriptScheduler refills the interpreter's instruction budget in
+   proportion to elapsed time, capped at 100000, runs every thread whose
+   wake time has passed, drains the event list and re-arms the timer.
+
+9.  Effect Engine
+
+       00013f10  drv_EffectEvaluate          waveforms and envelope
+       00013ac0  drv_EffectTick
+       00013a60  drv_EffectKick
+       00013a80  drv_EffectRun
+       00013ba0  drv_EffectKeepAlive
+       00013c50  drv_EffectSendPeriodic
+       00013d00  drv_EffectOnPakChange
+       00013d50  drv_EffectOnPakInsert
+       00013d70  drv_EffectOnPakRemove
+       00013d90  drv_EffectSendUpdate
+       00013e90  drv_EffectSlotActive
+       000149a0  drv_SineLerp
+
+   The vendor command byte that carries the motor bitmap varies with
+   context rather than being fixed at 0x36 as earlier notes implied:
+
+       0x32  idle or stop, sent when the engine has been quiet
+       0x34  update following accessory insertion
+       0x35  update following accessory removal, and the periodic path
+       0x36  the normal tick from drv_EffectTick
+
+   All four carry the same four-byte payload in wValue and wIndex.
+
+10. N64 Bus And Accessory
+
+       000137c0  drv_N64Transaction
+       000136f0  drv_N64PakAddrCrc5
+       00013730  drv_N64PakDataCrc8
+       00018d30  drv_AccessoryProbeStart
+       00018da0  drv_AccessoryProbeStep1
+       00018df0  drv_AccessoryProbeStep2
+       00018e30  drv_AccessoryProbeStep3
+       00018e70  drv_AccessoryProbeStep4
+       00018eb0  drv_AccessoryProbeStep5
+       00018ef0  drv_AccessoryProbeRead
+       00018f40  drv_AccessoryProbeClassify
+       00018fd0  drv_AccessoryProbeRead2
+       00019020  drv_AccessoryProbeClassify2
+
+11. USB Transport
+
+       000193df  drv_SendVendorRequest
+       00019527  drv_SubmitVendorUrb
+       00019747  drv_VendorUrbComplete
+       000160f0  drv_SubmitUrbSync              [I]
+       00015f90  drv_UsbGetPortStatus
+       00016010  drv_UsbResetPort
+       00016080  drv_UsbCyclePort
+       00015f50  drv_RecoverPort
+       00019290  drv_SendIoctlSync
+       00018b00  drv_SetDeviceEnable            [I]
+       00018ca0  drv_SendIdleCommand            [I]
+
+   drv_RecoverPort explains the sentinel 0xC0012345 that
+   drv_PollRestartWorker tests. It reads the port status; if the port is
+   connected but not enabled it issues IOCTL_INTERNAL_USB_RESET_PORT,
+   and otherwise falls back to IOCTL_INTERNAL_USB_CYCLE_PORT and returns
+   that sentinel. A cycle is the heavier recovery, so the sentinel is the
+   signal to stop retrying.
+
+   Two more vendor requests turn up here, beyond those in
+   usb-transport.txt section 3:
+
+       0x75  IN   firmware information, result kept at devext+0x33E
+       0x32  OUT  idle and enable control, see section 9
+
+12. Synchronisation And Deferred Work
+
+       000158e0  drv_LockInitialize
+       00015930  drv_LockAcquire
+       00015970  drv_LockRelease
+       000159a0  drv_LockReleaseAndWait
+       00015f00  drv_IsDeviceReady
+       00019670  drv_TryClaimVendorSlot
+       00019960  drv_ClaimVendorSlotForIrp
+       000199c0  drv_CancelVendorRequest
+       00019620  drv_NextDeferredWork
+       000196e0  drv_RunDeferredWork
+
+   The lock family is a hand-rolled equivalent of IoAcquireRemoveLock: a
+   reference count, a "removing" flag and an event, with
+   drv_LockReleaseAndWait as the drain. drv_LockAcquire returns
+   STATUS_DEVICE_NOT_CONNECTED once the flag is set.
+
+   The deferred-work system is four flags at devext+0x434, +0x438, +0x43C
+   and +0x440, each mapping to one callback. drv_NextDeferredWork returns
+   the highest-priority pending one and drv_RunDeferredWork loops until
+   none remain. It exists because only one vendor transfer may be in
+   flight at a time, so work that arrives while the slot is busy is
+   deferred rather than dropped.
+
+13. Utility
+
+       000193a0  drv_CompleteIrp
+       00019270  drv_StrCopy
+       000191f0  drv_StrPrepend
+       00019a10  __aulldiv                   compiler helper
+       00019a80  __alldiv                    compiler helper
+       00019b2a  HidRegisterMinidriver       import thunk
+
+14. What Is Still Not Known
+
+   Naming every function is not the same as understanding everything.
+   These remain open:
+
+   -  The firmware register semantics behind vendor requests 0x72 and
+      0x74, including the probe parameters and the 0x00C6 / 0x00A6
+      values. These are inside the adapter's firmware and are unlikely to
+      be recoverable from the driver alone; a USB capture would settle
+      them.
+
+   -  Which accessory kind maps to accessory state 2 versus state 3.
+
+   -  What devext+0x17F4 counts, the sole reason the driver vetoes an
+      IRP_MN_QUERY_STOP_DEVICE.
+
+   -  What is allocated at devext+0x17F8.
+
+   -  The eleven entries marked [I] above, where the name is an inference
+      from call sites rather than a full reading of the body.
+
+   -  The whole of wishd201.exe beyond the compiler: 610 functions, of
+      which only the flex/bison front end, the code generator and the
+      download path have been named.

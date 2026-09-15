@@ -1,0 +1,182 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishk201.sys                                                 2001 driver
+
+
+                        KNOWN DEFECTS
+
+
+Abstract
+
+   Three arithmetic defects have been found in wishk201.sys during
+   reverse engineering. This note records each one, the exact condition
+   that triggers it, what it would actually do, and whether a user would
+   be likely to notice.
+
+   The purpose is not to criticise a driver that shipped in 2001 and
+   worked. It is to stop a clean-room replacement from faithfully
+   reproducing a slip, and to record which observed behaviour is
+   deliberate and which is accidental.
+
+   All three are in peripheral paths. NONE of them is in the script
+   interpreter, the HID report descriptor, the keyboard or mouse report
+   builders, or the private IOCTL surface. A user running complex
+   scripts would not encounter any of them, which is consistent with the
+   software's reputation for robustness.
+
+Table of Contents
+
+   1.  Severity Summary
+   2.  Defect 1: Button Map Filler Entries
+   3.  Defect 3: Cross-Coupled Stick Acceleration
+   4.  Defect 3: Swapped Sine Interpolation Weights
+   5.  What Is Not Affected
+
+1.  Severity Summary
+
+       defect                     path            active by default
+       ------------------------   -------------   -----------------
+       button map filler entries  joystick report  yes, but needs a
+                                                   rare button combo
+       stick acceleration         joystick report  YES
+       sine interpolation         effect engine    only if an effect
+                                                   slot is running
+
+2.  Defect 1: Button Map Filler Entries
+
+   Location:  drv_BuildJoystickReport, the button loop at 000153a3
+              drv_ButtonMap at 00019d80
+
+   drv_ButtonMap has 16 entries, one per bit of the N64 button word, but
+   only 14 of those bits are buttons. Bit positions 8 and 9 are Reset and
+   an unused bit, and their table entries hold 0.
+
+   The loop does not special-case them. It executes
+
+       mask |= 1 << drv_ButtonMap[index]
+
+   unconditionally for all 16 indices, so an index holding the filler
+   value 0 asserts HID button 1 - the same bit that A uses.
+
+   Trigger:  the N64 controller asserts its Reset bit when L + R + Start
+             are pressed together. That is the only realistic way bit 8
+             becomes set.
+
+   Effect:   while L + R + Start is held, the gamepad reports button 1
+             as pressed even though A is not.
+
+   Would it be noticed? Rarely. L + R + Start is the controller reset
+   combination, not something pressed during play. It also overlaps the
+   on-controller tuning combination L + R + Z + Start, during which a
+   spurious A press is unlikely to be observed.
+
+   For a replacement: treat a map entry of 0 at indices 8 and 9 as "no
+   button", or better, give the table a sentinel such as 0xFF for "not a
+   button" and test for it.
+
+3.  Defect 3: Cross-Coupled Stick Acceleration
+
+   Location:  drv_BuildJoystickReport, the acceleration block
+
+   The acceleration term is applied as
+
+       X += (|Y| * accel * X) / 256
+       Y += (|X| * accel * Y) / 256
+
+   Each axis is boosted in proportion to the OTHER axis's magnitude. The
+   conventional form would use the axis's own magnitude, or the vector
+   length.
+
+   Consequence: when the stick is pushed straight left, right, up or
+   down, the other axis is zero, the product is zero, and NO acceleration
+   is applied at all. Acceleration only appears on diagonals, and is
+   strongest at 45 degrees.
+
+   Active by default. drv_AddDevice sets the acceleration at
+   devext+0x3F0 to 10 at 000123e2, and the sensitivity at devext+0x3EC to
+   0x4B at 000123d8. Since 0x4B is the neutral sensitivity, the
+   sensitivity step is a no-op out of the box but the acceleration step
+   is not.
+
+   Magnitude with the default accel of 10, working in raw units where the
+   stick reads about +/-80 in normal use and +/-127 at the stops:
+
+       rawX 40, rawY 0     base 640    boost 0       final 640
+       rawX 40, rawY 40    base 640    boost 62      final 702
+       rawX 80, rawY 80    base 1280   boost 250     final 1200 (clamped)
+
+   So the error is a modest mid-range shaping difference, not a gross
+   one, and at full deflection the clamp hides it entirely.
+
+   Would it be noticed? Probably not as a fault. It would feel like a
+   stick that is very slightly quicker on diagonals than on the axes.
+   Many users would read that as intentional, or not perceive it.
+
+   For a replacement: this one deserves a deliberate decision rather than
+   a silent fix. Any profile or muscle memory built on the original was
+   built on this curve. Reproducing it exactly, or making it an option,
+   is defensible; changing it silently will feel different to a
+   long-time user.
+
+4.  Defect 3: Swapped Sine Interpolation Weights
+
+   Location:  drv_SineLerp at 000149a0, verified in the disassembly at
+              000149c2 through 000149df
+
+   The routine interpolates drv_SineTable, whose entries are
+   1000 * sin(i * 5 degrees). Linear interpolation should pair
+   table[idx] with (500 - rem) and table[idx+1] with rem. The code does
+   the reverse:
+
+       000149c2  MOVSX ECX, word ptr [ESI*2 + 0x19d02]   ; table[idx+1]
+       000149cf  SUB   EAX, EDX                          ; 500 - rem
+       000149d1  IMUL  ECX, EAX                          ; wrong pairing
+       000149d4  MOVSX EAX, word ptr [ESI*2 + 0x19d00]   ; table[idx]
+       000149dc  IMUL  EAX, EDX
+
+   Within every 5-degree cell the output therefore runs backwards:
+
+       angle (hundredths of a degree)    0    250    499    500
+       returned                        870    435      1   1740
+       correct                           0    435    869    871
+
+   The result is a rising sawtooth rather than a sine. It is correct only
+   where two adjacent table entries are equal, which happens at the top
+   of the quarter wave.
+
+   Trigger:  any running effect slot, since drv_EffectEvaluate calls this
+             for every evaluation.
+
+   Effect:   whatever the effect engine drives receives a sawtooth with a
+             20-step discontinuity per quarter cycle instead of a smooth
+             sine.
+
+   Would it be noticed? Only by someone using the effect engine. If, as
+   inferred, the engine drives Rumble Pak feedback through duty-cycle
+   modulation, the result would feel buzzy or uneven rather than smooth -
+   easily attributed to the Rumble Pak itself rather than to the driver.
+   It has no effect on scripts, remapping, or any HID report.
+
+   For a replacement: implement the interpolation correctly. Nothing
+   should depend on the sawtooth.
+
+5.  What Is Not Affected
+
+   It is worth stating plainly which paths were examined and found free
+   of these defects, because the practical reliability of the original
+   software depends on them:
+
+   -  The script compiler in wishd201.exe and the bytecode it emits.
+   -  The bytecode interpreter drv_ScriptExecute, including its bounds
+      checks and the 100000-instruction budget.
+   -  The native builtin library drv_ScriptNativeCall, including the
+      thread, sleep, button and stick primitives.
+   -  The keyboard and mouse report builders drv_HidKeyEvent,
+      drv_HidMouseButtonEvent and drv_HidMouseMoveEvent, all of which
+      assemble reports that match the descriptor byte for byte.
+   -  The HID report descriptors themselves and their selection.
+   -  The private IOCTL surface and the dispatch wrapper triage.
+   -  The Controller Pak CRCs, which are the genuine N64 algorithms.
+
+   A user writing complex scripts exercises every item in that list and
+   none of the three defects. That is the reason the software behaves
+   robustly in practice despite them.
