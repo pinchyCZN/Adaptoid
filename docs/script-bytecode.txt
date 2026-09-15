@@ -225,9 +225,33 @@ Table of Contents
    +============+====================================================+
    | 0x10000000 | address of code, a script function                 |
    | 0x20000000 | global variable slot, emitted by the compiler      |
-   | 0x30000000 | address of a stack local, produced by opcode 0x192 |
+   | 0x30000000 | stack local, produced by opcode 0x192; see below   |
    | 0x40000000 | native builtin id, see section 6.5                 |
    +------------+----------------------------------------------------+
+
+   WHERE LOCALS ACTUALLY LIVE. drv_ScriptCheckVarIndex at 00018640 resolves
+   both variable tags against the single Vars array, and rejects anything out
+   of range:
+
+       tag 0x20000000   global; rejected unless index < VarCount,
+                        rewritten to the bare index
+       tag 0x30000000   local; rejected unless index <= 199,
+                        rewritten to VarCount + index
+
+   So locals occupy Vars[VarCount .. VarCount+199]. That is what the 0x328
+   slack on the Vars allocation is for - drv_ScriptLoad allocates VarCount *
+   4 + 0x328, and 200 slots is 800 bytes against 808 allocated. Only the
+   globals are zeroed on load.
+
+   A CONSEQUENCE FOR SCRIPT AUTHORS AND FOR ANY REPLACEMENT: the 200 local
+   slots are per DEVICE, not per thread. The per-thread area at Thread+0x24
+   holds only the arguments _fork copies. Two threads running the same
+   function share its locals, so a forked worker cannot assume private
+   storage.
+
+   This check is also what makes the unbounded VarCount safe. drv_ScriptLoad
+   does not validate VarCount beyond the allocation succeeding, but nothing
+   indexes Vars without passing through here first.
 
 6.3.  Instruction Set
 

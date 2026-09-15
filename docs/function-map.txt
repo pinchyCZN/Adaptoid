@@ -351,7 +351,7 @@ Table of Contents
 
 13.1.  Declared Arity Was Wrong In Thirteen Functions
 
-   Naming a function does not make its signature right. Thirteen routines in
+   Naming a function does not make its signature right. TWENTY routines in
    wishk201.sys had a declared parameter count that did not match the stack
    purge in their own epilogue, so the decompilation silently dropped
    arguments.
@@ -371,6 +371,38 @@ Table of Contents
    produces confident, readable, wrong output. The RET immediate of a stdcall
    function is free ground truth and should be checked before any signature
    is trusted.
+
+   Six of them were found only by a mechanical sweep of every
+   function, comparing declared parameter bytes against the RET immediate. An
+   earlier pass had missed them because it looked for prototypes CONTAINING
+   suspicious text - undefined types or unnamed parameters - and a wrong
+   (void) signature contains neither. Sweep the invariant, not the symptom.
+
+13.2.  Two Places The Decompiler Actively Misleads
+
+   Both were caught only because a name that had been written down stopped
+   agreeing with the disassembly. They are recorded because the same shapes
+   will recur.
+
+   A CONSTANT THAT COLLIDES WITH A FUNCTION ADDRESS. The script instruction
+   budget is 100000, which is 0x186A0, and drv_ScriptNativeCall happens to
+   live at 0x186A0. Ghidra therefore prints the budget's initialiser and its
+   clamp as `= drv_ScriptNativeCall` in both drv_ScriptLoad and
+   drv_ScriptScheduler. The DEC and CMP against zero in drv_ScriptExecute
+   settle that it is a number.
+
+   A NULL CHECK THAT LOOKS LIKE A PARAMETER COMPARISON. In
+   drv_ResetAllDeviceState the decompiler renders the loop guard as `if (link
+   != (undefined4 **)0x344)`. That reads as a comparison against a parameter-
+   relative address, and an earlier revision named the argument Except on
+   that basis. The disassembly is XOR EDI,EDI followed by LEA ECX,[ESI-0x344]
+   and CMP ECX,EDI - a NULL test on the extension base recovered from the
+   list link. The function processes every device and never reads its
+   argument at all.
+
+   The general shape: a folded constant in decompiler output is not evidence
+   of what the constant MEANS. Where a name would encode a claim about the
+   constant, read the instructions.
 
 14. What Is Still Not Known
 

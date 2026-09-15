@@ -219,6 +219,40 @@ Table of Contents
    enable pak I/O, 3 bytes back. Those are the same N64 commands documented
    in usb-transport.txt section 4.
 
+   HOW IT IS IMPLEMENTED. drv_ControlDeviceReadWrite copies the 64 bytes into
+   CommandBlock at control-extension+0x18 and, when the last byte of the
+   block is 1, runs drv_ProcessCommandBlock over it. That last byte is a GO
+   FLAG: the driver clears it after processing, so the walk is bounded at
+   block+0x3F and only 63 bytes are available to entries.
+
+   drv_ProcessCommandBlock walks the block entry by entry. A byte of 0x00 is
+   padding and advances the device index; 0xFE ends the block; 0xFF skips one
+   byte. Anything else is an entry whose first byte is the command length and
+   whose second byte, masked with 0x3F, is the expected reply length. Each
+   entry addresses the Nth device in the driver-wide list, N counting entries
+   seen so far.
+
+   An entry is REJECTED by setting bit 0x80 in its second byte, which is how
+   a caller learns it failed. The rejections are: a command length above
+   0x26, a reply length above 0x26, a reply longer than 3 for a command
+   longer than 4, an entry that would run past the end of the block, or more
+   than five devices addressed.
+
+   IT RUNS IN TWO PASSES, with a Pass argument selecting which entries act.
+   The pass-1 entries are cached fast paths; everything else is executed on
+   pass 0 through drv_ExecuteRawCommand.
+
+   ONE FAST PATH MATTERS FOR PERFORMANCE. Command 0x01 with a 4-byte reply
+   and argument 0x01 is answered entirely from DevExt->LastRawReport, the
+   cache the interrupt poll already maintains, WITHOUT issuing any USB
+   traffic. The bytes are re-ordered to [4][3][0][1] on the way out. So an
+   application can poll controller state at any rate it likes and cost the
+   bus nothing.
+
+   There is also a byte-order switch. If the last dword of an incoming block
+   is 1, drv_ControlDeviceReadWrite swaps the bytes of each dword pair and
+   records SwapBytes, then applies the same swap when the block is read back.
+
 4.  Per-Device Commands
 
    Handled by drv_IoctlDeviceCommand. Reached either with a device id

@@ -377,6 +377,10 @@ Table of Contents
 
        +0x00  Magic[3]           3E178AA3 7625F013 ED739374
        +0x0C  DeviceObject       back pointer
+       +0x10  Deleting           set during teardown
+       +0x14  OpenCount          handles open on \.\Wish_NA1
+       +0x18  CommandBlock[0x40] the SDK simple-interface joybus block
+       +0x58  SwapBytes          byte-swap the block on the way out
        +0x5C  EventCount         capped at 99
        +0x60  EventList          LIST_ENTRY
        +0x68  WaiterList         LIST_ENTRY, IRPs waiting for an event
@@ -386,6 +390,16 @@ Table of Contents
    Every dispatch wrapper tests the magic to recognise this device. The queue
    is DRIVER-WIDE, not per handle and not per adapter: every controller posts
    into it and any waiter can receive any event.
+
+   CommandBlock ends at exactly 0x58, where SwapBytes begins, which is the
+   same kind of arithmetic confirmation as the poll slots and the effect
+   ring: a 64-byte field placed at 0x18 lands precisely on the next field in
+   use.
+
+   A 64-byte WriteFile on the control device lands in CommandBlock and is
+   walked by drv_ProcessCommandBlock; a 64-byte ReadFile copies it back. That
+   is the transport behind the SDK simple interface recorded in ioctl-
+   surface.txt section 3.1.
 
 5.  Windows And USB Structures
 
@@ -426,7 +440,7 @@ Table of Contents
 
 6.  Corrected Function Arities
 
-   Thirteen functions had a declared parameter count that did not match their
+   TWENTY functions had a declared parameter count that did not match their
    stack purge. Until each was fixed the decompilation silently dropped
    arguments, which in several cases hid the whole point of the routine -
    drv_SendVendorRequest appeared to take no completion callback, so the
@@ -451,7 +465,27 @@ Table of Contents
    | drv_GetConfigDescriptor          | 0     | 1    | device extension                   |
    | drv_BuildDeviceLocationName      | 0     | 1    | firmware revision                  |
    | drv_UsbCyclePort                 | 0     | 1    | device extension                   |
+   | drv_N64Transaction               | 5     | 6    | the reply buffer is separate       |
+   | drv_SystemPowerRequestComplete   | 4     | 5    | the IO_STATUS_BLOCK                |
+   | drv_CreateControlDevice          | 0     | 1    | driver object                      |
+   | drv_ResetAllDeviceState          | 0     | 1    | the device to skip                 |
+   | drv_UsbResetPort                 | 0     | 1    | device extension                   |
+   | drv_CompleteNotificationIrps     | 1     | 2    | an unused second argument          |
+   | drv_ProcessCommandBlock          | weak  | 3    | control extension, block, pass     |
    +----------------------------------+-------+------+------------------------------------+
+
+   drv_N64Transaction is the one whose correction changes meaning rather than
+   just readability. It was recorded as taking a single buffer that held the
+   command on entry and received the reply. It does not: the command buffer
+   and the reply buffer are SEPARATE arguments, five and six. Every caller
+   passes a distinct local for the reply.
+
+   HOW THEY WERE FOUND. The first thirteen came from reading call sites. The
+   remaining six came from a mechanical sweep comparing each function's
+   declared parameter bytes against the RET immediate in its own epilogue -
+   which is the check that should have been run first. A wrong (void)
+   signature is invisible to any search for suspicious-looking prototypes,
+   because there is nothing suspicious about it.
 
 7.  Unreferenced Regions
 
@@ -505,15 +539,16 @@ Table of Contents
 
 9.  Open Questions
 
-   -  The 0x328 slack on the Vars allocation. drv_ScriptLoad allocates
-   -  VarCount * 4 + 0x328 and initialises only the leading VarCount dwords.
-   -  What the remainder holds is not established.
+   -  RESOLVED. The 0x328 slack on the Vars allocation is the STACK-LOCAL
+   -  REGION, not padding. drv_ScriptCheckVarIndex resolves operand tag
+   -  0x30000000 as a local, bounded at 199, and rewrites it to VarCount +
+   -  index. 200 slots is 800 bytes against 808 allocated. A consequence
+   -  worth noting: locals are per-DEVICE, not per-thread, so forked threads
+   -  share them.
 
-   -  Seven functions still have parameters that no call site determines:
-   -  drv_DeleteControlSymlink, drv_DeleteControlDevice,
-   -  drv_ProcessCommandBlock, drv_QueueUserNotification,
-   -  drv_UsbGetPortStatus, drv_SystemPowerRequestComplete and
-   -  drv_ScriptCheckVarIndex.
+   -  RESOLVED for all but one. Only drv_ProcessCommandBlock still has a
+   -  parameter no call site determines. Every other function in the driver
+   -  now has a signature whose declared size matches its RET immediate.
 
    -  ScriptState value -3. The load path accepts it alongside 0 and -1 but
    -  nothing observed writes it.
