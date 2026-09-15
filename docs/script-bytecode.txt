@@ -1,0 +1,345 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishd201.exe                                                 2001 config tool
+
+
+                  SCRIPT COMPILER AND BYTECODE
+
+
+Abstract
+
+   The Adaptoid button scripting language is compiled, not interpreted in
+   user mode. wishd201.exe contains a flex scanner and a bison parser that
+   translate a C-like source script into a stream of 32-bit opcodes, which is
+   then downloaded into wishk201.sys and executed in kernel mode.
+
+   That is why a script such as "A repeats as mouse clicks" reaches every
+   application as genuine HID input: no part of the translation happens above
+   the driver.
+
+   This note records the location of the compiler, the compile pipeline, the
+   download buffer format, the instruction encoding, and the opcode set.
+
+   Everything here is read out of the Ghidra database for wishd201.exe, with
+   driver-side cross-checks against wishk201.sys. Statements not directly
+   supported by an instruction or a byte are marked INFERENCE.
+
+Table of Contents
+
+   1.  Evidence That It Is Flex And Bison
+   2.  Map Of The Compiler
+   3.  The Compile Pipeline
+   4.  Download Buffer Format
+   5.  Instruction Encoding
+   6.  Opcodes
+   7.  Consequences For The Replacement Driver
+   8.  Open Questions
+
+1.  Evidence That It Is Flex And Bison
+
+   The original developer stated that the scripting language was built with
+   flex and bison. The binary confirms it.
+
+   Flex runtime strings, all referenced from cfg_yylex at 0040aa80:
+
+       00421174  "fatal flex scanner internal error--no action found"
+       004211a8  "input in flex scanner failed"
+       004211c8  "fatal error - scanner input buffer overflow"
+       004211f4  "fatal flex scanner internal error--end of buffer missed"
+       0042122c  "out of dynamic memory in yy_create_buffer()"
+       0042125c  "flex scanner push-back overflow"
+
+   Bison runtime strings, referenced from cfg_yyparse at 00409950:
+
+       004210a8  "parse error"
+       0042115c  "parser stack overflow"
+
+   "parse error" rather than "syntax error" places this at bison 1.x, which
+   is consistent with a tool built in or before 2001. A large character table
+   sits at 0041f4da. INFERENCE: this is the scanner equivalence-class array
+   that flex emits as a 256-entry map from character to class.
+
+2.  Map Of The Compiler
+
+   +----------------------------+----------+--------------------------------------+
+   | Name                       | Address  | Role                                 |
+   +============================+==========+======================================+
+   | cfg_yylex                  | 0040aa80 | flex scanner, 0x7C0 bytes            |
+   | cfg_yyparse                | 00409950 | bison parser and action switch       |
+   | cfg_CompileScript          | 0040bc00 | compile one script, top level        |
+   | cfg_EmitWord               | 0040cb00 | append one 32-bit word               |
+   | cfg_EmitOpOperand          | 0040cb90 | append opcode word plus operand word |
+   | cfg_ConcatCode             | 0040cbf0 | concatenate two code lists           |
+   | cfg_CodeLength             | 0040ca20 | length of a code list in words       |
+   | cfg_CurrentPc              | 0040caa0 | current code length, used as PC      |
+   | cfg_EmitSymbolRef          | 0040c9b0 | load a global or a local             |
+   | cfg_EmitStoreToSymbol      | 0040c480 | emit a store to a named symbol       |
+   | cfg_EmitLoop               | 0040c800 | build for/while/do from fragments    |
+   | cfg_CloseScopeAndBackpatch | 0040c530 | resolve branches, break, continue    |
+   | cfg_DownloadScript         | 00404700 | DeviceIoControl 0xb98c20f0           |
+   +----------------------------+----------+--------------------------------------+
+
+   Scripts are held per button. The UI walker at 00408af0 iterates 16 entries
+   of 0x43C bytes each from 00425788 to 00429b48, which matches the 16
+   entries of drv_ButtonMap in the driver: one script slot per bit position
+   in the N64 button word.
+
+3.  The Compile Pipeline
+
+   cfg_CompileScript performs:
+
+       FUN_0040beb0()        reset code generator state
+       FUN_0040b770(text)    point the lexer at the source string
+       cfg_yyparse()         parse; grammar actions emit into DAT_0045b5b4
+
+   The global DAT_0045b5b8 holds the result: zero on success, non-zero is the
+   error code returned to the caller. On failure the caller receives line and
+   column information from DAT_0045b5d8, DAT_0045b5c0, DAT_0045b5e0 and
+   DAT_0045b5c8, and the message text is copied out of DAT_0045b560. The UI
+   surfaces this as "Script compilation error" at 0041f288.
+
+   On success a fixed epilogue and prologue are wrapped around the body:
+
+       cfg_EmitOpOperand(tail, 0x110, sym[5] | 0x20000000)
+       cfg_EmitOpOperand(tail, 0x020, 0x80)
+       cfg_EmitWord     (tail, 0x082)
+       cfg_EmitOpOperand(NULL, 0x170, cfg_CodeLength(body))
+       cfg_ConcatCode(prologue, body)
+       cfg_ConcatCode(prologue, tail)
+
+   The symbol used in the first epilogue instruction comes from FUN_0040c6e0
+   looking up the name at 004212a0, and its field [5] is or-ed with
+   0x20000000 before being used as the operand. INFERENCE: 0x20000000 is a
+   global-storage tag rather than part of the value, since cfg_EmitSymbolRef
+   applies the same bit only on the global branch.
+
+4.  Download Buffer Format
+
+   The packed buffer is:
+
+       +0x00  dword         opcode count
+       +0x04  dword         flags/metadata, from DAT_0045b608
+       +0x08  dword[count]  the opcode stream
+
+   cfg_DownloadScript sends it with
+
+       DeviceIoControl(h, 0xb98c20f0, buf, buf[0] * 4 + 8, &out, 4, ...)
+
+   which matches the driver length check exactly: wishk201.sys requires the
+   input length to equal *input * 4 + 8. See ioctl-surface.txt section 5a for
+   the driver side. A count of zero unloads the script.
+
+   INFERENCE: the count is masked with 0x3FFFFFFF in the copy loops of both
+   cfg_CompileScript and cfg_EmitWord, so the top two bits of that dword may
+   be flags rather than count. Not established.
+
+5.  Instruction Encoding
+
+   The code list used during compilation has the layout
+
+       +0x00  dword    words used
+       +0x04  dword    capacity in words
+       +0x08  dword[]  the words
+
+   It doubles in capacity when full, starting at 8 words. An instruction is
+   one 32-bit opcode word, optionally followed by one 32-bit operand word.
+   Two bits of the opcode are structural:
+
+   +-------+-----------------------------------------------------+
+   | Bit   | Meaning                                             |
+   +=======+=====================================================+
+   | 0x100 | The opcode is followed by an operand word.          |
+   | 0x400 | The operand is an unresolved PC-relative reference. |
+   +-------+-----------------------------------------------------+
+
+   Bit 0x100 is the decoder stride rule, and it is not a guess. The
+   instruction walker inside cfg_CloseScopeAndBackpatch advances an extra
+   slot exactly when (opcode & 0x100) is non-zero. It holds for every opcode
+   recovered: 0x110, 0x170, 0x172, 0x190, 0x9f0, 0x9f1, 0xd91 and 0xd92 carry
+   operands, and none of the others do.
+
+   Bit 0x400 is set by cfg_EmitOpOperand, which rewrites the operand as
+
+       operand = ((short)(operand >> 16) << 16)
+               | ((operand - cfg_CurrentPc(list)) & 0xFFFF)
+
+   so the low half becomes a signed word displacement from the emit point and
+   the high half is preserved as a scope identifier. When the owning scope
+   closes, cfg_CloseScopeAndBackpatch matches the high half against the scope
+   being closed, clears bits 0x0C00, and sign-extends the operand to a final
+   32-bit displacement.
+
+   Note that cfg_EmitOpOperand is really just "emit two words". It is
+   sometimes used to emit two independent no-operand opcodes in one call:
+   cfg_EmitOpOperand(list, 0x20, 0x80) in cfg_CompileScript produces the same
+   two words as the separate cfg_EmitWord(0x20) and cfg_EmitWord(0x80) calls
+   in grammar action 7.
+
+6.  Opcodes
+
+   Recovered by enumerating every caller of cfg_EmitWord and
+   cfg_EmitOpOperand: 30 and 21 call sites respectively, across the
+   cfg_yyparse action switch and five code generation helpers.
+
+6.1.  Instructions With An Operand
+
+   +--------+---------------------------------------------------+
+   | Opcode | Operand and meaning                               |
+   +========+===================================================+
+   | 0x110  | Push a symbol value. Operand is the symbol field  |
+   |        | +0x14. Globals are tagged by or-ing 0x20000000    |
+   |        | into the operand.                                 |
+   | 0x170  | Unconditional jump. Operand is a signed word      |
+   |        | displacement.                                     |
+   | 0x172  | Conditional jump, taken when the tested value is  |
+   |        | false.                                            |
+   | 0x190  | Scope adjust. Emitted with +N on entry and -N on  |
+   |        | exit by cfg_CloseScopeAndBackpatch. Local frame   |
+   |        | allocation.                                       |
+   | 0x9f0  | continue placeholder. Backpatched to 0x170        |
+   |        | targeting the loop increment section.             |
+   | 0x9f1  | break placeholder. Backpatched to 0x170 targeting |
+   |        | the loop exit.                                    |
+   | 0xd91  | Scope reference, always emitted with bit 0x400    |
+   |        | set. Operand high half is the scope id. Precedes  |
+   |        | 0x9f0 and 0x9f1.                                  |
+   | 0xd92  | Load a local. Operand is (index & 0xFFFF) or-ed   |
+   |        | with (depth << 16).                               |
+   +--------+---------------------------------------------------+
+
+6.2.  Instructions Without An Operand
+
+   +--------+----------------------------------------------------+
+   | Opcode | Context                                            |
+   +========+====================================================+
+   | 0x020  | Emitted in actions 1, 7 and 0x38, and in the       |
+   |        | epilogue.                                          |
+   | 0x021  | Action 8.                                          |
+   | 0x022  | Action 9.                                          |
+   | 0x023  | Action 0x0F.                                       |
+   | 0x024  | Action 0x10.                                       |
+   | 0x040  | Value of action 0x17.                              |
+   | 0x041  | Value of action 0x16.                              |
+   | 0x042  | Value of action 0x15.                              |
+   | 0x080  | Emitted after 0x020 in action 7 and in the         |
+   |        | epilogue.                                          |
+   | 0x082  | Final instruction of the epilogue and of actions   |
+   |        | 0x79, 0x7A and 0x81. INFERENCE: return or end of   |
+   |        | script.                                            |
+   | 0x093  | Emitted between a left and a right operand in      |
+   |        | every binary construction, and counted by the      |
+   |        | argument counter at DAT_0045b480 when building a   |
+   |        | call argument list. INFERENCE: push or operand     |
+   |        | separator.                                         |
+   | 0x231  | Terminates a call sequence: callee, 0x093,         |
+   |        | arguments, 0x231. Emitted by cfg_EmitStoreToSymbol |
+   |        | and actions 0x37, 0x38, 0x4C and 0x83.             |
+   |        | INFERENCE: call.                                   |
+   +--------+----------------------------------------------------+
+
+6.3.  The Operator Block, 0x250 To 0x267
+
+   A contiguous family of 18 operator opcodes, all emitted with no operand,
+   after the pattern: left, 0x093, right, operator.
+
+   Ten are produced by actions 0x39 through 0x42, whose values are consumed
+   by action 0x13 as a plain binary operator:
+
+       action  0x39  0x3A  0x3B  0x3C  0x3D  0x3E  0x3F  0x40  0x41  0x42
+       opcode  0x254 0x255 0x256 0x252 0x253 0x250 0x251 0x257 0x259 0x258
+
+   The same ten plus eight more are produced by the compound-assignment
+   actions 0x19 through 0x33:
+
+       action  0x19  0x1A  0x1B  0x1D  0x1E  0x20  0x21  0x23  0x24
+       opcode  0x254 0x255 0x256 0x252 0x253 0x250 0x251 0x263 0x262
+
+       action  0x25  0x26  0x28  0x29  0x2B  0x2D  0x2F  0x31  0x33
+       opcode  0x265 0x264 0x260 0x261 0x257 0x259 0x258 0x266 0x267
+
+   INFERENCE: the ten shared codes are the operators that have a compound-
+   assignment form in C, and there are exactly ten of those: *= /= %= += -=
+   <<= >>= &= ^= |=. The codes appearing only in the second group would then
+   be the comparison and logical operators, which have no compound form. The
+   specific opcode-to-operator assignment is NOT established, because the
+   grammar rule numbers cannot be mapped back to C tokens without the
+   original .y file.
+
+6.4.  Language Features Rejected By The Compiler
+
+   The grammar is a full C expression and statement grammar, but several
+   productions raise an error in their action rather than emitting code.
+   These message strings are the clearest statement of what the scripting
+   language is not:
+
+       00421144  "invalid key description"          action 0x03
+       0042112c  "labels not supported"             action 0x57
+       00421110  "case keyword not supported"       action 0x58
+       004210f0  "default keyword not supported"    action 0x59
+       004210d0  "switch keyword not supported"     action 0x69
+       004210b4  "goto keyword not supported"       action 0x76
+       00421490  "undeclared symbol"                cfg_EmitSymbolRef
+
+   So the language has if, while, for, do, break, continue, function calls
+   and the full C operator set, but no switch, no goto and no labels.
+   Variables must be declared before use.
+
+6.5.  Control Flow Construction
+
+   cfg_EmitLoop at 0040c800 builds every loop from four code fragments,
+   namely init, condition, increment and body:
+
+       [init]
+       if a condition is present:
+           if do-while:  0x170  jump over the body to the condition
+           [condition]
+           0x172  jump past body and increment when false
+       [body]
+       close scope, backpatching break and continue
+       [increment]
+       0x170  negative displacement back to the top
+
+   The conditional expression forms in actions 0x35, 0x67 and 0x68 use the
+   same two opcodes: 0x172 to skip a branch and 0x170 to jump over the
+   alternative.
+
+7.  Consequences For The Replacement Driver
+
+   The bytecode is the real configuration format. A replacement driver must
+   implement the same interpreter, or the existing configurator cannot drive
+   it. Conversely, a replacement configurator must emit the same encoding.
+
+   Instructions are 32-bit words with an optional 32-bit operand. Nothing in
+   the stream is pointer-sized, so the format itself survives a 64-bit port
+   unchanged, and so does the two-DWORD buffer header.
+
+   Branch displacements are 16 bits and relative to the emit point, in words.
+   A script long enough to exceed that range would break silently; the
+   compiler does not appear to check it.
+
+   The interpreter runs in kernel mode on downloaded data with no signing and
+   no validation visible beyond the length check. A modern port must validate
+   the opcode stream before executing it, because a malformed script is
+   otherwise a kernel-mode fault. In particular a decoder that trusts bit
+   0x100 for stride can be walked off the end of the buffer by a crafted
+   final instruction. This is the single most important security difference
+   between the original design and anything shipped today.
+
+8.  Open Questions
+
+   - The specific C operator behind each code in the 0x250..0x267 block.
+   Recoverable by matching the bison rule numbers against a standard C
+   grammar, or by compiling known scripts and diffing the output.
+
+   - The driver-side interpreter. The load entry is FUN_00017310 in
+   wishk201.sys; the execution loop has not been located yet. Reading it
+   against this table would confirm the inferred semantics of 0x082, 0x093
+   and 0x231.
+
+   - The meaning of the flags word at buffer +0x04, sourced from
+   DAT_0045b608, and whether the top two bits of the count dword are flags.
+
+   - The symbol table behind FUN_0040c6e0 and the meaning of field [5], which
+   is what the epilogue 0x110 instruction carries.
+
+   - How the 16 per-button script slots relate to the 32 macro slots in the
+   driver, which are programmed by a different IOCTL entirely.

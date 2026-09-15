@@ -1,0 +1,391 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishk201.sys                                                 2001 driver
+
+
+                    PRIVATE IOCTL SURFACE
+
+
+Abstract
+
+   wishk201.sys is a HID minidriver, but it also carries a second,
+   private interface that user mode reaches directly. That interface is
+   how wishd201.exe configures the adapter, reads and writes the
+   Controller Pak, and downloads compiled button scripts into the
+   driver.
+
+   This note records how a user-mode DeviceIoControl reaches that
+   interface without hidclass.sys intercepting it, the two channels
+   available, the full IOCTL map of both, and the layout of the 32-slot
+   macro engine that executes downloaded scripts.
+
+   Everything here is read out of the Ghidra database for wishk201.sys.
+   Statements not directly supported by an instruction or a byte are
+   marked INFERENCE.
+
+Table of Contents
+
+   1.  How User Mode Reaches The Driver
+   2.  IOCTL Encoding
+   3.  Control-Device Commands
+   4.  Per-Device Commands
+   5.  The Macro Slot Engine
+   6.  Controller Pak Access
+   7.  The Button Map
+   8.  Consequences For The Replacement Driver
+   9.  Open Questions
+
+1.  How User Mode Reaches The Driver
+
+   drv_DriverEntry installs drv_DispatchDeviceControl (00013780) into
+   MajorFunction[0x0E] before calling HidRegisterMinidriver, so
+   hidclass.sys takes ownership of that entry. When the call returns,
+   DriverEntry saves the hidclass handler to 00019dac and installs
+   drv_DeviceControlTriage (00011a80) over the top.
+
+   The consequence is that every user-mode DeviceIoControl arrives at
+   drv_DeviceControlTriage first, and hidclass.sys only sees the ones
+   the minidriver chooses to forward. The triage is:
+
+   +---+--------------------------------------+--------------------------+
+   | # | Test                                 | Target                   |
+   +===+======================================+==========================+
+   | 1 | devext starts 3E178AA3 7625F013      | drv_IoctlControlDevice   |
+   |   | ED739374                             | (00 01 06 1f)            |
+   | 2 | FileName.Length == 4 and             | drv_IoctlViaHidHandle    |
+   |   | FileName.Buffer[1] == 0x71 ('q')     | (00 01 27 10)            |
+   | 3 | neither                              | chain to 00019dac        |
+   | 4 | chain pointer null                   | STATUS_NOT_SUPPORTED     |
+   +---+--------------------------------------+--------------------------+
+
+   Test 1 identifies a separate global control device object by a
+   12-byte magic value at the head of its device extension. It is not
+   tied to any one controller, and it owns the enumeration and
+   driver-wide commands in section 3.
+
+   Test 2 is the more interesting one. User mode opens the ordinary HID
+   device interface path with a two-character suffix whose second
+   character is 'q', and the minidriver claims the handle before
+   hidclass can see it. Only Buffer[1] is actually tested.
+
+   INFERENCE: the first character is almost certainly a backslash,
+   giving a relative open of "\q" against the HID interface path. The
+   code does not test it, so any first character works.
+
+   Both private paths converge on drv_IoctlDeviceCommand (00012bc0).
+   The control-device path carries a 4-byte device id at the front of
+   the input buffer and strips it before forwarding; the 'q' path has
+   the device implied by the file object and forwards the buffer
+   unchanged. That is the only difference between them.
+
+2.  IOCTL Encoding
+
+   All private codes are
+
+       CTL_CODE(0xB98C, fn, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+   which flattens to
+
+       code = 0xB98C0000 | (fn << 2)
+
+   0xB98C is a vendor-defined device type, and every fn observed is in
+   the 0x800+ vendor range, so the encoding is conformant. METHOD_BUFFERED
+   means the I/O manager copies buffers; the driver never touches user
+   addresses directly on this path.
+
+   Note the contrast with the HID minidriver IOCTLs documented in
+   hid-descriptor.txt, which use device type 0x0B and METHOD_NEITHER and
+   arrive only from hidclass.sys.
+
+3.  Control-Device Commands
+
+   Handled by drv_IoctlControlDevice. "in" and "out" are the required
+   input and output buffer lengths in bytes.
+
+   +------------+-------+-----+-----+-------------------------------------------+
+   | Code       | fn    | in  | out | Effect                                    |
+   +============+=======+=====+=====+===========================================+
+   | 0xb98c2004 | 0x801 |   0 |   1 | returns the byte at 00019d94              |
+   | 0xb98c2008 | 0x802 |  64 |  64 | 64-byte exchange, sets Information = 64   |
+   | 0xb98c200c | 0x803 |  64 |  64 | same handler as 0x802                     |
+   | 0xb98c2044 | 0x811 |   0 | >=4 | version bytes {2, 1, 0, 0}                |
+   | 0xb98c2048 | 0x812 |   0 |   4 | returns the DWORD at 00019d90             |
+   | 0xb98c2050 | 0x814 | 0/4 | 0/4 | recognised, falls through to unsupported  |
+   | 0xb98c2058 | 0x816 |   4 |   0 | driver-wide enable flag at 00019d70, then |
+   |            |       |     |     | flags every device and drains via         |
+   |            |       |     |     | FUN_00014a00                              |
+   | 0xb98c205c | 0x817 | <16 | <16 | get and set drv_ButtonMap, section 7      |
+   | 0xb98c2060 | 0x818 |   0 |  12 | FUN_000159e0, async event fetch           |
+   | 0xb98c2084 | 0x821 |   4 |   8 | enumerate: in = previous device id,       |
+   |            |       |     |     | out = {next id, device count}             |
+   | 0xb98c2088 | 0x822 |   4 |   4 | look up a device id by the value at       |
+   |            |       |     |     | devext+0x2d                               |
+   | 18 codes   |       | >=4 |   - | device id prefix, then forwarded to       |
+   |            |       |     |     | drv_IoctlDeviceCommand (section 4)        |
+   +------------+-------+-----+-----+-------------------------------------------+
+
+   0x811 returning {2, 1, 0, 0} matches the 2.01 in the binary file
+   names wishk201.sys and wishd201.exe.
+
+   0x821 is a standard iterator: pass 0 to get the first device, then
+   pass each returned id to get the next. The device list is the
+   spinlock-guarded list head at 00019d74.
+
+   INFERENCE: 0x802 and 0x803 set a 64-byte transfer length but no copy
+   is visible in the decompilation of this function. Not established.
+
+4.  Per-Device Commands
+
+   Handled by drv_IoctlDeviceCommand. Reached either with a device id
+   prefix through the control device, or directly through a 'q' handle.
+
+   +------------+-------+------+------+------------------------------------------+
+   | Code       | fn    | in   | out  | Effect                                   |
+   +============+=======+======+======+==========================================+
+   | 0xb98c20c8 | 0x832 | var  | var  | raw controller transaction, may return   |
+   |            |       |      |      | STATUS_PENDING and mark the IRP pending  |
+   | 0xb98c20cc | 0x833 |    0 |    6 | status snapshot from devext+0x16f0,      |
+   |            |       |      |      | clears the flag byte at +0x16f8          |
+   | 0xb98c20d0 | 0x834 | <513 |    0 | accepted, no observable effect           |
+   | 0xb98c20d4 | 0x835 |    0 |  var | NUL-terminated string at devext+0x334    |
+   | 0xb98c20d8 | 0x836 |    4 |    4 | read one counter, selector 1..4          |
+   | 0xb98c20dc | 0x837 |    4 |    0 | zero counter 2 or 3                      |
+   | 0xb98c20e4 | 0x839 |    4 |    0 | FUN_00018b00 on/off toggle               |
+   | 0xb98c20e8 | 0x83a | var  | var  | FUN_000137c0 raw N64 bus transfer        |
+   | 0xb98c20f0 | 0x83c | 8+4n |    0 | DOWNLOAD COMPILED SCRIPT, section 5a     |
+   | 0xb98c20f4 | 0x83d |    0 |  var | drain and free the two script buffers    |
+   | 0xb98c20f8 | 0x83e |  0/4 |  0/4 | get and/or set the DWORD at devext+0x3ec |
+   | 0xb98c20fc | 0x83f |  0/4 |  0/4 | get and/or set the DWORD at devext+0x3f0 |
+   | 0xb98c2100 | 0x840 |    0 |    1 | 3-byte status read, returns one byte     |
+   | 0xb98c2104 | 0x841 |    4 | >=32 | Controller Pak read, section 6           |
+   | 0xb98c2108 | 0x842 | 0x24 |    0 | Controller Pak write, section 6          |
+   | 0xb98c2148 | 0x852 | >=28 |    0 | program a macro slot, section 5          |
+   | 0xb98c214c | 0x853 |    2 |    0 | start, stop, or stop-all macro slots     |
+   | 0xb98c2154 | 0x855 |    1 |    1 | query whether a macro slot is running    |
+   +------------+-------+------+------+------------------------------------------+
+
+   An unrecognised code gives STATUS_NOT_SUPPORTED (0xC00000BB). A
+   recognised code with the wrong buffer sizes gives
+   STATUS_INVALID_PARAMETER (0xC000000D). The distinction is useful when
+   probing a live device.
+
+   0x83c guards on the state word at devext+0x1640 and returns
+   STATUS_DEVICE_BUSY (0x80000011) if a script load is already in
+   progress.
+
+5.  The Macro Slot Engine
+
+   This is the mechanism behind behaviour like "hold A and it emits
+   repeated mouse clicks". The driver holds 32 independently programmed,
+   independently started slots. The configurator compiles a script and
+   downloads the result here; the driver executes the timing in kernel
+   mode, which is why the output is indistinguishable from real input.
+
+   This slot engine is a parameterised repeat engine. It is NOT the
+   compiled-script path: that is IOCTL 0xb98c20f0, described in section
+   5a, which carries a real 32-bit bytecode stream. The two mechanisms
+   are separate and coexist.
+
+   5.1.  Programming a slot, fn 0x852
+
+   Input is a 28-byte header followed by up to two payload streams:
+
+       offset  size   meaning
+       +0x00   dword  bits  0..15  slot index, must be < 0x20
+                      bits 16..23  flags
+                      bits 24..31  stored at slot+0x448
+       +0x04   dword  stored at slot+0x458
+       +0x08   dword  stored at slot+0x45c
+       +0x0C   dword  stored at devext + (slot + 0x14) * 0x38
+       +0x10   dword  stored at slot+0x464
+       +0x14   dword  stored at slot+0x468
+       +0x18   dword  per-stream payload length, stored at slot+0x46c
+       +0x1C   ...    one payload stream per set flag bit
+
+   Flag bits 0 and 1 each indicate one payload stream is present. The
+   required input length is 0x1C plus the payload length once per set
+   bit. Bits 0x40 and 0xC0 of the flags gate whether the slot's start
+   timestamp is reset.
+
+   5.2.  Slot control block
+
+   Slot n occupies 0x38 bytes at devext + 0x448 + n * 0x38:
+
+       +0x448   header byte field from bits 24..31
+       +0x44c   running flag, non-zero while the slot is active
+       +0x450   QWORD start timestamp
+       +0x458   parameter
+       +0x45c   parameter
+       +0x464   parameter
+       +0x468   parameter
+       +0x46c   payload length
+       +0x470   payload bytes
+
+   Payload bytes land at devext + 0x470 + (n * 7 + stream) * 8, and the
+   copy loop breaks once the byte index exceeds 7. So a stream is capped
+   at 8 bytes regardless of the declared length.
+
+   INFERENCE: the stride of 7 implies room for seven streams per slot,
+   but fn 0x852 only ever writes streams 0 and 1.
+
+   5.3.  Timing
+
+   Timestamps are KeQueryInterruptTime divided by 0x2625A (156250).
+   KeQueryInterruptTime is in 100ns units and 10,000,000 / 156,250 = 64,
+   so slot timestamps are in 1/64-second ticks, about 15.625 ms.
+
+   INFERENCE: 1/64 s is therefore the natural granularity of any repeat
+   rate the scripting language can express.
+
+   5a.  The Compiled Script Path, fn 0x83c
+
+   IOCTL 0xb98c20f0 is how wishd201.exe loads a compiled script into the
+   driver. cfg_DownloadScript (00404700 in wishd201.exe) issues it:
+
+       CreateFileA(interface_path, GENERIC_READ|GENERIC_WRITE, ...)
+       DeviceIoControl(h, 0xb98c20f0, buf, buf[0] * 4 + 8, &out, 4, ...)
+
+   The trace string it prints is "Loading %d opcode script into device
+   %s", and passing a null script prints "Unloading script from device
+   %s" instead, so a count of zero unloads.
+
+   Buffer layout, produced by cfg_CompileScript (0040bc00):
+
+       +0x00  dword         opcode count
+       +0x04  dword         flags/metadata word
+       +0x08  dword[count]  the opcode stream
+
+   This is exactly the length test the driver applies:
+   input length must equal *input * 4 + 8. On the driver side the load is
+   performed by FUN_00017310(devext, count) and the state word at
+   devext+0x1640 is left at (count != 0) - 1, i.e. 0 when a script is
+   loaded and -1 when it was unloaded.
+
+   GetLastError of 0xAA (ERROR_BUSY) is treated as a soft failure and
+   returns -1 rather than an error.
+
+   The instruction encoding is documented in script-bytecode.txt.
+
+   5.4.  Starting and stopping, fn 0x853
+
+   Input is two bytes, {command, slot}, with slot < 0x20:
+
+       1   start the slot, but only if its payload length at +0x46c is
+           greater than zero; stamps the start time
+       2   stop the slot
+       3   stop all 32 slots
+
+   Every command ends by calling FUN_00013a60(devext), which is the
+   engine's rescan or reschedule entry point.
+
+   fn 0x855 takes a slot number and returns one byte from FUN_00013e90,
+   reporting whether the slot is currently running.
+
+6.  Controller Pak Access
+
+   fn 0x841 and 0x842 are Controller Pak (memory card) reads and writes,
+   and they implement the genuine N64 accessory protocol.
+
+   drv_N64PakAddrCrc5 (000136f0) takes a block address, keeps bits 5..15
+   as an 11-bit block number, computes a 5-bit CRC with polynomial 0x15,
+   and returns (block << 5) | crc5. That is the standard N64 accessory
+   address encoding.
+
+   drv_N64PakDataCrc8 (00013730) computes an 8-bit CRC with polynomial
+   0x85 over exactly 32 bytes. That is the standard N64 accessory data
+   CRC.
+
+   Read, fn 0x841: input is a 4-byte address, output at least 32 bytes.
+   The driver issues N64 command 0x02 with the encoded address, reads 32
+   bytes plus a trailing CRC byte, and verifies it.
+
+   Write, fn 0x842: input is 0x24 bytes, a 4-byte address followed by 32
+   bytes of data. The driver issues N64 command 0x03 and checks the
+   echoed CRC.
+
+   Both map CRC results to status:
+
+       CRC matches        STATUS_SUCCESS
+       returned CRC 0x80  STATUS_DEVICE_NOT_READY (0xC0000013)
+       otherwise          STATUS_CRC_ERROR (0xC000003F)
+
+7.  The Button Map
+
+   drv_ButtonMap at 00019d80 is a 16-byte driver-wide table, read and
+   written by control-device IOCTL fn 0x817. Input bytes with a value of
+   0x0E or greater are ignored, which caps entries at 0..13 - exactly
+   the 14 buttons in the joystick collection.
+
+   drv_DriverEntry initialises it to:
+
+       index  0  1  2  3   4   5   6   7   8  9  10 11 12 13 14 15
+       value  0  3  9  8  10  11  12  13   0  0   6  7  5  1  4  2
+
+   The 14 non-filler values are a permutation of 0..13, each appearing
+   exactly once, and the two zeros fall at indices 8 and 9.
+
+   INFERENCE: the index is the bit position in the N64 controller's
+   16-bit button word, whose conventional order is
+
+       0 A       1 B        2 Z        3 Start
+       4 D-up    5 D-down   6 D-left   7 D-right
+       8 Reset   9 unused  10 L       11 R
+      12 C-up   13 C-down  14 C-left  15 C-right
+
+   Bits 8 and 9 are the only two positions in that order that are not
+   buttons, and they are exactly where the filler zeros sit. On that
+   reading the default mapping, as 1-based HID button numbers, is:
+
+       A -> 1        B -> 4        Z -> 10       Start -> 9
+       D-up -> 11    D-down -> 12  D-left -> 13  D-right -> 14
+       L -> 7        R -> 8
+       C-up -> 6     C-down -> 2   C-left -> 5   C-right -> 3
+
+   This is a strong inference but it is still an inference. It closes the
+   first open question in hid-descriptor.txt only once confirmed against
+   the report builder under FUN_00015020.
+
+8.  Consequences For The Replacement Driver
+
+   -  The private channel is the real configuration contract. A
+      replacement that reproduces the HID descriptor but not these
+      IOCTLs will present correctly and be unconfigurable.
+
+   -  The 'q' filename trick depends on the minidriver seeing
+      IRP_MJ_DEVICE_CONTROL before hidclass. That is achieved by
+      overwriting the dispatch table after HidRegisterMinidriver
+      returns. It works, but it is undocumented behaviour that a modern
+      KMDF or UMDF2 driver should not reproduce; a separate control
+      device or a WDF device interface is the supported equivalent.
+
+   -  All buffers are METHOD_BUFFERED, so no pointer-width problem
+      arises from the transfer method itself. The payloads are a
+      different matter: fn 0x852 is a packed structure of six DWORDs
+      plus inline payload, and the slot control block is 0x38 bytes with
+      hard-coded offsets. Both need explicit fixed-width types in a
+      64-bit port rather than a recompiled struct.
+
+   -  The magic value 3E178AA3 7625F013 ED739374 at the head of the
+      control device extension is a type check, not a security boundary.
+      Nothing else authenticates a caller on this interface.
+
+   -  drv_ButtonMap is driver-wide, not per-device. With two adapters
+      plugged in, changing the map changes it for both. This is likely
+      a bug in the original and should not be reproduced.
+
+9.  Open Questions
+
+   -  The meaning of the four DWORD parameters per macro slot at +0x458,
+      +0x45c, +0x464 and +0x468. These are what the configurator's
+      compiler emits, so they are the closest thing to the compiled
+      script format.
+   -  What FUN_00013a60 does when a slot starts, and where the slot
+      payload is turned into HID reports. That is the other half of the
+      macro engine.
+   -  Whether the payload stream is a key or button list, given the
+      8-byte cap and the keyboard's 10-key array.
+   -  Why the slot header dword at +0x0C is stored at
+      devext + (slot + 0x14) * 0x38 rather than inside the slot's own
+      control block. This may be a second parallel array.
+   -  What the 64-byte exchange in control-device fn 0x802 and 0x803
+      carries.
+   -  Which side generates the device id used by fn 0x821 and 0x822.

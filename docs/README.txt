@@ -42,7 +42,8 @@ Table of Contents
 
 2.  Planned Documents
 
-   None of these exist yet. They are listed so findings land in a
+   Written so far: hid-descriptor.txt, ioctl-surface.txt and
+   script-bytecode.txt. The rest are listed so findings land in a
    predictable place rather than accumulating in one file.
 
    +-----------------------+---------------------------------------------+
@@ -59,8 +60,8 @@ Table of Contents
    | usb-protocol.txt      | Device endpoints, the N64 serial protocol,  |
    |                       | polling cadence, and pak handling.          |
    +-----------------------+---------------------------------------------+
-   | config-format.txt     | The configurator's saved profile and        |
-   |                       | button-scripting format.                    |
+   | script-bytecode.txt   | DONE. The flex/bison compiler and the       |
+   |                       | 32-bit opcode format it emits.              |
    +-----------------------+---------------------------------------------+
    | driver-structure.txt  | Driver object layout, dispatch table, and   |
    |                       | device extension.                           |
