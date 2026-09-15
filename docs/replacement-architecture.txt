@@ -497,7 +497,7 @@ Table of Contents
 
    -  The three defects in known-defects.txt, each of which is a
       deliberate decision rather than an automatic fix. The stick
-      acceleration in particular shaped how the original felt.
+      corner stretch in particular shaped how the original felt.
 
    What does NOT carry over: the USB vendor protocol, the accessory
    probe, the polling engine, the PnP and power paths, and the whole
@@ -516,7 +516,12 @@ Table of Contents
       bytecode preserves existing profiles; dropping it removes the need
       to reimplement the interpreter exactly.
 
-   -  Whether to reproduce the stick acceleration defect, make it an
+   -  RESOLVED, and it was never a defect. The stick cross-coupling is
+      the vendor's documented octagonal-to-square corner stretch; see
+      known-defects.txt section 3. A replacement should implement it and
+      expose both it and the range clipping as tunables.
+
+   -  Whether to expose the stick corner stretch as an option, make it an
       option, or fix it silently.
 
    -  Whether the Adaptoid-specific add-on is worth building at all, or

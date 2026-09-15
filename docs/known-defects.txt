@@ -7,10 +7,11 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Four defects have been found during reverse engineering: three
+   Three defects have been found during reverse engineering: two
    arithmetic ones in wishk201.sys, and a race in wishh201.dll. This note
    records each one, the exact condition that triggers it, what it would
-   actually do, and whether a user would be likely to notice.
+   actually do, and whether a user would be likely to notice. It also
+   records one claim that was made here and later RETRACTED, in section 3.
 
    The purpose is not to criticise a driver that shipped in 2001 and
    worked. It is to stop a clean-room replacement from faithfully
@@ -27,7 +28,7 @@ Table of Contents
 
    1.  Severity Summary
    2.  Defect 1: Button Map Filler Entries
-   3.  Defect 2: Cross-Coupled Stick Acceleration
+   3.  RETRACTED: Cross-Coupled Stick Acceleration Is Not A Defect
    4.  Defect 3: Swapped Sine Interpolation Weights
    5.  Defect 4: Race On The Launch-Detection Path Buffer
    6.  What Is Not Affected
@@ -38,7 +39,7 @@ Table of Contents
        ------------------------   -------------   -----------------
        button map filler entries  joystick report  yes, but needs a
                                                    rare button combo
-       stick acceleration         joystick report  YES
+       (stick cross-coupling)     joystick report  RETRACTED, see 3
        sine interpolation         effect engine    only if an effect
                                                    slot is running
        launch-detection race      wishh201.dll     only with Detect
@@ -77,49 +78,70 @@ Table of Contents
    button", or better, give the table a sentinel such as 0xFF for "not a
    button" and test for it.
 
-3.  Defect 2: Cross-Coupled Stick Acceleration
+3.  RETRACTED: Cross-Coupled Stick Acceleration Is Not A Defect
 
-   Location:  drv_BuildJoystickReport, the acceleration block
+   An earlier revision of this note recorded the cross-coupled stick term in
+   drv_BuildJoystickReport as an arithmetic defect. THAT WAS WRONG, and this
+   section records the correction rather than deleting the claim.
 
-   The acceleration term is applied as
+   The term is applied as
 
-       X += (|Y| * accel * X) / 256
-       Y += (|X| * accel * Y) / 256
+       X += (|Y| * k * X) / 256
+       Y += (|X| * k * Y) / 256
 
-   Each axis is boosted in proportion to the OTHER axis's magnitude. The
-   conventional form would use the axis's own magnitude, or the vector
-   length.
+   with k taken from devext+0x3F0, which drv_AddDevice initialises to 10. The
+   earlier reading was that a conventional acceleration curve would use each
+   axis's own magnitude, so cross-coupling looked like a transposition slip.
 
-   Consequence: when the stick is pushed straight left, right, up or
-   down, the other axis is zero, the product is zero, and NO acceleration
-   is applied at all. Acceleration only appears on diagonals, and is
-   strongest at 45 degrees.
+   It is not acceleration. The vendor SDK, shipped as sdk_1163b.zip and
+   documented in src/dxsample/dxescape.cpp, names these two parameters and
+   describes exactly this transform:
 
-   Active by default. drv_AddDevice sets the acceleration at
-   devext+0x3F0 to 10 at 000123e2, and the sensitivity at devext+0x3EC to
-   0x4B at 000123d8. Since 0x4B is the neutral sensitivity, the
-   sensitivity step is a no-op out of the box but the acceleration step
-   is not.
+       0x7834BB10   joystick clipping range   default 75   devext+0x3EC
+       0x7834BB11   joystick corner stretch   default 10   devext+0x3F0
 
-   Magnitude with the default accel of 10, working in raw units where the
-   stick reads about +/-80 in normal use and +/-127 at the stops:
+   and says of the second, verbatim:
 
-       rawX 40, rawY 0     base 640    boost 0       final 640
-       rawX 40, rawY 40    base 640    boost 62      final 702
-       rawX 80, rawY 80    base 1280   boost 250     final 1200 (clamped)
+       "Corner stretching is used by the Adaptoid driver to map the octagonal
+       range of the analog stick to the square range expected by PC games.
+       [...] The default value of 10 warps the maximum deflection of 65 out
+       to 75 in the corners, matching the default range clipping of 75 in the
+       horizontal and vertical directions. [...] Note that the warping is
+       smooth and linear across the full range."
 
-   So the error is a modest mid-range shaping difference, not a gross
-   one, and at full deflection the clamp hides it entirely.
+   The N64 stick's gate is octagonal. It reaches about 80 raw units on an
+   axis but only about 65 into a diagonal corner, so a diagonal can never
+   reach full scale. A term that is ZERO on-axis and MAXIMAL on the diagonal
+   is precisely the correction needed, and cross-coupling is the only way to
+   express it. Using each axis's own magnitude - the "fix" the earlier
+   revision proposed - would have boosted the axes that already reach full
+   scale and done nothing for the corners, which is the opposite of what is
+   wanted.
 
-   Would it be noticed? Probably not as a fault. It would feel like a
-   stick that is very slightly quicker on diagonals than on the axes.
-   Many users would read that as intentional, or not perceive it.
+   The arithmetic in the earlier revision proves the point once it is read
+   correctly. Reports are raw * 16, clipped at 1200, so 1200/16 = 75 is the
+   clipping range. At the diagonal maximum of 65 raw on each axis:
 
-   For a replacement: this one deserves a deliberate decision rather than
-   a silent fix. Any profile or muscle memory built on the original was
-   built on this curve. Reproducing it exactly, or making it an option,
-   is defensible; changing it silently will feel different to a
-   long-time user.
+       base  = 65 * 16                 = 1040
+       boost = (65 * 10 * 65) / 256    =  165
+       final = 1040 + 165             = 1205, clipped to 1200
+
+   1200 is full scale. The corner reaches it exactly, which is the documented
+   behaviour: 65 warped out to 75. The earlier note recorded the same number
+   and described the clip as "hiding the error", when reaching full diagonal
+   deflection was the entire purpose.
+
+   For a replacement: implement this deliberately, and expose both
+   parameters. Setting corner stretch to 0 disables the warp and setting
+   range clipping to 128 restores the controller's raw range, both documented
+   by the SDK. Neither is a bug to be fixed.
+
+   LESSON, recorded because it generalises: the cross-coupling looked wrong
+   against an assumed intent (acceleration) that the code never claimed. The
+   driver alone did not name the parameters. It was only the vendor's own
+   documentation that supplied the intent, and with the right intent the code
+   is correct. Where a routine's PURPOSE is inferred rather than read, a
+   "defect" in it is only as sound as that inference.
 
 4.  Defect 3: Swapped Sine Interpolation Weights
 

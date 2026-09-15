@@ -115,22 +115,28 @@ Table of Contents
 
 4.  Field Tags
 
-   +------+-------+---------+--------------------------------------+
-   | Tag  | Field | Reader  | Meaning                              |
-   +======+=======+=========+======================================+
-   | 0x3D | 0     | string  | script name, the table key           |
-   | 0x3E | 1, 2  | fixed   | last-write FILETIME, low then high   |
-   | 0x46 | 3     | string  | not yet identified                   |
-   | 0x47 | 4     | string  | directory component                  |
-   | 0x48 | 5     | string  | file component                       |
-   | 0x49 | 6     | string  | not yet identified                   |
-   | 0x4A | 7     | fixed   | not yet identified                   |
-   | 0x4B | 8     | strlist | not yet identified                   |
-   | 0x4C | 9     | strlist | not yet identified                   |
-   | 0x50 | 10    | string  | not yet identified                   |
-   | 0x5B | 11    | fixed   | slot or index, tracked as a maximum  |
-   | 0x5C | 12    | fixed   | not yet identified                   |
-   +------+-------+---------+--------------------------------------+
+   SETTLED. All thirteen fields are identified. The mapping was closed from
+   two directions that agree: cfg_DbWriteScriptNode (00407b60) passes the
+   record base straight to cfg_ScriptReadHeaderTags, so fields 3 to 10 ARE
+   the parsed // tag = value header block; and a live script.db from an
+   installed copy confirms the payloads.
+
+   +------+-------+---------+------------------------------------------+
+   | Tag  | Field | Reader  | Meaning                                  |
+   +======+=======+=========+==========================================+
+   | 0x3D | 0     | string  | script .ac file name, the table key      |
+   | 0x3E | 1, 2  | fixed   | last-write FILETIME, low then high       |
+   | 0x46 | 3     | string  | game_name                                |
+   | 0x47 | 4     | string  | game_dir                                 |
+   | 0x48 | 5     | string  | game_exe                                 |
+   | 0x49 | 6     | string  | game_prod                                |
+   | 0x4A | 7     | fixed   | game_size, decimal text via crt_atoi     |
+   | 0x4B | 8     | strlist | game_regexe, repeatable                  |
+   | 0x4C | 9     | strlist | game_regdir, repeatable                  |
+   | 0x50 | 10    | string  | driver_version                           |
+   | 0x5B | 11    | fixed   | last-launched sequence number, active.db |
+   | 0x5C | 12    | fixed   | port assignment bitmask, active.db       |
+   +------+-------+---------+------------------------------------------+
 
    The three readers behave differently and a parser must match them:
 
@@ -140,17 +146,50 @@ Table of Contents
                 and PREPEND it, so repeated tags build a list in reverse
                 order of appearance
 
-   Fields 4 and 5 are a directory and a file name that cfg_CheckInstall
-   joins and probes with FindFirstFileA, so a record can point at a file
-   outside the scripts directory. INFERENCE: this supports scripts
-   installed alongside a game rather than in the shared directory. Not
-   established.
+   THE TWO DATABASES USE DIFFERENT SUBSETS. script.db is a cache of the
+   script header blocks: fields 0, 1, 2 and 3 to 10. active.db records
+   assignments: cfg_SaveActiveDb writes fields 0, 5, 11 and 12 only.
 
-   Field 11 is read into a slot the scanner compares against a running
-   maximum, which reads as an index or an assignment number.
+   Field 11 is the value cfg_LaunchGame stamps from an incrementing counter,
+   so it orders scripts by when their game was last launched;
+   cfg_ScanScriptDir tracks the maximum on load to resume the sequence. Field
+   12 is a bitmask with bit N set when the script is assigned to controller
+   port N, maintained by cfg_AssignScriptToPort.
 
-   Tag numbering is sparse and out of order, which suggests tags were
-   assigned as fields were added over time rather than renumbered.
+   A record written by cfg_DbWriteRecord OMITS any field that is null or
+   zero, so most records are short. Both control tags are written with a
+   length of zero: 0x33 ends a record, 0x32 ends the file.
+
+4.1.  A Real Example
+
+   From an installed copy, active.db is 26 bytes in full:
+
+       3d 0e  "@--TRON 2.0.ac"      field 0, script name
+       5c 04  01 00 00 00           field 12, port mask = port 0
+       33 00                        end of record
+       32 00                        end of file
+
+   and a typical script.db record is
+
+       3d 09  "@--PSX.ac"           field 0, script name
+       3e 08  5e 55 26 e7 8d 04 c9 01   fields 1,2, FILETIME
+       50 05  "2.0.0"               field 10, driver_version
+       33 00                        end of record
+
+   Every record in that file carries exactly those three tags, because all 24
+   scripts in the install are common "@--" scripts with no game bound. The
+   0x50 payloads are "2.0.0" except for Sample Absolute Mouse.ac, which is
+   "1.3.175" - matching the driver_version line in the .ac file itself.
+
+   NOTE a quirk visible in that file: script.db BEGINS with a 32 00 pair, an
+   end-of-file marker, before its first record. cfg_DbCreateNew writes it
+   into a freshly created database, and the rebuild path appends records
+   after it rather than overwriting it. A reader that stops at the first
+   0x32, as cfg_DbReadRecord does, therefore sees an EMPTY database on the
+   first read of that file. INFERENCE: this is why the configurator tolerates
+   a full rebuild so readily - the cached index is cheap to discard. Not
+   established; the rebuild path was not traced far enough to confirm the
+   leading marker is always present.
 
 5.  Scanning And Rebuilding
 
@@ -192,7 +231,7 @@ Table of Contents
       since a replacement that regenerates its own index has no reason to
       keep a 255-byte field limit.
 
-   -  Seven of the thirteen fields are not yet identified. They can be
-      settled by dumping a real script.db and matching field contents
-      against a known set of scripts, which is faster than reading more
-      code.
+   -  RESOLVED. All thirteen fields are identified; see section 4. The
+      method was the one suggested here - dump a real script.db and match
+      it against the .ac files - combined with reading
+      cfg_DbWriteScriptNode, and the two agree.

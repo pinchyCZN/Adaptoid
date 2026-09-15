@@ -27,6 +27,7 @@ Table of Contents
    1.  How User Mode Reaches The Driver
    2.  IOCTL Encoding
    3.  Control-Device Commands
+   3.1.  The SDK Simple Interface
    4.  Per-Device Commands
    4.1.  Confirmed User-Mode Usage
    5.  The Macro Slot Engine
@@ -187,6 +188,35 @@ Table of Contents
 
    INFERENCE: 0x802 and 0x803 set a 64-byte transfer length but no copy
    is visible in the decompilation of this function. Not established.
+
+3.1.  The SDK Simple Interface
+
+   fn 0x801, 0x802 and 0x803 are not private after all. They are the
+   interface the vendor published in the Adaptoid SDK, which describes them
+   in terms of ReadFile and WriteFile on the control device rather than
+   DeviceIoControl:
+
+       read 1 byte     the number of Adaptoids currently connected
+       write 64 bytes  a command block for up to 4 controllers
+       read 64 bytes   the replies
+
+   The SDK is explicit that the sizes are exact and that other lengths fail,
+   which is why the driver's length checks are rigid. fn 0x801 returning the
+   byte at 00019d94 is the device count.
+
+   The 64-byte block is the N64 joybus format, the same shape the console's
+   PIF RAM uses. From the SDK's sample.c, per controller:
+
+       byte 0     number of command bytes to send
+       byte 1     number of reply bytes expected
+       byte 2..   the command bytes
+       then       reply space, prefilled with 0xFF
+
+   repeated for each controller, terminated by a 0xFE byte, with byte 63 set
+   to 1 to request processing. The two commands the sample uses are 0x01,
+   read the joystick, 4 bytes back; and 0x00, query the accessory port and
+   enable pak I/O, 3 bytes back. Those are the same N64 commands documented
+   in usb-transport.txt section 4.
 
 4.  Per-Device Commands
 
@@ -555,22 +585,43 @@ Table of Contents
 
        1. negate Y, converting N64 up-positive to HID down-positive
        2. X = rawX * 16,  Y = rawY * 16
-       3. if devext+0x3F0 != 0, the acceleration set by IOCTL fn 0x83f:
-              X += (|Y| * accel * X) / 256
-              Y += (|X| * accel * Y) / 256
-       4. if devext+0x3EC is neither 0 nor 0x4B, the sensitivity set by
+       3. if devext+0x3F0 != 0, CORNER STRETCH, IOCTL fn 0x83f:
+              X += (|Y| * stretch * X) / 256
+              Y += (|X| * stretch * Y) / 256
+       4. if devext+0x3EC is neither 0 nor 0x4B, RANGE CLIPPING,
           IOCTL fn 0x83e:
-              value = value * 0x4B / sens
+              value = value * 0x4B / clip
        5. clamp both axes to +/-0x4B0
 
-   So 75 is the neutral sensitivity and larger values reduce travel. There is
-   no dead zone anywhere in the path.
+   THE NAMES COME FROM THE VENDOR, not from this analysis. The Adaptoid SDK
+   (sdk_1163b.zip, src/dxsample/dxescape.cpp) exposes the same two parameters
+   as DirectInput driver escapes and documents both:
 
-   Note the cross coupling in step 3: each axis is boosted by the OTHER
-   axis's magnitude, so pure horizontal or pure vertical motion receives no
-   acceleration at all. INFERENCE: the operands look swapped, that is, a bug.
-   A replacement should decide deliberately whether to reproduce it, since
-   scripts and profiles tuned on the original will have been tuned around it.
+       0x7834BB10   joystick clipping range   default 75   devext+0x3EC
+       0x7834BB11   joystick corner stretch   default 10   devext+0x3F0
+
+   RANGE CLIPPING exists because the stick reports -128..+127 but physically
+   reaches only about +/-80. 0x4B is 75, and raw * 16 clipped at 1200 means
+   raw 75 is full scale, so the default makes 75 raw units full deflection
+   and anything beyond it clips. Step 4 is a no-op at the default because the
+   expression is value * 75 / 75. The SDK notes that setting it to 128
+   restores the controller's untransformed range, at which point full
+   deflection reaches only about 65 per cent of the logical range; the
+   formula agrees, giving 80 * 16 * 75 / 128 = 750 out of 1200, or 62 per
+   cent.
+
+   CORNER STRETCH maps the stick's octagonal gate onto the square range PC
+   games expect. The gate reaches about 80 on an axis but only about 65 into
+   a diagonal, so without it a full diagonal is unreachable. The cross-
+   coupled form is deliberate and necessary: it is zero when either axis is
+   zero, and maximal on the diagonal. At the diagonal limit, 65 * 16 = 1040
+   plus (65 * 10 * 65) / 256 = 165 gives 1205, which clips to full scale.
+
+   An earlier revision of this note called step 3 a probable bug with swapped
+   operands. That was wrong; see known-defects.txt section 3 for the
+   retraction and the reasoning.
+
+   There is no dead zone anywhere in the path.
 
    When a script owns the stick, indicated by devext+0x1640 >= 0, the values
    written by the native builtins at devext+0x1708, +0x170C and +0x1710 are
@@ -618,7 +669,6 @@ Table of Contents
    -  Why the slot header dword at +0x0C is stored at
       devext + (slot + 0x14) * 0x38 rather than inside the slot's own
       control block. This may be a second parallel array.
-   -  What the 64-byte exchange in control-device fn 0x802 and 0x803
-      carries. No path in wishd201.exe uses either code, so the
-      configurator does not settle it either.
+   -  RESOLVED. The 64-byte exchange behind control-device fn 0x802 and
+      0x803 is the SDK's documented "simple interface"; see section 3.1.
    -  Which side generates the device id used by fn 0x821 and 0x822.

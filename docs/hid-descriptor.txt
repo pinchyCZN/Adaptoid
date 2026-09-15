@@ -245,7 +245,7 @@ Table of Contents
    The stick is reported as a 12-bit signed value in the range -1200 to
    +1200. The raw N64 stick is 8-bit signed and drv_BuildJoystickReport
    scales it: Y is negated to convert N64 up-positive into HID down-positive,
-   both axes are multiplied by 16, optional acceleration and sensitivity are
+   both axes are multiplied by 16, optional corner stretch and range clipping
    applied, and the result is clamped to +/-1200. There is no dead zone. The
    scaling is detailed in ioctl-surface.txt section 7.1.
 

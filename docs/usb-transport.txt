@@ -276,6 +276,24 @@ Table of Contents
       until the accessory state is known avoids a burst of garbage input
       at plug-in time.
 
+6.1.  The DirectInput Escape API Is In Another Binary
+
+   The Adaptoid SDK documents nine DirectInput driver escapes, numbered
+   0x7834BB00 through 0x7834BB28, covering device identification, the port
+   name string, rumble control, Controller Pak init/read/write, the two stick
+   parameters, and a synchronous raw controller command.
+
+   NONE OF THOSE CONSTANTS APPEARS IN wishk201.sys. A byte search for
+   0x7834BB00 across the whole image returns nothing, so the escape surface
+   belongs to the separate force-feedback or "rumble" driver that the product
+   readme describes and that is not part of this project.
+
+   The two binaries do share state, though: the stick parameters the escapes
+   0x7834BB10 and 0x7834BB11 set are the same devext+0x3EC and devext+0x3F0
+   that wishk201.sys initialises to 75 and 10 and exposes through private
+   IOCTL fn 0x83e and fn 0x83f. So the same tunables are reachable two ways,
+   by two drivers, with the same defaults.
+
 7.  Open Questions
 
    - The meaning of the wValue and wIndex pairs in probe steps 1 to 5, and of

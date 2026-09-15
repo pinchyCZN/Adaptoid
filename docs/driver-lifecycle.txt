@@ -65,8 +65,9 @@ Table of Contents
 
    It sets the tunables the joystick path reads:
 
-       devext+0x3EC  sensitivity    0x4B, the neutral value
-       devext+0x3F0  acceleration   10, which is why the acceleration
+       devext+0x3EC  range clip     0x4B = 75, the neutral value
+       devext+0x3F0  corner stretch 10, which maps the stick's
+                                    octagonal gate onto a square range
                                     path is live out of the box; see
                                     known-defects.txt section 3
 
