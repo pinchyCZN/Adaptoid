@@ -1,0 +1,376 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishk201.sys                                                 2001 driver
+
+
+                      HID REPORT DESCRIPTORS
+
+
+Abstract
+
+   The Adaptoid presents itself to Windows as a composite HID device:
+   one physical USB device reporting a mouse, a keyboard, and a joystick
+   as three separate top-level application collections. This is the
+   property that lets the adapter drive any application, because the OS
+   delivers genuine HID keyboard and mouse input rather than synthesized
+   events injected from user mode.
+
+   This note records where the report descriptors live in wishk201.sys,
+   how one of three variants is selected at device-add time, the exact
+   item stream of each, the resulting report byte layouts, and the HID
+   minidriver IOCTL surface that serves them.
+
+   Everything here is read out of the Ghidra database for wishk201.sys.
+   Statements not directly supported by an instruction or a byte are
+   marked INFERENCE.
+
+Table of Contents
+
+   1.  Driver Role
+   2.  Descriptor Storage
+   3.  Descriptor Selection
+   4.  Descriptor A: Mouse + Keyboard + Joystick
+   5.  Report Layouts
+   6.  Device Identity
+   7.  Minidriver IOCTL Surface
+   8.  Consequences For The Replacement Driver
+   9.  Open Questions
+
+1.  Driver Role
+
+   wishk201.sys is a HID minidriver. It imports HidRegisterMinidriver
+   from hidclass.sys and calls it from drv_DriverEntry at 000115f0. The
+   minidriver owns the USB transport and supplies the report descriptor;
+   hidclass.sys owns the HID plumbing and presents the collections to
+   the rest of the system.
+
+   That division is why the remapping is invisible to applications. The
+   descriptor below is what every application sees. Nothing above the
+   driver is aware that the bytes originated on an N64 controller.
+
+   drv_DriverEntry installs its dispatch table, calls
+   HidRegisterMinidriver (which replaces that table with the hidclass
+   entry points), saves the replaced pointers to 00019d98..00019db4,
+   and then installs its own wrappers over them. INFERENCE: this is a
+   deliberate interception of the hidclass dispatch path; the purpose
+   of the wrappers is not yet established.
+
+2.  Descriptor Storage
+
+   Three complete report descriptors are stored as static byte arrays at
+   the start of the .data section, followed by an eight-entry selection
+   table.
+
+   +-------------------------------+----------+--------+-----------------------------+
+   | Symbol                        | Address  | Length | Collections                 |
+   +===============================+==========+========+=============================+
+   | drv_HidReportDesc_MouseKbdJoy | 00019b40 |    185 | Mouse + Keyboard + Joystick |
+   | drv_HidReportDesc_JoyOnly     | 00019c00 |     64 | Joystick                    |
+   | drv_HidReportDesc_MouseKbd    | 00019c40 |    121 | Mouse + Keyboard            |
+   | drv_HidReportDescTable        | 00019cc0 |     64 | 8 entries of {ptr, length}  |
+   +-------------------------------+----------+--------+-----------------------------+
+
+   The table entry is 8 bytes: a 4-byte pointer at +0 and a 4-byte
+   length at +4. Contents as stored:
+
+       index  pointer   length   descriptor
+         0    00019c00      64   Joystick only
+         1    00019c00      64   Joystick only
+         2    00019c00      64   Joystick only
+         3    00019c00      64   Joystick only
+         4    00019c00      64   Joystick only
+         5    00019c00      64   Joystick only
+         6    00019c40     121   Mouse + Keyboard
+         7    00019b40     185   Mouse + Keyboard + Joystick
+
+   Note that no instruction anywhere in the image contains the literal
+   address of any descriptor. They are reached only through this table,
+   which is why a naive cross-reference search finds nothing. The two
+   cross-references Ghidra reports against 00019b40 are PE section-table
+   fields at 000100f0 and 000101ec, not code.
+
+3.  Descriptor Selection
+
+   The table index is (g_dwVirtualDevicesMask & 7), where
+   g_dwVirtualDevicesMask is the global at 00019d68.
+
+   drv_DriverEntry initialises it to 7 at 00011604. drv_AddDevice then
+   overwrites it at 00012553 by calling drv_RegQueryDword with the value
+   name L"VirtualDevices". drv_RegQueryDword (00011c3c) performs a
+   RtlQueryRegistryValues REG_DWORD read against:
+
+       \REGISTRY\Machine\Software\Wish Technologies\Adaptoid
+
+   So the HID personality of the device is a single registry DWORD, read
+   once per device arrival. Changing it requires a replug or a restart of
+   the device stack; it is not renegotiated at runtime.
+
+   Only indices 6 and 7 select distinct descriptors. Indices 0 through 5
+   all resolve to the joystick-only descriptor.
+
+   INFERENCE: the three-bit mask looks like it was meant to be a set of
+   per-collection enables, but as built only two of the eight slots are
+   distinct, so the low bits carry no independent meaning in this
+   binary.
+
+4.  Descriptor A: Mouse + Keyboard + Joystick
+
+   The 185-byte descriptor at 00019b40, decoded. This is the default and
+   the one that gives the adapter its unusual reach.
+
+4.1.  Mouse Collection, Report ID 3
+
+       05 01        Usage Page (Generic Desktop)
+       09 02        Usage (Mouse)
+       A1 01        Collection (Application)
+       09 01          Usage (Pointer)
+       A1 00          Collection (Physical)
+       85 03            Report ID (3)
+       05 09            Usage Page (Button)
+       19 01            Usage Minimum (Button 1)
+       29 03            Usage Maximum (Button 3)
+       15 00            Logical Minimum (0)
+       25 01            Logical Maximum (1)
+       75 01            Report Size (1)
+       95 03            Report Count (3)
+       81 02            Input (Data,Var,Abs)
+       75 05            Report Size (5)
+       95 01            Report Count (1)
+       81 01            Input (Const)
+       05 01            Usage Page (Generic Desktop)
+       09 30            Usage (X)
+       09 31            Usage (Y)
+       09 38            Usage (Wheel)
+       15 81            Logical Minimum (-127)
+       25 7F            Logical Maximum (127)
+       75 08            Report Size (8)
+       95 03            Report Count (3)
+       81 06            Input (Data,Var,Rel)
+       C0             End Collection
+       C0           End Collection
+
+   Three buttons, relative X, Y and Wheel. A standard mouse.
+
+4.2.  Keyboard Collection, Report ID 2
+
+       05 01        Usage Page (Generic Desktop)
+       09 06        Usage (Keyboard)
+       A1 01        Collection (Application)
+       85 02          Report ID (2)
+       05 07          Usage Page (Keyboard/Keypad)
+       19 E0          Usage Minimum (LeftControl)
+       29 E7          Usage Maximum (RightGUI)
+       15 00          Logical Minimum (0)
+       25 01          Logical Maximum (1)
+       75 01          Report Size (1)
+       95 08          Report Count (8)
+       81 02          Input (Data,Var,Abs)      modifier bits
+       95 01          Report Count (1)
+       75 08          Report Size (8)
+       81 01          Input (Const)             reserved byte
+       95 05          Report Count (5)
+       75 01          Report Size (1)
+       05 08          Usage Page (LED)
+       19 01          Usage Minimum (Num Lock)
+       29 05          Usage Maximum (Kana)
+       91 02          Output (Data,Var,Abs)     5 LED bits
+       95 01          Report Count (1)
+       75 03          Report Size (3)
+       91 01          Output (Const)            3 pad bits
+       95 0A          Report Count (10)
+       75 08          Report Size (8)
+       05 07          Usage Page (Keyboard/Keypad)
+       19 00          Usage Minimum (0)
+       2A A5 00       Usage Maximum (0xA5)
+       15 00          Logical Minimum (0)
+       26 A5 00       Logical Maximum (165)
+       81 00          Input (Data,Array)        10 key slots
+       C0           End Collection
+
+   Note the Report Count of 10 for the key array. A USB boot keyboard
+   uses 6. This device advertises 10-key rollover, so a script can hold
+   ten simultaneous keys.
+
+   The LED output report is genuine: the descriptor accepts host LED
+   state for Num, Caps, Scroll, Compose and Kana. See section 7 for what
+   the driver actually does with it.
+
+4.3.  Joystick Collection, Report ID 1
+
+       05 01        Usage Page (Generic Desktop)
+       09 04        Usage (Joystick)
+       A1 01        Collection (Application)
+       09 01          Usage (Pointer)
+       A1 00          Collection (Physical)
+       85 01            Report ID (1)
+       05 01            Usage Page (Generic Desktop)
+       09 30            Usage (X)
+       09 31            Usage (Y)
+       16 50 FB         Logical Minimum (-1200)
+       26 B0 04         Logical Maximum (1200)
+       36 00 00         Physical Minimum (0)
+       46 60 09         Physical Maximum (2400)
+       75 0C            Report Size (12)
+       95 02            Report Count (2)
+       81 02            Input (Data,Var,Abs)
+       C0             End Collection
+       05 09          Usage Page (Button)
+       19 01          Usage Minimum (Button 1)
+       29 0E          Usage Maximum (Button 14)
+       15 00          Logical Minimum (0)
+       25 01          Logical Maximum (1)
+       35 00          Physical Minimum (0)
+       45 01          Physical Maximum (1)
+       75 01          Report Size (1)
+       95 0E          Report Count (14)
+       81 02          Input (Data,Var,Abs)
+       95 02          Report Count (2)
+       75 01          Report Size (1)
+       81 01          Input (Const)
+       C0           End Collection
+
+   Fourteen buttons is exactly the N64 button count: A, B, Z, Start, L,
+   R, four C buttons and four D-pad directions. INFERENCE: the mapping
+   of N64 button to HID button number is not established here; it must
+   be read out of the input report builder.
+
+   The stick is reported as a 12-bit signed value in the range -1200 to
+   +1200. The raw N64 stick is 8-bit signed, so the driver scales it.
+   INFERENCE: the scale factor and any dead zone are not established
+   here.
+
+   Descriptor C at 00019c00 is byte-for-byte this joystick collection on
+   its own. Descriptor B at 00019c40 is the mouse and keyboard
+   collections without it.
+
+5.  Report Layouts
+
+   Every report carries a leading report ID byte, because the descriptor
+   declares Report ID items.
+
+   Input report 1, joystick, 6 bytes total:
+
+       byte 0    report ID = 1
+       byte 1    X bits 0..7
+       byte 2    X bits 8..11 in the low nibble, Y bits 0..3 in the high
+       byte 3    Y bits 4..11
+       byte 4    buttons 1..8
+       byte 5    buttons 9..14 in bits 0..5, bits 6..7 padding
+
+   Input report 2, keyboard, 13 bytes total:
+
+       byte 0      report ID = 2
+       byte 1      modifier bits, LeftControl..RightGUI
+       byte 2      reserved, constant
+       byte 3..12  ten key usage slots, 0 = empty
+
+   Output report 2, keyboard LEDs, 2 bytes total:
+
+       byte 0    report ID = 2
+       byte 1    bits 0..4 Num/Caps/Scroll/Compose/Kana, bits 5..7 pad
+
+   Input report 3, mouse, 5 bytes total:
+
+       byte 0    report ID = 3
+       byte 1    bits 0..2 buttons 1..3, bits 3..7 padding
+       byte 2    X, signed, -127..127, relative
+       byte 3    Y, signed, -127..127, relative
+       byte 4    Wheel, signed, -127..127, relative
+
+   INFERENCE: the 12-bit packing in report 1 follows the HID rule that
+   fields are packed with no padding between them. It has not been
+   confirmed against the report builder in the driver.
+
+6.  Device Identity
+
+   From IOCTL_HID_GET_DEVICE_ATTRIBUTES:
+
+       VendorID       0x06F7    Wish Technologies
+       ProductID      0x0001
+       VersionNumber  0x0100
+
+   From IOCTL_HID_GET_STRING:
+
+       manufacturer (index 0x0E)   L"Wish Technologies, Inc."
+       product      (index 0x0F)   L"Adaptoid"
+       serial       (index 0x10)   empty, Information = 0
+
+   The HID descriptor returned by IOCTL_HID_GET_DEVICE_DESCRIPTOR
+   declares bcdHID = 0x0001. That is an odd value; the conventional
+   encoding for HID 1.0 is 0x0100. It is recorded here as observed.
+
+7.  Minidriver IOCTL Surface
+
+   drv_DispatchInternalDeviceControl at 000128d2 is installed into
+   DriverObject->MajorFunction[0x0F]. hidclass.sys calls it; user mode
+   never does. Codes are
+   CTL_CODE(FILE_DEVICE_KEYBOARD, fn, METHOD_NEITHER, FILE_ANY_ACCESS),
+   so code = 0x000b0000 | (fn << 2) | 3.
+
+   +---------+----+-----------------------+---------------------------------+
+   | Code    | fn | Name                  | Behaviour                       |
+   +=========+====+=======================+=================================+
+   | 0xb0003 |  0 | GET_DEVICE_DESCRIPTOR | builds 9-byte HID_DESCRIPTOR    |
+   | 0xb0007 |  1 | GET_REPORT_DESCRIPTOR | copies the selected descriptor  |
+   | 0xb000b |  2 | READ_REPORT           | FUN_00015020 under a guard      |
+   | 0xb000f |  3 | WRITE_REPORT          | accepted and discarded          |
+   | 0xb0013 |  4 | GET_STRING            | manufacturer/product/serial     |
+   | 0xb001f |  7 | ACTIVATE_DEVICE       | devext[0x328 + i] = 1, i < 3    |
+   | 0xb0023 |  8 | DEACTIVATE_DEVICE     | devext[0x328 + i] = 0, i < 3    |
+   | 0xb0027 |  9 | GET_DEVICE_ATTRIBUTES | VID/PID/version, 0x20 bytes     |
+   | other   |  - | unsupported           | STATUS_NOT_SUPPORTED            |
+   +---------+----+-----------------------+---------------------------------+
+
+   A guard runs before the switch: FUN_00015f00(devext) returning zero
+   completes the IRP with STATUS_DEVICE_NOT_CONNECTED (0xC0000056).
+
+   WRITE_REPORT returning success without doing anything is worth
+   noting. The keyboard LED output report is therefore accepted and
+   dropped rather than acted on, which matches the hardware: there are
+   no LEDs on an N64 controller.
+
+   The three activate/deactivate slots at devext+0x328 correspond to the
+   three top-level collections. INFERENCE: the index order has not been
+   confirmed against the descriptor.
+
+8.  Consequences For The Replacement Driver
+
+   The descriptor in section 4 is the contract. A replacement that
+   reproduces it byte-for-byte will be indistinguishable to every
+   application, which is the stated goal of this project.
+
+   Points that carry over unchanged:
+
+   -  The three collections and their report IDs. Report IDs 1, 2 and 3
+      are baked into anything already configured.
+   -  VID 0x06F7 / PID 0x0001, if existing configuration tooling is to
+      keep working.
+   -  The 10-slot key array, not the usual 6.
+
+   Points that do not carry over:
+
+   -  The registry path is under Software\Wish Technologies\Adaptoid
+      with no WOW64 redirection considered. On 64-bit Windows a
+      kernel-mode RtlQueryRegistryValues against \REGISTRY\Machine\
+      Software resolves to the 64-bit view, so a 32-bit configurator
+      writing the same path lands in Wow6432Node and the driver will not
+      see it. This must be handled explicitly in any port.
+   -  The descriptor selection table stores raw 32-bit pointers. On x64
+      these become 64-bit, so the 8-byte entry stride changes.
+   -  Selecting the personality by a registry DWORD read once at
+      AddDevice is workable but coarse. It is recorded here as the
+      original behaviour, not as a recommendation.
+
+9.  Open Questions
+
+   -  Which N64 button maps to which HID button number, and where the
+      input report is assembled. Report 1 is built somewhere under the
+      READ_REPORT path at FUN_00015020.
+   -  The stick scaling from 8-bit raw to the -1200..+1200 range, and
+      any dead zone or response curve. A monotonic run of 16-bit values
+      rising to 0x3E8 sits just past the descriptor table near 00019d10;
+      INFERENCE, not confirmed, that this is a response curve.
+   -  What the dispatch wrappers installed after HidRegisterMinidriver
+      actually do, and why the hidclass handlers are saved and chained.
+   -  Whether the remapping bytecode from the configurator arrives via
+      IRP_MJ_DEVICE_CONTROL on drv_DispatchDeviceControl at 00013780.
+      That is the natural next target.
