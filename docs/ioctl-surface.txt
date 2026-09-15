@@ -28,6 +28,7 @@ Table of Contents
    2.  IOCTL Encoding
    3.  Control-Device Commands
    4.  Per-Device Commands
+   4.1.  Confirmed User-Mode Usage
    5.  The Macro Slot Engine
    6.  Controller Pak Access
    7.  The Button Map
@@ -234,6 +235,59 @@ Table of Contents
    thread on an error it stashes the thread context at devext+0x1684 and a
    full copy of the variable array at devext+0x1688; this command hands both
    to user mode and frees them. See script-bytecode.txt section 6.4.
+
+4.1.  Confirmed User-Mode Usage
+
+   The table above is what the driver ACCEPTS. This subsection records what
+   wishd201.exe actually SENDS, which pins down several buffer layouts that
+   the driver side alone leaves ambiguous. Every item is read out of the
+   Ghidra database for wishd201.exe.
+
+   fn 0x832, raw controller transaction. The configurator uses this to reach
+   vendor requests the driver never issues itself, by building the 8-byte
+   setup packet in the input buffer. Two are known, both from
+   cfg_DumpDeviceDiagnostics; see usb-transport.txt section 3.
+
+       C0 70 00 00 00 00   in 6, out 6    firmware CRC
+       C0 73 00 00 00 00   in 6, out 1    timing code
+
+   fn 0x835, string at devext+0x334. The configurator requests 100 bytes and
+   prints the result as "Device is in port %s", so that field holds the
+   PHYSICAL USB PORT PATH, in the form the configurator itself builds when it
+   walks the bus - a letter for the host controller followed by a digit per
+   hub port, for example A1-2. See configurator-architecture.txt section 5.
+
+   fn 0x836, counter read. The configurator issues this four times in
+   succession on the diagnostics page and labels the replies, which fixes the
+   selector order:
+
+       selector 1   bcdDevice, printed as "Firmware revision %d.%d%d"
+       selector 2   "Device has transmitted %d status packets"
+       selector 3   "Device has been reset %d times"
+       selector 4   "Initialization result %d"
+
+   fn 0x83d, post-mortem dump. cfg_DumpScriptCrash requests 0xFC8 bytes and
+   formats the result, which gives the layout:
+
+       +0x08   dword   thread id, printed as pid
+       +0x0C   dword   instruction pointer
+       +0x10   dword   accumulator, printed in decimal and hex
+       +0x14   dword   stack depth, in words
+       +0x24   dword[] stack contents, stack-depth entries
+       ...     dword[] the variable array, to the end of the reply
+
+   The reply length is what bounds the variable array; the dump carries no
+   count for it. 0xFC8 is 4040 bytes, or 1010 dwords.
+
+   fn 0x818, event fetch. The 12-byte reply is three dwords: type, arg1,
+   arg2. The consumer is cfg_DriverEventThread. Only event types the driver
+   does not turn into HID reports ever arrive here; the full list and an
+   important caveat about dead code on the user-mode side are in
+   configurator-architecture.txt section 6.
+
+   fn 0x811, version. cfg_ReadFirmwareVersion opens the control device and
+   requests 4 bytes, formatting them as "%d.%02d.%d". A failure prints
+   "-.--.-", which is how the UI shows "driver not loaded".
 
 5.  The Effect Slot Engine
 
@@ -565,5 +619,6 @@ Table of Contents
       devext + (slot + 0x14) * 0x38 rather than inside the slot's own
       control block. This may be a second parallel array.
    -  What the 64-byte exchange in control-device fn 0x802 and 0x803
-      carries.
+      carries. No path in wishd201.exe uses either code, so the
+      configurator does not settle it either.
    -  Which side generates the device id used by fn 0x821 and 0x822.

@@ -310,6 +310,15 @@ Table of Contents
    -  The eleven entries marked [I] above, where the name is an inference
       from call sites rather than a full reading of the body.
 
-   -  The whole of wishd201.exe beyond the compiler: 610 functions, of
-      which only the flex/bison front end, the code generator and the
-      download path have been named.
+   -  RESOLVED. wishd201.exe is now fully named: 619 functions, zero left as
+      FUN_. 269 carry a cfg_ prefix and are the application; the remainder
+      are the statically linked MSVC 6 runtime, prefixed crt_, plus import
+      thunks. Nine functions were created by hand from regions Ghidra had
+      left as orphaned instructions - the two window procedures, two dialog
+      procedures, two worker threads and three atexit callbacks. The
+      architecture is written up in configurator-architecture.txt.
+
+   -  wishh201.dll, a THIRD binary. wishd201.exe loads it by name and
+      resolves five exports from it for game-launch detection. It is not
+      present in decomp/, so its mechanism is inferred rather than read. See
+      configurator-architecture.txt section 8.

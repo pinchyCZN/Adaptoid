@@ -1,0 +1,427 @@
+Adaptoid Reverse Engineering                                 Analysis Note
+wishd201.exe                                                 2001 config tool
+
+
+                  CONFIGURATOR ARCHITECTURE
+
+
+Abstract
+
+   How wishd201.exe is built, and what it does besides compiling scripts. The
+   compiler front end is covered in script-bytecode.txt and the surface
+   language in script-language.txt; this note covers everything else: the
+   editing model, device discovery, driver installation, and the user-mode
+   half of the driver's event queue.
+
+   The central finding is that the configurator has NO separate configuration
+   model. The .ac script file IS the model. Every control in the user
+   interface is rendered by generating canonical script text, and read back
+   by re-parsing that same text against the same templates. See section 1.
+
+   Everything here is read out of the Ghidra database for wishd201.exe.
+   Statements not directly supported by an instruction or a byte are marked
+   INFERENCE.
+
+Table of Contents
+
+   1.  The GUI Is A View Over Script Text
+   2.  The Template Language
+   3.  The Script Editing Engine
+   4.  Script File Names And Header Tags
+   5.  Device Discovery
+   6.  The User-Mode Event Loop
+   7.  Driver Installation
+   8.  Game Launch Detection And wishh201.dll
+   9.  Process And Thread Structure
+   10. Consequences For The Replacement
+   11. Open Questions
+
+1.  The GUI Is A View Over Script Text
+
+   There is no binary profile format and no in-memory settings structure that
+   the UI edits. When the user ticks a box or picks a key, the configurator
+   BUILDS SCRIPT SOURCE TEXT and splices it into the .ac file. When it needs
+   to populate the UI, it reads the .ac file back and matches it against the
+   same templates.
+
+   Each round trip is a matched pair of functions:
+
+   +---------------------------+---------------------------+-----------------------------------------+
+   | Generate                  | Parse back                | What it round-trips                     |
+   +===========================+===========================+=========================================+
+   | cfg_EmitStickMouseScript  | cfg_ParseStickMouseScript | the stick and mouse page: sensitivity,  |
+   |                           |                           | corner adjust, axis flip, linear or     |
+   |                           |                           | smoothed mouse                          |
+   | cfg_EmitActionExpr        | cfg_ParseActionExpr       | one button binding, emitted as if (p) { |
+   |                           |                           | _button(N,1); } else { _button(N,0); }  |
+   | cfg_ScriptHandlerWrite    | cfg_ScriptHandlerScan     | which handlers exist and what each one  |
+   |                           |                           | does                                    |
+   | cfg_ScriptHeaderTagInsert | cfg_ScriptReadHeaderTags  | the // tag = value metadata block,      |
+   |                           |                           | section 4                               |
+   +---------------------------+---------------------------+-----------------------------------------+
+
+   The consequence is visible in the UI. If the parse fails, because the user
+   hand-edited the script into a form the templates do not match, the
+   configurator does not error. It reports the binding as
+
+       < more complex than a simple action >
+
+   and leaves the text alone. cfg_SwitchTab does exactly this: it calls
+   cfg_ParseActionExpr and substitutes that string when the result is zero.
+   Hand-written script is therefore never damaged by the UI, but it also
+   stops being editable through the UI.
+
+   cfg_DescribeActionList and cfg_DescribeAction produce the human-readable
+   form shown in the main window: <joybut 3>, <left click>, an upper-cased
+   key name, or the literal word nothing for an empty binding.
+
+2.  The Template Language
+
+   Templates are plain ASCII string constants in .rdata. They are stored in
+   an escaped form so that they can hold newlines and leading spaces without
+   any escape processing at load time.
+
+   +------+-----------------------------------------------+-----------------------+
+   | Char | In a stored template                          | Decoded by            |
+   +======+===============================================+=======================+
+   | %    | newline                                       | cfg_TmplDecodeEscapes |
+   | +    | space                                         | cfg_TmplDecodeEscapes |
+   | .    | dropped when template[1] is a semicolon       | cfg_TmplDecodeEscapes |
+   | @    | match one identifier character, A-Z a-z 0-9 _ | cfg_TmplCharMatch     |
+   | *    | match any one character                       | cfg_TmplCharMatch     |
+   +------+-----------------------------------------------+-----------------------+
+
+   cfg_TmplSubst replaces the first @ or * in a template with an argument
+   string and returns a heap copy. The copy is TAGGED: its first byte is set
+   to the letter d, and cfg_TmplFree only frees a string whose first byte is
+   d. That lets one pointer type carry both static .rdata templates and
+   dynamically built ones, with a free that is safe on either.
+
+   The two leading bytes of every template are consumed by that tagging
+   scheme, which is why cfg_TmplDecodeEscapes starts reading at offset 2.
+
+3.  The Script Editing Engine
+
+   cfg_ScriptTemplateSearch at 004037d0 is the core. It is a multi-pattern
+   scanner that walks a .ac file one character at a time and simultaneously
+   tracks:
+
+       -  C comment state, both the /* */ and // forms
+       -  brace depth
+       -  parenthesis depth
+       -  whether the current position is at the start of a statement
+
+   It accepts an ARRAY of templates and keeps one live match node per
+   template per candidate start position, in a doubly linked list. A node
+   that stops matching is unlinked and freed. Because comment and depth state
+   is tracked as it scans, a template can be anchored to "at statement level"
+   rather than merely "anywhere in the text", which is what makes the
+   matching robust against commented-out code and nested blocks.
+
+   On a match it returns the byte offsets of the start and the end of the
+   match and, optionally, a captured substring for the Nth wildcard.
+
+   Editing is then a splice. cfg_ScriptSplice at 00406ad0 copies bytes [0,
+   start) from the original into a temporary file, writes the replacement
+   text, then copies [end, EOF). cfg_ScriptCommitTemp renames the temporary
+   over the original and cfg_ScriptDiscardTemp deletes it on failure, so an
+   interrupted edit leaves the original intact.
+
+   This is the same all-or-nothing discipline cfg_ScanScriptDir uses for
+   script.db; see config-format.txt section 5.
+
+4.  Script File Names And Header Tags
+
+   A script file name encodes up to three fields separated by a DOUBLE
+   HYPHEN, with the .ac extension last:
+
+       <game name>--<second field>--<third field>.ac
+
+   cfg_BuildScriptFileName assembles that form and cfg_SplitScriptName takes
+   it apart, returning field N for N = 0, 1 or 2. A name with no double
+   hyphen is a common script, shown in the UI as < common >. A leading @-- is
+   skipped, so @ is reserved as a first character.
+
+   Inside the file, a metadata block of line comments carries everything the
+   file name cannot. cfg_ScriptReadHeaderTags parses it with a hand-written
+   scanner, not flex, accepting
+
+       // <tag> = <value>
+
+   with arbitrary space or tab around the equals sign, up to a 20-character
+   tag and a 300-character value, terminating at the first line that is not a
+   comment.
+
+   +----------------+-------+--------------------------------------------+
+   | Tag            | Index | Meaning                                    |
+   +================+=======+============================================+
+   | game_name      | 0     | display name of the game                   |
+   | game_exe       | 1     | executable file name, no path              |
+   | game_dir       | 2     | directory the executable lives in          |
+   | game_prod      | 3     | product name. INFERENCE: from version info |
+   | game_size      | 4     | executable size in bytes, as decimal       |
+   | game_regexe    | 5     | registry path to an executable; repeatable |
+   | game_regdir    | 6     | registry path to a directory; repeatable   |
+   | driver_version | 7     | written as 2.0.0 by cfg_CreateNewScript    |
+   +----------------+-------+--------------------------------------------+
+
+   game_regexe and game_regdir accumulate into linked lists, so a script may
+   carry several alternative registry locations for one game. The others are
+   single valued and the FIRST occurrence wins: each is stored only if the
+   destination field is still null.
+
+   These tags are how a script finds its game. cfg_CheckInstall joins
+   game_dir and game_exe and probes the result with FindFirstFileA; a script
+   whose game is not installed is simply not offered.
+
+5.  Device Discovery
+
+   The configurator locates adapters two different ways and merges the
+   results.
+
+   First, by driver interface. cfg_EnumAdaptoidInterfaces calls
+   SetupDiGetClassDevsA for the interface GUID at 0041c2e8 and enumerates
+   every present interface. This finds devices that wishk201.sys has claimed.
+
+   Second, by USB topology. cfg_UsbScanHostControllers opens the ten device
+   names HCD0 through HCD9 in turn and walks the bus with the standard USB
+   hub IOCTLs:
+
+   +----------+------------------------------------+----------------------------------+
+   | Code     | Name                               | Used for                         |
+   +==========+====================================+==================================+
+   | 0x220408 | GET_ROOT_HUB_NAME                  | root hub of a host controller    |
+   | 0x22040c | GET_NODE_CONNECTION_INFORMATION    | per-port descriptor, VID and PID |
+   | 0x220414 | GET_NODE_CONNECTION_NAME           | name of a downstream hub         |
+   | 0x220420 | GET_NODE_CONNECTION_DRIVERKEY_NAME | driver key of a port             |
+   | 0x220424 | GET_HUB_NAME                       | name of an external hub          |
+   +----------+------------------------------------+----------------------------------+
+
+   cfg_UsbWalkHubPorts recurses into every port that reports a hub, and tests
+   each node for VID 0x06F7 and PID 0x0001. As it descends it appends one
+   character per level to the buffer at 00425708, a letter for the host
+   controller then a digit per port, producing the physical path string the
+   UI shows as "Device is in port A1-2".
+
+   The two lists are merged by cfg_DeviceListMerge, which matches on the
+   device path and the port path together, and sorted by cfg_DeviceInfoLess.
+   Arrival and removal are driven by RegisterDeviceNotificationA on the
+   hidden message window; cfg_ParseDeviceBroadcast filters the broadcast to
+   the Adaptoid interface GUID and accepts only DBT_DEVICEARRIVAL (0x8000)
+   and DBT_DEVICEREMOVECOMPLETE (0x8004).
+
+   A device that the topology scan sees but the interface scan does not is an
+   adapter with no driver bound. That is how the UI distinguishes "no
+   adapter" from "adapter present but not claimed", and it is why the tray
+   icon has separate states for the two.
+
+6.  The User-Mode Event Loop
+
+   cfg_StartDriverEventThread spawns cfg_DriverEventThread at
+   THREAD_PRIORITY_TIME_CRITICAL. It opens the control device and loops on
+   IOCTL 0xb98c2060, fn 0x818, which blocks in the driver until an event is
+   available and returns exactly 12 bytes: type, arg1, arg2.
+
+   IMPORTANT. The thread has handlers for event types 0, 1 and 2 that call
+   keybd_event and mouse_event, and THOSE HANDLERS ARE DEAD CODE against this
+   driver. drv_DispatchEvents in wishk201.sys switches on the same type field
+   and turns 0, 1 and 2 into real HID reports inside the driver, through
+   drv_HidKeyEvent, drv_HidMouseButtonEvent and drv_HidMouseMoveEvent. Only
+   types it does NOT recognise are queued to user mode at all.
+
+   INFERENCE: the three dead arms are vestigial, left from a design in which
+   injection was done in user mode before the composite HID descriptor
+   existed. Not established.
+
+   The types that really do arrive:
+
+   +------+---------------------------------------------------------------+
+   | Type | Handling in wishd201.exe                                      |
+   +======+===============================================================+
+   | 3    | mouse absolute. The ONLY input event genuinely routed through |
+   |      | user mode, because the mouse collection is relative-only and  |
+   |      | cannot express an absolute position. Injected with            |
+   |      | MOUSEEVENTF_ABSOLUTE or MOUSEEVENTF_MOVE.                     |
+   | 0x42 | script fault. Posted to the main window as message 0x442 with |
+   |      | the interpreter status code in wParam.                        |
+   | 0x4D | output of the _debug builtin. Posted as message 0x44D.        |
+   | 99   | device interface state changed. Posts 0x40A to the hidden     |
+   |      | message window, which starts a device rescan.                 |
+   +------+---------------------------------------------------------------+
+
+   cfg_FormatDriverEvent renders every one of these as text for the debugging
+   log, including all eleven interpreter status codes. It is the
+   authoritative naming of those codes and it agrees with the driver.
+
+7.  Driver Installation
+
+   The configurator is also the installer. The -i switch installs and -u
+   uninstalls; both run from cfg_WinMain before any window is created.
+
+   cfg_UpdateDriverForDevice picks one of two paths at run time. On NT it
+   loads newdev.dll and calls UpdateDriverForPlugAndPlayDevicesA for the
+   hardware ID
+
+       USB\VID_06F7&PID_0001
+
+   On Windows 9x, where newdev.dll does not exist, it falls back to deleting
+   the existing devnodes and forcing a re-enumeration with
+   CM_Reenumerate_DevNode on the root devnode.
+
+   Either way the INF is placed by SetupCopyOEMInfA and the returned
+   published name is recorded in the registry under
+
+       HKLM\Software\Wish Technologies\Adaptoid    value WdmInf
+
+   so that uninstall can find the exact copy it made. cfg_DeleteWishInf will
+   delete an INF only if its text contains
+
+       Provider="Wish "
+
+   which is a deliberate guard against deleting another vendor's INF that
+   happens to have been given the same oemNN.inf name. It deletes the
+   matching .pnf precompiled file alongside it.
+
+   cfg_RemoveExistingDevnodes enumerates all device instance IDs with
+   CM_Get_Device_ID_ListA and removes anything matching either of
+
+       USB\VID_06F7&PID_0001&
+       HID\VID_06F7&PID_0001&
+
+   using SetupDiCallClassInstaller with DIF_REMOVE. Uninstall additionally
+   deletes the whole key
+
+       HKLM\System\CurrentControlSet\Control\...\VID_06F7&PID_0001
+
+   with SHDeleteKeyA, which is what clears Windows' cached driver ranking for
+   the device.
+
+8.  Game Launch Detection And wishh201.dll
+
+   A THIRD BINARY exists that is not present in decomp/. cfg_LoadHookDll
+   loads
+
+       wishh201.dll
+
+   and resolves five exports, failing with a distinct error code for each one
+   that is missing:
+
+   +-----------------+-------+------------------------------------------------+
+   | Export          | Error | Use                                            |
+   +=================+=======+================================================+
+   | InstallHook     | 0x15  | arm the system-wide hook                       |
+   | UninstallHook   | 0x16  | disarm it                                      |
+   | IsHookInstalled | 0x17  | query state                                    |
+   | SetTarget       | 0x18  | set the window that receives notifications     |
+   | GetInfo         | 0x19  | retrieve the path of the process that launched |
+   +-----------------+-------+------------------------------------------------+
+
+   A missing DLL is error 0x14 and sets the flag at 0045b028, which puts the
+   tray icon into its error state.
+
+   The flow is: SetTarget installs the hook with the hidden message window as
+   target; when a process starts, the hook notifies that window;
+   cfg_OnProcessLaunch calls cfg_HookGetLaunchedExe to retrieve the image
+   path and looks it up with cfg_FindGameEntry; on a hit, cfg_SetActiveGame
+   switches every port to that game's script and cfg_DownloadAllProfiles
+   pushes the compiled bytecode to the driver.
+
+   The feature is gated on a registry value:
+
+       HKLM\Software\Wish Technologies\Adaptoid
+           DetectGameLaunches   REG_DWORD   0 or 1
+
+   INFERENCE: wishh201.dll is a SetWindowsHookEx-based DLL injected into
+   every process, since that is the only mechanism available in 2001 for
+   system-wide launch notification without a driver. Its export set is
+   consistent with that and with nothing else obvious. NOT ESTABLISHED: the
+   binary has not been examined, and it is not part of this project.
+
+9.  Process And Thread Structure
+
+   cfg_WinMain parses four single-letter switches, each accepted with either
+   a hyphen or a forward slash:
+
+   +--------+----------------------------------------------+
+   | Switch | Effect                                       |
+   +========+==============================================+
+   | -i     | install the driver, then continue            |
+   | -u     | uninstall the driver, then continue          |
+   | -h     | start hidden; do not raise the main window   |
+   | -x     | signal a running instance to exit, then exit |
+   +--------+----------------------------------------------+
+
+   Single-instance control uses two named events and a named mutex under Wish
+   Technologies\Adaptoid Keymapper. The -x switch simply sets the quit event
+   and returns; the running instance's watcher thread sees it and posts a
+   message.
+
+   Two window classes are registered. AdaptoidConfigurator is the visible,
+   owner-drawn main window: cfg_PaintMainWindow renders it entirely by hand
+   into a memory DC using bitmaps from the resource section, which is why the
+   port strip and its focus rectangle are drawn rather than being child
+   controls. AdaptoidDriver is a hidden message-only window that receives
+   device notifications and the messages posted by the worker threads.
+
+   Three threads run besides the message loop:
+
+   +----------------------------+------------------------+-------------------------------------+
+   | Thread                     | Waits on               | Purpose                             |
+   +============================+========================+=====================================+
+   | cfg_DriverEventThread      | IOCTL fn 0x818         | the driver event queue, section 6   |
+   | cfg_ScriptDirWatcherThread | WaitForMultipleObjects | the quit event, the exit event, and |
+   |                            |                        | a directory change notification on  |
+   |                            |                        | the scripts directory               |
+   | hook notification          | wishh201.dll           | game launches, section 8            |
+   +----------------------------+------------------------+-------------------------------------+
+
+   The directory watcher is why editing a .ac file in an external text editor
+   is picked up without restarting the configurator: the change notification
+   posts 0x41E to the message window, which triggers
+   cfg_RefreshChangedProfiles and then cfg_RecompileAllProfiles.
+
+   There are SIXTEEN profile slots, at 00425788 with a stride of 0x10F
+   dwords, matching the sixteen virtual devices the driver can present.
+
+10. Consequences For The Replacement
+
+   - The script text is the configuration. A replacement that keeps the .ac
+   format gets profile compatibility for free and needs no converter. A
+   replacement that invents a binary profile format must also ship a
+   migration path, and loses the property that a profile can be edited in any
+   text editor.
+
+   - The generate-and-reparse model is worth keeping, but the matching should
+   be done on a parsed syntax tree rather than on text templates. The
+   original's weakness is that any reformatting of the script text, such as
+   different spacing or a reordered clause, makes a binding invisible to the
+   UI even though it still compiles and runs correctly.
+
+   - The metadata header is a good design and costs nothing. It keeps a
+   script self-describing, so a script file passed between users carries the
+   information needed to find its game.
+
+   - Storing everything beside the executable does not work on a modern
+   Windows install. See config-format.txt section 6.
+
+   - The installer logic is largely obsolete. UpdateDriverForPlugAndPlay-
+   Devices still exists, but a modern replacement should ship as a signed
+   driver package and let PnP do the ranking, and must not delete other
+   vendors' INF files.
+
+   - The absolute-mouse path is the one real constraint the HID descriptor
+   imposes. If the replacement declares an absolute pointer collection
+   instead of a relative one, the user-mode event loop disappears entirely
+   and _mouse_absolute becomes a HID report like everything else.
+
+11. Open Questions
+
+   - wishh201.dll itself. It is referenced by name and by five exports but is
+   not present in decomp/, so its mechanism is inferred, not read.
+
+   - The content of the 64-byte exchange behind control-device fn 0x802 and
+   fn 0x803, which no configurator path appears to use.
+
+   - Whether game_prod is compared against the version-resource product name
+   at run time, or is purely informational. No comparison site was found.
+

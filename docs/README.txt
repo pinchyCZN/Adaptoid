@@ -48,9 +48,10 @@ Table of Contents
 
    Written so far: hid-descriptor.txt, ioctl-surface.txt, script-
    bytecode.txt, script-language.txt, known-defects.txt, usb-transport.txt,
-   driver-lifecycle.txt, function-map.txt, config-format.txt and replacement-
-   architecture.txt. The rest are listed so findings land in a predictable
-   place rather than accumulating in one file.
+   driver-lifecycle.txt, function-map.txt, config-format.txt,
+   configurator-architecture.txt and replacement-architecture.txt. The rest
+   are listed so findings land in a predictable place rather than
+   accumulating in one file.
 
    +-----------------------+---------------------------------------------+
    | File                  | Contents                                    |
@@ -62,6 +63,11 @@ Table of Contents
    | ioctl-surface.txt     | Every IOCTL code shared between             |
    |                       | wishd201.exe and wishk201.sys, with its     |
    |                       | input and output buffer layout.             |
+   +-----------------------+---------------------------------------------+
+   | configurator-         | DONE. How wishd201.exe is built: the        |
+   | architecture.txt      | edit-as-script-text model, device           |
+   |                       | discovery, driver installation, and the     |
+   |                       | user-mode half of the event queue.          |
    +-----------------------+---------------------------------------------+
    | usb-protocol.txt      | Device endpoints, the N64 serial protocol,  |
    |                       | polling cadence, and pak handling.          |

@@ -94,12 +94,28 @@ Table of Contents
        0x23      IN   N64 transaction, short form, 3 command bytes
        0x24      IN   N64 transaction, short form, 4 command bytes
        0x36      OUT  force-feedback motor bitmap, see section 3.2
+       0x70      IN   firmware CRC, 6 bytes
        0x71      IN   collect the reply to a long-form transaction,
                       wValue 0x0030
        0x72      OUT  probe/configure step, wValue and wIndex carry the
                       parameters
+       0x73      IN   timing code, 1 byte
        0x74      OUT  accessory select or power state, wValue 0x00C6 and
                       0x00A6 observed
+
+   Requests 0x70 and 0x73 are not issued by the driver at all. They are
+   issued by wishd201.exe, which builds the 8-byte setup packet itself and
+   passes it through IOCTL fn 0x832, the raw controller transaction. The
+   exact bytes are visible in cfg_DumpDeviceDiagnostics:
+
+       C0 70 00 00 00 00    6-byte reply, rendered as
+                            "Firmware crc %02X%02X%02X%02X %x%x"
+       C0 73 00 00 00 00    1-byte reply, rendered as
+                            " timing code %02X"
+
+   The leading C0 is bmRequestType: vendor, device to host. The timing code
+   is only requested when the initialisation result reported by fn 0x836 is
+   greater than 1.
 
    Controller state does NOT arrive through any of these. It is read
    continuously from a USB interrupt pipe by the polling engine, described in
@@ -264,7 +280,11 @@ Table of Contents
 
    - The meaning of the wValue and wIndex pairs in probe steps 1 to 5, and of
    request 0x74's 0x00C6 and 0x00A6. These are firmware register semantics
-   and may not be recoverable from the driver alone.
+   and may not be recoverable from the driver alone. Requests 0x70 and 0x73
+   are no longer open; see section 3.
+
+   - What the timing code returned by request 0x73 encodes. The
+   configurator prints it as a raw hex byte and does not interpret it.
 
    - Which accessory kind corresponds to devext+0x3E4 state 2 versus state 3.
    The status byte kept at devext+0x3E8 tells the driver whether a Pak is

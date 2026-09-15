@@ -77,6 +77,14 @@ Table of Contents
    store, which means a replacement can ignore both and simply read the
    .ac files if it does not need the assignment state.
 
+   RESOLVED. The INFERENCE above about handler skeletons is confirmed and
+   is in fact the whole editing model: the configurator has no separate
+   settings structure, and generates and re-parses script text for every
+   control in the UI. The file name itself is structured, as
+   <game>--<field>--<field>.ac, and a block of // tag = value line
+   comments at the top of each script carries the game metadata. Both are
+   documented in configurator-architecture.txt sections 1 and 4.
+
 3.  The Record Format
 
    script.db and active.db share one format: a flat stream of
