@@ -114,6 +114,29 @@ Table of Contents
    would have to be a deliberate one. src_drv/harness.c performs that parse
    alongside the byte comparison.
 
+   THE COLLECTION ORDER IS CONFIRMED BY A RUNNING DRIVER. With the original
+   loaded on 32-bit Windows 7, hidclass creates one child devnode per
+   top-level collection and numbers them in descriptor order:
+
+       HID\VID_06F7&PID_0001&Col01   HID_DEVICE_SYSTEM_MOUSE
+                                    HID_DEVICE_UP:0001_U:0002
+       HID\VID_06F7&PID_0001&Col02   HID_DEVICE_SYSTEM_KEYBOARD
+                                    HID_DEVICE_UP:0001_U:0006
+       HID\VID_06F7&PID_0001&Col03   HID_DEVICE_SYSTEM_GAME
+                                    HID_DEVICE_UP:0001_U:0004
+
+   Mouse, then keyboard, then joystick - the order section 4 gives, and the
+   usages Windows derives are the three Usage items at the head of each
+   collection: 0x02 Mouse, 0x06 Keyboard, 0x04 Joystick. Three children
+   also means drv_VirtualDevicesMask was 7, which is what section 3
+   predicts when the registry value is absent.
+
+   A FOURTH, UNSUFFIXED NODE MAY SIT BESIDE THEM. HID\VID_06F7&PID_0001
+   with no &ColNN is what hidclass creates when the device has ONE
+   collection - which is what the hardware's own descriptor reports when
+   Microsoft's HidUsb owns it. It survives as a phantom after the Wish
+   driver takes over and does not indicate a second device.
+
 3.  Descriptor Selection
 
    The table index is (g_dwVirtualDevicesMask & 7), where
@@ -129,6 +152,14 @@ Table of Contents
    So the HID personality of the device is a single registry DWORD, read
    once per device arrival. Changing it requires a replug or a restart of
    the device stack; it is not renegotiated at runtime.
+
+   THE VALUE IS NORMALLY ABSENT AND THAT IS THE INTENDED STATE. Neither the
+   installer nor wishna1.inf ever writes it - a working install has only
+   InstallVer, InstallDir, Installed and WdmInf under that key.
+   drv_RegQueryDword seeds RtlQueryRegistryValues with the CURRENT value as
+   its default, so a missing value leaves drv_DriverEntry's 7 in place and
+   all three collections are served. It is an override that exists for
+   support cases, not a setting the product configures.
 
    Only indices 6 and 7 select distinct descriptors. Indices 0 through 5
    all resolve to the joystick-only descriptor.
