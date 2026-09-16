@@ -28,21 +28,6 @@
 /* Report sink - the driver side of the core seam                      */
 /* ------------------------------------------------------------------ */
 
-void AdaptoidReportSink(void *ctx, u8 report_id, const u8 *data, u32 len)
-{
-	PADAPTOID_DEVEXT devext = (PADAPTOID_DEVEXT)ctx;
-
-	(void)devext;
-	(void)report_id;
-	(void)data;
-	(void)len;
-
-	/*
-	 * TODO: hand the report to hidclass by completing a pending read IRP.
-	 * This is the seam the original calls drv_SubmitHidReport, and it is
-	 * deliberately the ONLY point at which core.c touches the OS.
-	 */
-}
 
 /* ------------------------------------------------------------------ */
 /* Load and unload                                                     */
@@ -478,6 +463,67 @@ NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
 	UNREFERENCED_PARAMETER(TransferBuffer);
 	return STATUS_NOT_IMPLEMENTED;
 }
+/*
+ * The OS edge of the poll loop and the read queue. Like
+ * AdaptoidVendorSubmitUrb these have two definitions selected by
+ * ADAPTOID_USERMODE - harness.c supplies observable ones - and one origin
+ * row each; see origin.txt.
+ *
+ * STAGE FOUR: the URB build needs usbdi.h and there is no device to send it
+ * to yet.
+ */
+NTSTATUS AdaptoidPollSubmit(PADAPTOID_DEVEXT DevExt, ULONG Slot)
+{
+	UNREFERENCED_PARAMETER(DevExt);
+	UNREFERENCED_PARAMETER(Slot);
+	return STATUS_NOT_IMPLEMENTED;
+}
+
+void AdaptoidFreePollIrp(PIRP Irp, PVOID Urb)
+{
+	if (Urb != NULL) {
+		ExFreePool(Urb);
+	}
+	if (Irp != NULL) {
+		IoFreeIrp(Irp);
+	}
+}
+
+void AdaptoidCancelIrp(PIRP Irp)
+{
+	IoCancelIrp(Irp);
+}
+
+void AdaptoidQueuePollRestart(PADAPTOID_DEVEXT DevExt)
+{
+	UNREFERENCED_PARAMETER(DevExt);
+}
+
+/*
+ * Whether a parked request is still ours. The InterlockedExchange is the
+ * whole of it: if the cancel routine was still set we won the race, and if
+ * it was already null the canceller owns completing the request.
+ */
+int AdaptoidClaimIrp(PIRP Irp)
+{
+	return InterlockedExchange((LONG volatile *)&Irp->CancelRoutine, 0) != 0;
+}
+
+NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
+                              const UCHAR *Data, UCHAR Length)
+{
+	UCHAR *out = (UCHAR *)Irp->AssociatedIrp.SystemBuffer;
+	ULONG  i;
+
+	UNREFERENCED_PARAMETER(DevExt);
+	for (i = 0; i < Length; i++) {
+		out[i] = Data[i];
+	}
+	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, Length);
+	AdaptoidLockRelease(&DevExt->RemoveLockB);
+	return STATUS_SUCCESS;
+}
+
 #endif /* !ADAPTOID_USERMODE */
 
 /* ------------------------------------------------------------------ */
@@ -785,7 +831,8 @@ NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	case IRP_MN_STOP_DEVICE:
 		/* TOP-DOWN: stop polling and release USB resources BEFORE the bus
 		 * driver reclaims them. */
-		AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_PNP);
+		AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_PNP,
+		                 ADAPTOID_POLL_SLOTS);
 		AdaptoidQuiesceIo(DevExt);
 		AdaptoidUnconfigureDevice(DevExt);
 		DevExt->Started = 0;
@@ -799,7 +846,8 @@ NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		AdaptoidLockReleaseAndWait(&DevExt->RemoveLockA);
 
 		AdaptoidRegistryRemove(DevExt);
-		AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_REMOVE);
+		AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_REMOVE,
+		                 ADAPTOID_POLL_SLOTS);
 		AdaptoidQuiesceIo(DevExt);
 		AdaptoidAbortPipes(DevExt);
 
@@ -884,11 +932,7 @@ NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
 void AdaptoidSetDeviceName(PADAPTOID_DEVEXT DevExt)
 { UNREFERENCED_PARAMETER(DevExt); }
 
-void AdaptoidPollStart(PADAPTOID_DEVEXT DevExt, ULONG Reason)
-{ UNREFERENCED_PARAMETER(DevExt); UNREFERENCED_PARAMETER(Reason); }
 
-void AdaptoidPollStop(PADAPTOID_DEVEXT DevExt, ULONG Reason)
-{ UNREFERENCED_PARAMETER(DevExt); UNREFERENCED_PARAMETER(Reason); }
 
 void AdaptoidQuiesceIo(PADAPTOID_DEVEXT DevExt)
 { UNREFERENCED_PARAMETER(DevExt); }
@@ -959,3 +1003,370 @@ NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 }
 
 #endif /* !ADAPTOID_USERMODE */
+
+/*
+ * Bring a device extension to a usable state. Every lock initialised, every
+ * list head pointing at itself.
+ *
+ * A LIST HEAD OF ZEROES IS NOT AN EMPTY LIST, it is a null pointer waiting
+ * to be walked - so this is not optional, and it is one call rather than
+ * scattered initialisation so that adding a list cannot forget it.
+ */
+void AdaptoidDevExtInit(PADAPTOID_DEVEXT DevExt)
+{
+	ULONG i;
+
+	AdaptoidLockInit(&DevExt->RemoveLockA);
+	AdaptoidLockInit(&DevExt->RemoveLockB);
+
+	KeInitializeSpinLock(&DevExt->Vendor.Lock);
+	DevExt->Vendor.State = ADAPTOID_SLOT_FREE;
+
+	KeInitializeSpinLock(&DevExt->PollLock);
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		DevExt->PollSlot[i].CancelLatch = 0;
+		DevExt->PollSlot[i].Irp         = NULL;
+		DevExt->PollSlot[i].Urb         = NULL;
+		DevExt->PollSlot[i].Active      = 0;
+	}
+	/* Polling starts STOPPED, for the PnP reason, so nothing reads the
+	 * device before START_DEVICE has selected a configuration. */
+	DevExt->PollStopMask       = ADAPTOID_STOP_REASON_PNP;
+	DevExt->PollRestartPending = 0;
+
+	KeInitializeSpinLock(&DevExt->ReportLock);
+	DevExt->ReportHead       = 0;
+	DevExt->ReportCount      = 0;
+	DevExt->ReportsDropped   = 0;
+	DevExt->PendingReads.Flink = &DevExt->PendingReads;
+	DevExt->PendingReads.Blink = &DevExt->PendingReads;
+	DevExt->PendingReadCount = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* the polling engine                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Clear one reason from the stop mask and, once NO reasons remain, put both
+ * slots back in flight.
+ *
+ * A slot already active is left alone, so calling this twice does not submit
+ * four reads.
+ */
+void AdaptoidPollStart(PADAPTOID_DEVEXT DevExt, ULONG Reason)
+{
+	KIRQL irql;
+	int submit[ADAPTOID_POLL_SLOTS];
+	ULONG i;
+
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		submit[i] = 0;
+	}
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	DevExt->PollStopMask &= ~Reason;
+	if (DevExt->PollStopMask == 0) {
+		for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+			submit[i] = (DevExt->PollSlot[i].Active == 0);
+			DevExt->PollSlot[i].Active = 1;
+		}
+	}
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	/* Submitted outside the lock; the submit itself can complete
+	 * synchronously and would deadlock against it. */
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		if (submit[i]) {
+			AdaptoidPollSubmit(DevExt, i);
+		}
+	}
+}
+
+/*
+ * Add a reason to the stop mask and cancel whatever is outstanding.
+ *
+ * Slot names the slot that is already completing, if any, so it is not
+ * cancelled; pass ADAPTOID_POLL_SLOTS to mean "cancel everything", which is
+ * what the PnP paths do.
+ *
+ * Returns non-zero if this was the LAST slot outstanding. The completion
+ * path uses that to queue the restart work exactly once no matter which of
+ * the two reads failed first.
+ */
+int AdaptoidPollStop(PADAPTOID_DEVEXT DevExt, ULONG Reason, ULONG Slot)
+{
+	KIRQL irql;
+	PIRP  cancel[ADAPTOID_POLL_SLOTS];
+	PVOID urb[ADAPTOID_POLL_SLOTS];
+	ULONG i;
+	int   last = 0;
+	int   any  = 0;
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	DevExt->PollStopMask |= Reason;
+	if (Slot < ADAPTOID_POLL_SLOTS) {
+		DevExt->PollSlot[Slot].Active = 0;
+		/* The OTHER slot having no IRP means this was the last one. */
+		last = (DevExt->PollSlot[Slot ^ 1].Irp == NULL);
+	}
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		cancel[i] = NULL;
+		urb[i]    = NULL;
+		if (DevExt->PollSlot[i].Active != 0 &&
+		    DevExt->PollSlot[i].CancelLatch == 0) {
+			cancel[i] = DevExt->PollSlot[i].Irp;
+			urb[i]    = DevExt->PollSlot[i].Urb;
+			/* Latch it: the completion path must not free it now. */
+			DevExt->PollSlot[i].CancelLatch = 1;
+			if (cancel[i] != NULL) {
+				any = 1;
+			}
+		}
+	}
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	if (!any) {
+		return last;
+	}
+
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		if (cancel[i] != NULL) {
+			AdaptoidCancelIrp(cancel[i]);
+		}
+	}
+
+	/*
+	 * THE HANDSHAKE. If the latch is still set the completion path has not
+	 * run, so it will find the latch set, clear it, and leave the freeing
+	 * to us - except that we then drop the reference, because it has not
+	 * finished with the IRP yet. If the latch is already CLEAR, completion
+	 * got there first and freed nothing, so we free.
+	 */
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		if (cancel[i] != NULL && DevExt->PollSlot[i].CancelLatch != 0) {
+			DevExt->PollSlot[i].CancelLatch = 0;
+			cancel[i] = NULL;       /* completion will free it */
+		}
+	}
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		if (cancel[i] != NULL) {
+			AdaptoidFreePollIrp(cancel[i], urb[i]);
+		}
+	}
+	return last;
+}
+
+/*
+ * One read finished.
+ *
+ * Three things must all hold for a packet to be accepted: the IRP succeeded,
+ * the URB succeeded, and the transfer was EXACTLY five bytes. A short read
+ * is not a partial packet to be salvaged - the controller state is five
+ * bytes or it is nothing.
+ *
+ * On success the packet goes to the core and the slot resubmits immediately.
+ * On failure polling stops and the restart work is queued, once.
+ */
+void AdaptoidPollComplete(PADAPTOID_DEVEXT DevExt, ULONG Slot,
+                          NTSTATUS Status, ULONG Length)
+{
+	KIRQL irql;
+	PIRP  irp;
+	PVOID urb;
+	ULONG stopmask;
+	int   failed;
+	int   owns;
+	int   last;
+
+	if (Slot >= ADAPTOID_POLL_SLOTS) {
+		return;
+	}
+	failed = (!NT_SUCCESS(Status) || Length != ADAPTOID_POLL_BYTES);
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	irp = DevExt->PollSlot[Slot].Irp;
+	urb = DevExt->PollSlot[Slot].Urb;
+	DevExt->PollSlot[Slot].Irp = NULL;
+	DevExt->PollSlot[Slot].Urb = NULL;
+
+	owns = (DevExt->PollSlot[Slot].CancelLatch == 0);
+	if (!owns) {
+		DevExt->PollSlot[Slot].CancelLatch = 0;
+	}
+	stopmask = DevExt->PollStopMask;
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	if (owns) {
+		AdaptoidFreePollIrp(irp, urb);
+	}
+
+	if (stopmask == 0 && !failed) {
+		/* The whole point: decode, then immediately put the slot back in
+		 * flight so the other one is never alone. */
+		core_on_raw_packet(&DevExt->Core, DevExt->PollSlot[Slot].Buffer);
+		AdaptoidPollSubmit(DevExt, Slot);
+		return;
+	}
+
+	last = AdaptoidPollStop(DevExt, failed ? ADAPTOID_STOP_REASON_ERROR : 0,
+	                        Slot);
+	if (last && failed &&
+	    NT_SUCCESS(AdaptoidLockAcquire(&DevExt->RemoveLockB))) {
+		/*
+		 * The remove lock is held ACROSS the queued work, not just around
+		 * queueing it; the restart worker releases it. That is what keeps
+		 * the device alive until the retry finishes.
+		 */
+		DevExt->PollRestartPending = 1;
+		AdaptoidQueuePollRestart(DevExt);
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* the report queue and pending reads                                  */
+/* ------------------------------------------------------------------ */
+
+/* Take the oldest parked read that cancellation has not claimed. */
+PIRP AdaptoidDequeueRead(PADAPTOID_DEVEXT DevExt)
+{
+	KIRQL irql;
+	PIRP  irp = NULL;
+
+	for (;;) {
+		PLIST_ENTRY entry = NULL;
+
+		KeAcquireSpinLock(&DevExt->ReportLock, &irql);
+		if (DevExt->PendingReads.Flink != &DevExt->PendingReads) {
+			entry = DevExt->PendingReads.Flink;
+			entry->Blink->Flink = entry->Flink;
+			entry->Flink->Blink = entry->Blink;
+			DevExt->PendingReadCount--;
+		}
+		KeReleaseSpinLock(&DevExt->ReportLock, irql);
+
+		if (entry == NULL) {
+			return NULL;
+		}
+		irp = ADAPTOID_IRP_FROM_ENTRY(entry);
+		if (AdaptoidClaimIrp(irp)) {
+			return irp;
+		}
+		/* Cancellation won; it owns completing that one. Try the next. */
+	}
+}
+
+/* Park a read, with the cancel handshake. */
+void AdaptoidQueueRead(PADAPTOID_DEVEXT DevExt, PIRP Irp)
+{
+	KIRQL irql;
+	PLIST_ENTRY entry = ADAPTOID_IRP_LIST_ENTRY(Irp);
+
+	KeAcquireSpinLock(&DevExt->ReportLock, &irql);
+	entry->Flink = &DevExt->PendingReads;
+	entry->Blink = DevExt->PendingReads.Blink;
+	DevExt->PendingReads.Blink->Flink = entry;
+	DevExt->PendingReads.Blink = entry;
+	DevExt->PendingReadCount++;
+	KeReleaseSpinLock(&DevExt->ReportLock, irql);
+}
+
+/* Fail every parked read. The device going away does this. */
+void AdaptoidCancelPendingReads(PADAPTOID_DEVEXT DevExt)
+{
+	PIRP irp;
+
+	while ((irp = AdaptoidDequeueRead(DevExt)) != NULL) {
+		AdaptoidCompleteIrp(irp, STATUS_DELETE_PENDING, 0);
+	}
+}
+
+/*
+ * IOCTL_HID_READ_REPORT. Answer from the queue if anything is waiting there,
+ * otherwise park until something arrives.
+ *
+ * The two halves are deliberately in this order: a report already queued is
+ * older than this request, so serving it first keeps reports in order.
+ */
+NTSTATUS AdaptoidReadReport(PADAPTOID_DEVEXT DevExt, PIRP Irp)
+{
+	KIRQL irql;
+	ADAPTOID_REPORT_NODE node;
+	int have = 0;
+
+	KeAcquireSpinLock(&DevExt->ReportLock, &irql);
+	if (DevExt->ReportCount > 0) {
+		node = DevExt->ReportQueue[DevExt->ReportHead];
+		DevExt->ReportHead =
+		        (DevExt->ReportHead + 1) % ADAPTOID_REPORT_QUEUE_MAX;
+		DevExt->ReportCount--;
+		have = 1;
+	}
+	KeReleaseSpinLock(&DevExt->ReportLock, irql);
+
+	if (have) {
+		return AdaptoidCompleteRead(DevExt, Irp, node.Data, node.Length);
+	}
+
+	if (!NT_SUCCESS(AdaptoidLockAcquire(&DevExt->RemoveLockB))) {
+		return AdaptoidCompleteIrp(Irp, STATUS_DELETE_PENDING, 0),
+		       STATUS_DELETE_PENDING;
+	}
+	AdaptoidQueueRead(DevExt, Irp);
+	return STATUS_PENDING;
+}
+
+/*
+ * The report sink. core_emit has already decided the report is enabled and
+ * stripped the length and ID; what arrives here is the payload.
+ *
+ * Hand it straight to a waiting read if there is one, otherwise queue it.
+ *
+ * A FULL QUEUE DISCARDS THE NEW REPORT and keeps the old ones, which is the
+ * original's policy and the opposite of the notification queue's. See the
+ * note in wdm.h.
+ */
+void AdaptoidReportSink(void *ctx, u8 report_id, const u8 *data, u32 len)
+{
+	PADAPTOID_DEVEXT DevExt = (PADAPTOID_DEVEXT)ctx;
+	KIRQL irql;
+	PIRP  irp;
+	ULONG i;
+	LONG  slot;
+
+	if (len + 1 > CORE_REPORT_MAX_BYTES) {
+		return;
+	}
+
+	irp = AdaptoidDequeueRead(DevExt);
+	if (irp != NULL) {
+		UCHAR buf[CORE_REPORT_MAX_BYTES];
+
+		buf[0] = report_id;
+		for (i = 0; i < len; i++) {
+			buf[1 + i] = data[i];
+		}
+		AdaptoidCompleteRead(DevExt, irp, buf, (UCHAR)(len + 1));
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
+		return;
+	}
+
+	KeAcquireSpinLock(&DevExt->ReportLock, &irql);
+	if (DevExt->ReportCount >= ADAPTOID_REPORT_QUEUE_MAX) {
+		DevExt->ReportsDropped++;
+		KeReleaseSpinLock(&DevExt->ReportLock, irql);
+		return;
+	}
+	slot = (DevExt->ReportHead + DevExt->ReportCount) %
+	       ADAPTOID_REPORT_QUEUE_MAX;
+	DevExt->ReportQueue[slot].Length  = (UCHAR)(len + 1);
+	DevExt->ReportQueue[slot].Data[0] = report_id;
+	for (i = 0; i < len; i++) {
+		DevExt->ReportQueue[slot].Data[1 + i] = data[i];
+	}
+	DevExt->ReportCount++;
+	KeReleaseSpinLock(&DevExt->ReportLock, irql);
+}

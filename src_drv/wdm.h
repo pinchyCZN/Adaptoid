@@ -178,6 +178,77 @@ extern ADAPTOID_SAVED_DISPATCH AdaptoidSavedDispatch;
 
 int AdaptoidRouteOf(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
+/* ======================================================================
+ * THE POLLING ENGINE
+ *
+ * The top of the input path. Everything the adapter reports arrives here and
+ * leaves through core_on_raw_packet.
+ *
+ * A continuous double-buffered USB interrupt read: TWO IRPs in flight at all
+ * times, each completion resubmitting immediately, so one read is always
+ * outstanding while the other is being processed. That is what keeps latency
+ * down without a timer - and two is not an arbitrary number, it is what the
+ * original allocates, scans and matches against.
+ *
+ * FIVE BYTES is the whole controller state, and it is the raw layout
+ * core_decode expects: X, Y, status, button hi, button lo.
+ *
+ * THE STOP MASK IS A BITMASK, not a flag. Polling runs only while it is
+ * zero, so a stop for one reason cannot be undone by a start for another.
+ * ====================================================================== */
+
+#define ADAPTOID_POLL_SLOTS     2
+#define ADAPTOID_POLL_BYTES     CORE_RAW_PACKET_BYTES
+
+typedef struct _ADAPTOID_POLL_SLOT {
+	/*
+	 * Non-zero while a stop is cancelling this slot. It is how the stop and
+	 * completion paths agree on ownership: whoever finds it CLEAR frees the
+	 * IRP and URB, so they are never freed twice and never leaked.
+	 */
+	LONG  CancelLatch;
+	PIRP  Irp;
+	PVOID Urb;
+	UCHAR Buffer[ADAPTOID_POLL_BYTES];
+	UCHAR Active;           /* this slot should have a read outstanding */
+} ADAPTOID_POLL_SLOT;
+
+/* ======================================================================
+ * THE REPORT QUEUE AND PENDING READS
+ *
+ * The other half of core_emit. hidclass sends down IOCTL_HID_READ_REPORT
+ * and the driver answers it either immediately, from a report already
+ * queued, or later, when one arrives.
+ *
+ * THE SAME SHAPE AS THE NOTIFICATION QUEUE in ioctl.c - two queues paired
+ * one for one with a cancel-safe handshake - but NOT the same policy. When
+ * that one fills it drops its OLDEST entry; this one discards the NEWEST and
+ * keeps what it has. Reproduced, but worth knowing which way round it is: a
+ * backed-up report queue keeps replaying stale input rather than catching up.
+ * ====================================================================== */
+
+#define ADAPTOID_REPORT_QUEUE_MAX   100
+
+typedef struct _ADAPTOID_REPORT_NODE {
+	UCHAR Length;
+	UCHAR Data[CORE_REPORT_MAX_BYTES];
+} ADAPTOID_REPORT_NODE;
+
+/*
+ * Claim a parked read for completion. Non-zero if it is still ours; zero
+ * means cancellation got there first and the canceller owns completing it.
+ * The same question the notification queue asks, and the same reason it is
+ * a seam: it is a cancellation question, so the OS answers it.
+ */
+int  AdaptoidClaimIrp(PIRP Irp);
+
+void AdaptoidPollComplete(struct _ADAPTOID_DEVEXT *DevExt, ULONG Slot,
+                          NTSTATUS Status, ULONG Length);
+void AdaptoidQueueRead(struct _ADAPTOID_DEVEXT *DevExt, PIRP Irp);
+PIRP AdaptoidDequeueRead(struct _ADAPTOID_DEVEXT *DevExt);
+void AdaptoidCancelPendingReads(struct _ADAPTOID_DEVEXT *DevExt);
+NTSTATUS AdaptoidReadReport(struct _ADAPTOID_DEVEXT *DevExt, PIRP Irp);
+
 typedef struct _ADAPTOID_DEVEXT {
 	PDEVICE_OBJECT  Self;
 	PDEVICE_OBJECT  NextDeviceObject;
@@ -199,6 +270,28 @@ typedef struct _ADAPTOID_DEVEXT {
 	ULONG           StopPending;
 	/* The one veto this driver casts on QUERY_STOP. */
 	ULONG           StopVeto;
+
+	/* The polling engine. */
+	KSPIN_LOCK          PollLock;
+	ADAPTOID_POLL_SLOT  PollSlot[ADAPTOID_POLL_SLOTS];
+	ULONG               PollStopMask;
+	ULONG               PollRestartPending;
+
+	/*
+	 * The report queue, and the reads waiting on it. A fixed ring rather
+	 * than the original's pool allocations: the cap is the same 100, and
+	 * pre-allocating removes a failure path that had nothing useful to do
+	 * with it anyway - the original silently drops the report if the
+	 * allocation fails, which is what a full queue does too.
+	 */
+	KSPIN_LOCK           ReportLock;
+	ADAPTOID_REPORT_NODE ReportQueue[ADAPTOID_REPORT_QUEUE_MAX];
+	LONG                 ReportHead;
+	LONG                 ReportCount;
+	ULONG                ReportsDropped;
+
+	LIST_ENTRY           PendingReads;
+	LONG                 PendingReadCount;
 } ADAPTOID_DEVEXT, *PADAPTOID_DEVEXT;
 
 /*
@@ -254,7 +347,21 @@ NTSTATUS AdaptoidVendorSubmitUrb(struct _ADAPTOID_DEVEXT *DevExt,
  * reason cannot restart while another still holds it. */
 #define ADAPTOID_STOP_REASON_PNP    4
 #define ADAPTOID_STOP_REASON_REMOVE 8
+#define ADAPTOID_STOP_REASON_ERROR  1
 
+/*
+ * Where an IRP's queue link lives. The DDK puts it in Tail.Overlay; the
+ * harness has a plain member. One accessor so wdm.c never names either.
+ */
+#ifdef ADAPTOID_USERMODE
+#define ADAPTOID_IRP_LIST_ENTRY(Irp)  (&(Irp)->ListEntry)
+#define ADAPTOID_IRP_FROM_ENTRY(e)    	((PIRP)((char *)(e) - (char *)&(((PIRP)0)->ListEntry)))
+#else
+#define ADAPTOID_IRP_LIST_ENTRY(Irp)  (&(Irp)->Tail.Overlay.ListEntry)
+#define ADAPTOID_IRP_FROM_ENTRY(e)    	CONTAINING_RECORD((e), IRP, Tail.Overlay.ListEntry)
+#endif
+
+void     AdaptoidDevExtInit(struct _ADAPTOID_DEVEXT *DevExt);
 NTSTATUS AdaptoidStartDevice(struct _ADAPTOID_DEVEXT *DevExt);
 NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
@@ -270,7 +377,15 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(struct _ADAPTOID_DEVEXT *DevExt);
 NTSTATUS AdaptoidSelectConfiguration(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidSetDeviceName(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidPollStart(struct _ADAPTOID_DEVEXT *DevExt, ULONG Reason);
-void     AdaptoidPollStop(struct _ADAPTOID_DEVEXT *DevExt, ULONG Reason);
+int      AdaptoidPollStop(struct _ADAPTOID_DEVEXT *DevExt, ULONG Reason,
+                          ULONG Slot);
+/* The OS edge of the poll loop: build and submit one interrupt read. */
+NTSTATUS AdaptoidPollSubmit(struct _ADAPTOID_DEVEXT *DevExt, ULONG Slot);
+void     AdaptoidFreePollIrp(PIRP Irp, PVOID Urb);
+void     AdaptoidCancelIrp(PIRP Irp);
+void     AdaptoidQueuePollRestart(struct _ADAPTOID_DEVEXT *DevExt);
+NTSTATUS AdaptoidCompleteRead(struct _ADAPTOID_DEVEXT *DevExt, PIRP Irp,
+                              const UCHAR *Data, UCHAR Length);
 void     AdaptoidQuiesceIo(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidUnconfigureDevice(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidAbortPipes(struct _ADAPTOID_DEVEXT *DevExt);

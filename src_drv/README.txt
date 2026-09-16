@@ -234,10 +234,10 @@ Table of Contents
    | ioctl.c   |     1303 |    1303 | both IOCTL surfaces, the registry and |
    |           |          |         | the notify queue; finished            |
    +-----------+----------+---------+---------------------------------------+
-   | wdm.c     |      961 |   ~1900 | DriverEntry, AddDevice, PnP, power,   |
+   | wdm.c     |     1372 |   ~2000 | DriverEntry, AddDevice, PnP, power,   |
    |           |          |         | polling, URB transport, device naming |
    +-----------+----------+---------+---------------------------------------+
-   | harness.c |     5171 |   ~5600 | main() and every test                 |
+   | harness.c |     6524 |   ~7000 | main() and every test                 |
    +-----------+----------+---------+---------------------------------------+
 
    THE BUILTINS WENT INTO sched.c, NOT script.c as first planned. Eleven of
@@ -273,8 +273,8 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 91 of the 146 functions in
-   wishk201.sys are ported, 29380 of 38690 bytes, so 76 percent by code
+   Measured against the Ghidra database: 99 of the 146 functions in
+   wishk201.sys are ported, 30940 of 38690 bytes, so 80 percent by code
    size.
 
    THE COUNT NOW INCLUDES NAMED-BUT-EMPTY FUNCTIONS. Stage two declared and
@@ -296,10 +296,15 @@ Table of Contents
    with its bring-up and tear-down ordering. Both are testable, and both
    are tested.
 
-   Stage three is what the second stage named but left empty: the USB
-   descriptor fetch and configuration select, interrupt polling, device
-   naming, power, USB port recovery, the HID read-IRP plumbing and the
-   control device object.
+   Stage three was THE INPUT PATH, end to end: the double-buffered polling
+   engine, the report queue and the reads waiting on it. That is the
+   driver's actual job - a packet goes from a completed URB through
+   core_on_raw_packet and out of a completed HID read - and all of it is
+   testable, so all of it is tested.
+
+   Stage four is the rest of what stage two named: the USB descriptor fetch
+   and configuration select, device naming, power, USB port recovery, and
+   the control device object with its command-block read/write channel.
 
    The 5332 lines of replacement written so far cover 24733 bytes of
    original, which is 4.6 bytes per line and is the ratio the estimates
@@ -317,14 +322,12 @@ Table of Contents
    | IOCTL and CDO plumbing   |  15 |  3009 |      501 | wdm.c     |
    | PnP and start/stop, rest |   9 |  1526 |      254 | wdm.c     |
    | device naming            |   6 |  1808 |      301 | wdm.c     |
-   | HID report IRP plumbing  |   6 |   768 |      128 | wdm.c     |
-   | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
    | power                    |   7 |  1225 |      204 | wdm.c     |
    | kernel glue              |   4 |   401 |       66 | wdm.c     |
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  55 |  9310 |     1551 |           |
+   | TOTAL REMAINING          |  47 |  7750 |     1291 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of

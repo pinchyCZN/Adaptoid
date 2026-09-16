@@ -5083,9 +5083,9 @@ static void wdm_reset(PADAPTOID_DEVEXT dx)
 		p[i] = 0;
 	}
 	core_init(&dx->Core, 0, 0);
-	AdaptoidLockInit(&dx->RemoveLockA);
-	AdaptoidLockInit(&dx->RemoveLockB);
-	KeInitializeSpinLock(&dx->Vendor.Lock);
+	AdaptoidDevExtInit(dx);
+	/* The transport tests drive the slot directly, so start it free. */
+	dx->PollStopMask = 0;
 	g_urb_count        = 0;
 	g_urb_len          = 0;
 	g_urb_ret          = STATUS_PENDING;
@@ -5427,12 +5427,6 @@ NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
 void AdaptoidSetDeviceName(PADAPTOID_DEVEXT DevExt)
 { (void)DevExt; pnp_note("name"); }
 
-void AdaptoidPollStart(PADAPTOID_DEVEXT DevExt, ULONG Reason)
-{ (void)DevExt; (void)Reason; pnp_note("pollstart"); }
-
-void AdaptoidPollStop(PADAPTOID_DEVEXT DevExt, ULONG Reason)
-{ (void)DevExt; (void)Reason; pnp_note("pollstop"); }
-
 void AdaptoidQuiesceIo(PADAPTOID_DEVEXT DevExt)
 { (void)DevExt; pnp_note("quiesce"); }
 
@@ -5758,11 +5752,18 @@ static int test_triage_pnp(void)
 		triage_irp(&irp, 0, 0, 0, 0);
 		g_sp.MinorFunction = IRP_MN_STOP_DEVICE;
 
+		g_hid_ext.PollStopMask = 0;
 		AdaptoidPnp(&g_hid_dev, &irp);
-		sched_expect(pnp_at("pollstop") == 0, "polling stops first",
-		             pnp_at("pollstop"), 0, &bad);
+		sched_expect((g_hid_ext.PollStopMask &
+		              ADAPTOID_STOP_REASON_PNP) != 0,
+		             "polling was stopped",
+		             (long)g_hid_ext.PollStopMask,
+		             ADAPTOID_STOP_REASON_PNP, &bad);
+		sched_expect(pnp_at("quiesce") == 0,
+		             "and quiesced before anything else", pnp_at("quiesce"),
+		             0, &bad);
 		sched_expect(pnp_at("unconfigure") < pnp_at("passdown"),
-		             "and the resources go BEFORE the IRP does",
+		             "the resources go BEFORE the IRP does",
 		             pnp_at("unconfigure") < pnp_at("passdown"), 1, &bad);
 		sched_expect(g_hid_ext.Started == 0, "the started flag is cleared",
 		             (long)g_hid_ext.Started, 0, &bad);
@@ -5871,6 +5872,488 @@ static int test_triage_pnp(void)
 	return bad;
 }
 
+/* ---- the OS edge of the poll loop and the read queue --------------- */
+
+static int   g_poll_submits;
+static ULONG g_poll_last_slot;
+static NTSTATUS g_poll_submit_ret = STATUS_PENDING;
+static int   g_poll_freed;
+static int   g_poll_cancels;
+static int   g_poll_restarts;
+static int   g_claim_refuse;        /* refuse to claim the next N reads */
+
+/* Stand-ins for the IRP and URB a real submit would allocate. */
+static IRP   g_poll_irp[ADAPTOID_POLL_SLOTS];
+static ULONG g_poll_urb[ADAPTOID_POLL_SLOTS];
+
+NTSTATUS AdaptoidPollSubmit(PADAPTOID_DEVEXT DevExt, ULONG Slot)
+{
+	g_poll_submits++;
+	g_poll_last_slot = Slot;
+	pnp_note("pollsubmit");
+	if (Slot < ADAPTOID_POLL_SLOTS) {
+		DevExt->PollSlot[Slot].Irp = &g_poll_irp[Slot];
+		DevExt->PollSlot[Slot].Urb = &g_poll_urb[Slot];
+	}
+	return g_poll_submit_ret;
+}
+
+void AdaptoidFreePollIrp(PIRP Irp, PVOID Urb)
+{ (void)Irp; (void)Urb; g_poll_freed++; }
+
+/*
+ * Cancelling a real IRP makes it COMPLETE, and it completes underneath the
+ * caller. Modelling that is what puts a completion between the stop's two
+ * passes - the interleaving the CancelLatch exists for, and one no test can
+ * reach if cancel is a no-op.
+ */
+static PADAPTOID_DEVEXT g_cancel_devext;
+static int              g_cancel_completes;
+
+void AdaptoidCancelIrp(PIRP Irp)
+{
+	ULONG i;
+
+	g_poll_cancels++;
+	if (!g_cancel_completes || g_cancel_devext == 0) {
+		return;
+	}
+	for (i = 0; i < ADAPTOID_POLL_SLOTS; i++) {
+		if (Irp == &g_poll_irp[i]) {
+			AdaptoidPollComplete(g_cancel_devext, i, STATUS_CANCELLED, 0);
+			return;
+		}
+	}
+}
+
+void AdaptoidQueuePollRestart(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; g_poll_restarts++; pnp_note("pollrestart"); }
+
+int AdaptoidClaimIrp(PIRP Irp)
+{
+	(void)Irp;
+	if (g_claim_refuse > 0) {
+		g_claim_refuse--;
+		return 0;
+	}
+	return 1;
+}
+
+/* What the last completed read carried. */
+static UCHAR g_read_data[CORE_REPORT_MAX_BYTES];
+static UCHAR g_read_len;
+static int   g_read_count;
+
+NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
+                              const UCHAR *Data, UCHAR Length)
+{
+	ULONG i;
+
+	(void)DevExt;
+	for (i = 0; i < Length && i < CORE_REPORT_MAX_BYTES; i++) {
+		g_read_data[i] = Data[i];
+	}
+	g_read_len = Length;
+	g_read_count++;
+	return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, Length), STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/* the input path: polling, the report queue, pending reads            */
+/* ------------------------------------------------------------------ */
+
+static void input_reset(PADAPTOID_DEVEXT dx)
+{
+	int i;
+	u8 *p = (u8 *)dx;
+
+	for (i = 0; i < (int)sizeof(*dx); i++) {
+		p[i] = 0;
+	}
+	core_init(&dx->Core, AdaptoidReportSink, dx);
+	AdaptoidDevExtInit(dx);
+	dx->Core.accessory_state = CORE_ACC_FOUND_1;   /* past the probe gate */
+
+	g_poll_submits     = 0;
+	g_poll_freed       = 0;
+	g_poll_cancels     = 0;
+	g_poll_restarts    = 0;
+	g_poll_submit_ret  = STATUS_PENDING;
+	g_claim_refuse     = 0;
+	g_cancel_completes = 0;
+	g_cancel_devext    = dx;
+	g_read_count       = 0;
+	g_read_len         = 0;
+	g_irp_count        = 0;
+	g_pnp_count        = 0;
+}
+
+static int test_input_path(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	static ADAPTOID_DEVEXT dx;
+	IRP reads[4];
+	int i;
+
+	/* ---- 1. starting polling submits both slots -------------------- */
+	{
+		input_reset(&dx);
+
+		sched_expect(dx.PollStopMask == ADAPTOID_STOP_REASON_PNP,
+		             "polling starts stopped",
+		             (long)dx.PollStopMask, ADAPTOID_STOP_REASON_PNP, &bad);
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+		sched_expect(dx.PollStopMask == 0, "the reason is cleared",
+		             (long)dx.PollStopMask, 0, &bad);
+		sched_expect(g_poll_submits == 2, "both slots go in flight",
+		             g_poll_submits, 2, &bad);
+
+		/* a second start does not submit four */
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+		sched_expect(g_poll_submits == 2,
+		             "starting twice does not double up", g_poll_submits, 2,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 2. a reason still held keeps polling stopped --------------- */
+	{
+		input_reset(&dx);
+		dx.PollStopMask = ADAPTOID_STOP_REASON_PNP |
+		                  ADAPTOID_STOP_REASON_ERROR;
+
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+		sched_expect(dx.PollStopMask == ADAPTOID_STOP_REASON_ERROR,
+		             "one reason cleared, one remains",
+		             (long)dx.PollStopMask, ADAPTOID_STOP_REASON_ERROR,
+		             &bad);
+		sched_expect(g_poll_submits == 0, "and nothing is submitted",
+		             g_poll_submits, 0, &bad);
+
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_ERROR);
+		sched_expect(g_poll_submits == 2, "clearing the last one starts it",
+		             g_poll_submits, 2, &bad);
+		groups++;
+	}
+
+	/* ---- 3. a good packet decodes and resubmits its slot ----------- */
+	{
+		input_reset(&dx);
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+		g_poll_submits = 0;
+
+		dx.PollSlot[0].Buffer[CORE_RAW_X]          = 40;
+		dx.PollSlot[0].Buffer[CORE_RAW_Y]          = 0;
+		dx.PollSlot[0].Buffer[CORE_RAW_STATUS]     = CORE_STATUS_VALID;
+		dx.PollSlot[0].Buffer[CORE_RAW_BUTTONS_HI] = 0;
+		dx.PollSlot[0].Buffer[CORE_RAW_BUTTONS_LO] = 0;
+
+		AdaptoidPollComplete(&dx, 0, STATUS_SUCCESS, ADAPTOID_POLL_BYTES);
+		sched_expect(g_poll_submits == 1, "the slot went straight back",
+		             g_poll_submits, 1, &bad);
+		sched_expect(g_poll_last_slot == 0, "the same slot",
+		             (long)g_poll_last_slot, 0, &bad);
+		sched_expect(dx.PollStopMask == 0, "and polling is still running",
+		             (long)dx.PollStopMask, 0, &bad);
+		/* the packet reached the core and produced a report */
+		sched_expect(dx.ReportCount == 1, "a report was queued",
+		             dx.ReportCount, 1, &bad);
+		sched_expect(dx.ReportQueue[0].Data[0] == CORE_REPORT_JOYSTICK,
+		             "the joystick report", dx.ReportQueue[0].Data[0],
+		             CORE_REPORT_JOYSTICK, &bad);
+		groups++;
+	}
+
+	/* ---- 4. a short read is an error, not a partial packet ---------- */
+	{
+		static const struct {
+			NTSTATUS st;
+			ULONG    len;
+			const char *what;
+		} BAD[] = {
+		  {STATUS_SUCCESS,      4, "a four-byte read"},
+		  {STATUS_SUCCESS,      6, "a six-byte read"},
+		  {STATUS_SUCCESS,      0, "an empty read"},
+		  {STATUS_UNSUCCESSFUL, 5, "a failed IRP"}
+		};
+		int k;
+
+		for (k = 0; k < 4; k++) {
+			input_reset(&dx);
+			AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+			g_poll_submits = 0;
+			dx.PollSlot[0].Buffer[CORE_RAW_STATUS] = CORE_STATUS_VALID;
+
+			AdaptoidPollComplete(&dx, 0, BAD[k].st, BAD[k].len);
+			if (g_poll_submits != 0 || dx.ReportCount != 0) {
+				hlog("  FAIL input %s was accepted\n", BAD[k].what);
+				bad++;
+			}
+			if ((dx.PollStopMask & ADAPTOID_STOP_REASON_ERROR) == 0) {
+				hlog("  FAIL input %s did not stop polling\n", BAD[k].what);
+				bad++;
+			}
+		}
+		sched_expect(1, "four malformed reads all rejected", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 5. the restart work is queued exactly once ---------------- */
+	{
+		input_reset(&dx);
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+
+		/* the first failure is not the last slot outstanding */
+		AdaptoidPollComplete(&dx, 0, STATUS_UNSUCCESSFUL, 0);
+		sched_expect(g_poll_restarts == 0,
+		             "the first failure does not queue the restart",
+		             g_poll_restarts, 0, &bad);
+
+		/* the second one is */
+		AdaptoidPollComplete(&dx, 1, STATUS_UNSUCCESSFUL, 0);
+		sched_expect(g_poll_restarts == 1,
+		             "the last one queues it, once", g_poll_restarts, 1,
+		             &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 2,
+		             "holding the remove lock across the work",
+		             dx.RemoveLockB.IoCount, 2, &bad);
+		groups++;
+	}
+
+	/* ---- 6. the cancel handshake frees exactly once ---------------- */
+	{
+		/* stop first, then complete: the stop latches, so completion
+		 * clears the latch and the stop frees */
+		input_reset(&dx);
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+		g_poll_freed = 0;
+
+		AdaptoidPollStop(&dx, ADAPTOID_STOP_REASON_PNP,
+		                 ADAPTOID_POLL_SLOTS);
+		sched_expect(g_poll_cancels == 2, "both reads were cancelled",
+		             g_poll_cancels, 2, &bad);
+		/*
+		 * The stop found the latch still set, so it CLEARED it and left
+		 * the freeing to the completion that has not run yet. Freeing
+		 * here would be freeing an IRP the stack still owns.
+		 */
+		sched_expect(g_poll_freed == 0, "the stop frees nothing yet",
+		             g_poll_freed, 0, &bad);
+
+		AdaptoidPollComplete(&dx, 0, STATUS_CANCELLED, 0);
+		AdaptoidPollComplete(&dx, 1, STATUS_CANCELLED, 0);
+		sched_expect(g_poll_freed == 2,
+		             "the completions free them, exactly twice",
+		             g_poll_freed, 2, &bad);
+
+		/* THE OTHER ORDER: complete first, then stop. The completion
+		 * finds the latch clear and frees; the stop must not free again. */
+		input_reset(&dx);
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+		g_poll_freed = 0;
+		dx.PollSlot[0].Buffer[CORE_RAW_STATUS] = 0;   /* rejected packet */
+		AdaptoidPollComplete(&dx, 0, STATUS_UNSUCCESSFUL, 0);
+		sched_expect(g_poll_freed == 1, "completion frees its own",
+		             g_poll_freed, 1, &bad);
+		AdaptoidPollComplete(&dx, 1, STATUS_UNSUCCESSFUL, 0);
+		sched_expect(g_poll_freed == 2, "and so does the other",
+		             g_poll_freed, 2, &bad);
+		AdaptoidPollStop(&dx, ADAPTOID_STOP_REASON_PNP,
+		                 ADAPTOID_POLL_SLOTS);
+		sched_expect(g_poll_freed == 2,
+		             "a later stop frees nothing a second time",
+		             g_poll_freed, 2, &bad);
+
+		/*
+		 * THE INTERLEAVED CASE, which is the one the latch is for: the
+		 * cancel completes the IRP underneath the stop, so the completion
+		 * runs between the stop's two passes. Exactly one of them must
+		 * free each slot.
+		 */
+		input_reset(&dx);
+		AdaptoidPollStart(&dx, ADAPTOID_STOP_REASON_PNP);
+		g_poll_freed       = 0;
+		g_cancel_completes = 1;
+		AdaptoidPollStop(&dx, ADAPTOID_STOP_REASON_PNP,
+		                 ADAPTOID_POLL_SLOTS);
+		sched_expect(g_poll_freed == 2,
+		             "an interleaved cancel frees each slot once",
+		             g_poll_freed, 2, &bad);
+		g_cancel_completes = 0;
+		groups++;
+	}
+
+	/* ---- 7. a report with no reader is queued ---------------------- */
+	{
+		input_reset(&dx);
+
+		core_hid_key_event(&dx.Core, 0x04, 1);
+		sched_expect(dx.ReportCount == 1, "queued with no reader",
+		             dx.ReportCount, 1, &bad);
+		sched_expect(g_read_count == 0, "and nothing completed",
+		             g_read_count, 0, &bad);
+
+		/* a read now takes it immediately */
+		sched_expect(AdaptoidReadReport(&dx, &reads[0]) == STATUS_SUCCESS,
+		             "a read is answered from the queue", 1, 1, &bad);
+		sched_expect(g_read_count == 1, "with a completion", g_read_count,
+		             1, &bad);
+		sched_expect(g_read_data[0] == CORE_REPORT_KEYBOARD,
+		             "carrying the report ID first", g_read_data[0],
+		             CORE_REPORT_KEYBOARD, &bad);
+		sched_expect(g_read_len == 13, "and the ID plus twelve bytes",
+		             g_read_len, 13, &bad);
+		sched_expect(dx.ReportCount == 0, "the queue is empty again",
+		             dx.ReportCount, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 8. a reader waiting is served the moment one arrives ------ */
+	{
+		input_reset(&dx);
+
+		sched_expect(AdaptoidReadReport(&dx, &reads[0]) == STATUS_PENDING,
+		             "a read with nothing queued parks", 1, 1, &bad);
+		sched_expect(dx.PendingReadCount == 1, "on the pending list",
+		             dx.PendingReadCount, 1, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 2,
+		             "holding the remove lock while parked",
+		             dx.RemoveLockB.IoCount, 2, &bad);
+
+		core_hid_mouse_button(&dx.Core, 1, 1);
+		sched_expect(g_read_count == 1, "and is served on arrival",
+		             g_read_count, 1, &bad);
+		sched_expect(g_read_data[0] == CORE_REPORT_MOUSE, "with the report",
+		             g_read_data[0], CORE_REPORT_MOUSE, &bad);
+		sched_expect(dx.ReportCount == 0, "which was never queued",
+		             dx.ReportCount, 0, &bad);
+		sched_expect(dx.PendingReadCount == 0, "and the reader is gone",
+		             dx.PendingReadCount, 0, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1, "with its lock returned",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 9. readers are served oldest first ------------------------ */
+	{
+		input_reset(&dx);
+		for (i = 0; i < 3; i++) {
+			AdaptoidReadReport(&dx, &reads[i]);
+		}
+		sched_expect(dx.PendingReadCount == 3, "three parked",
+		             dx.PendingReadCount, 3, &bad);
+
+		g_irp_last = 0;
+		core_hid_mouse_button(&dx.Core, 1, 1);
+		sched_expect(g_irp_last == &reads[0], "the first one is served",
+		             g_irp_last == &reads[0], 1, &bad);
+		core_hid_mouse_button(&dx.Core, 2, 1);
+		sched_expect(g_irp_last == &reads[1], "then the second",
+		             g_irp_last == &reads[1], 1, &bad);
+		sched_expect(dx.PendingReadCount == 1, "one still waiting",
+		             dx.PendingReadCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 10. a read cancellation claimed elsewhere is skipped ------ */
+	{
+		input_reset(&dx);
+		AdaptoidReadReport(&dx, &reads[0]);
+		AdaptoidReadReport(&dx, &reads[1]);
+
+		g_claim_refuse = 1;         /* cancellation took the first */
+		g_irp_last = 0;
+		core_hid_mouse_button(&dx.Core, 1, 1);
+
+		sched_expect(g_irp_last == &reads[1],
+		             "the report went to the next reader",
+		             g_irp_last == &reads[1], 1, &bad);
+		sched_expect(g_read_count == 1, "and only one was completed",
+		             g_read_count, 1, &bad);
+		sched_expect(dx.ReportCount == 0, "the report was not wasted",
+		             dx.ReportCount, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 11. a full queue discards the NEW report ------------------ */
+	{
+		input_reset(&dx);
+
+		/*
+		 * Each report must be DISTINGUISHABLE, or dropping the oldest and
+		 * dropping the newest look identical. Mouse moves carry their dx
+		 * in the payload and emit unconditionally.
+		 */
+		for (i = 0; i < ADAPTOID_REPORT_QUEUE_MAX + 20; i++) {
+			core_hid_mouse_move(&dx.Core, (s32)(s8)(1 + i), 0, 0);
+		}
+		sched_expect(dx.ReportCount == ADAPTOID_REPORT_QUEUE_MAX,
+		             "the queue filled", dx.ReportCount,
+		             ADAPTOID_REPORT_QUEUE_MAX, &bad);
+		sched_expect(dx.ReportsDropped == 20, "and dropped twenty",
+		             (long)dx.ReportsDropped, 20, &bad);
+
+		/* THE OLDEST SURVIVES - the opposite of the notification queue. */
+		sched_expect(dx.ReportQueue[dx.ReportHead].Data[2] == 1,
+		             "the FIRST report is still at the head",
+		             dx.ReportQueue[dx.ReportHead].Data[2], 1, &bad);
+		{
+			LONG tail = (dx.ReportHead + dx.ReportCount - 1) %
+			            ADAPTOID_REPORT_QUEUE_MAX;
+
+			sched_expect(dx.ReportQueue[tail].Data[2] ==
+			             ADAPTOID_REPORT_QUEUE_MAX,
+			             "and the hundredth is the newest kept",
+			             dx.ReportQueue[tail].Data[2],
+			             ADAPTOID_REPORT_QUEUE_MAX, &bad);
+		}
+		sched_expect(AdaptoidReadReport(&dx, &reads[0]) == STATUS_SUCCESS,
+		             "and can still be read", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 12. tearing down fails every parked read ------------------ */
+	{
+		input_reset(&dx);
+		for (i = 0; i < 3; i++) {
+			AdaptoidReadReport(&dx, &reads[i]);
+		}
+		g_irp_count = 0;
+
+		AdaptoidCancelPendingReads(&dx);
+		sched_expect(dx.PendingReadCount == 0, "all three withdrawn",
+		             dx.PendingReadCount, 0, &bad);
+		sched_expect(g_irp_count == 3, "and completed", g_irp_count, 3,
+		             &bad);
+		sched_expect(g_irp_status == STATUS_DELETE_PENDING,
+		             "as delete-pending", (long)g_irp_status,
+		             (long)STATUS_DELETE_PENDING, &bad);
+		groups++;
+	}
+
+	/* ---- 13. the device mask still gates the whole path ------------ */
+	{
+		input_reset(&dx);
+		dx.Core.devices_mask = CORE_DEVICE_JOYSTICK;   /* keyboard off */
+
+		AdaptoidReadReport(&dx, &reads[0]);
+		core_hid_key_event(&dx.Core, 0x04, 1);
+		sched_expect(g_read_count == 0,
+		             "a disabled report never reaches a reader",
+		             g_read_count, 0, &bad);
+		sched_expect(dx.ReportCount == 0, "nor the queue", dx.ReportCount,
+		             0, &bad);
+		sched_expect(dx.PendingReadCount == 1, "the reader is still parked",
+		             dx.PendingReadCount, 1, &bad);
+		groups++;
+	}
+
+	hlog("Input path             : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
@@ -5954,6 +6437,7 @@ int main(int argc, char **argv)
 	bad += test_control_device();
 	bad += test_wdm_transport();
 	bad += test_triage_pnp();
+	bad += test_input_path();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

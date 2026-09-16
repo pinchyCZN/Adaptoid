@@ -195,6 +195,10 @@ typedef struct _IRP {
 	/* The harness pre-builds both locations; the real thing walks an
 	 * array and the macros below hide the difference. */
 	PIO_STACK_LOCATION NextStackLocation;
+	/* The DDK keeps this in Tail.Overlay; see ADAPTOID_IRP_LIST_ENTRY. */
+	LIST_ENTRY         ListEntry;
+	PVOID              CancelRoutine;
+	BOOLEAN            Cancel;
 } IRP, *PIRP;
 
 /*
