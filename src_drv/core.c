@@ -318,10 +318,40 @@ void core_on_raw_packet(core_state *cs, const u8 *raw)
 	cs->prev_status = cs->status;
 
 	/*
-	 * TODO, all of which need state this layer does not own yet:
-	 * the accessory probe state machine, the on-controller tuning mode,
-	 * and the script override that lets a loaded script drive the stick
-	 * instead of the hardware. See ../docs/hid-descriptor.txt section 8.
+	 * The tuning mode, and the stick-moved rescan that only matters when
+	 * it is OFF: a live condition effect has to be re-evaluated when the
+	 * stick moves, because its output is computed from the stick.
+	 */
+	{
+		int kick = core_tune_update(cs, raw[CORE_RAW_BUTTONS_HI],
+		                           raw[CORE_RAW_BUTTONS_LO],
+		                           (s32)(s8)raw[CORE_RAW_X],
+		                           (s32)(s8)raw[CORE_RAW_Y]);
+
+		if (cs->tune_mode == 0 && cs->tune_strength != 0 &&
+		    (raw[CORE_RAW_X] != cs->prev_raw_x ||
+		     raw[CORE_RAW_Y] != cs->prev_raw_y)) {
+			int slot;
+
+			for (slot = 0; slot < CORE_EFFECT_SLOTS; slot++) {
+				if (cs->effect[slot].type == CORE_FX_TUNING &&
+				    cs->effect[slot].running) {
+					kick = 1;
+					break;
+				}
+			}
+		}
+		cs->prev_raw_x = raw[CORE_RAW_X];
+		cs->prev_raw_y = raw[CORE_RAW_Y];
+
+		if (kick) {
+			core_effect_kick(cs, cs->now_100ns);
+		}
+	}
+
+	/*
+	 * TODO: the script override, which lets a loaded script drive the
+	 * stick instead of the hardware. See ../docs/hid-descriptor.txt 8.
 	 */
 
 	core_zero(report, (u32)sizeof(report));
@@ -657,6 +687,15 @@ s32 core_effect_intensity(core_state *cs, s32 tick)
 	          + (transient * cs->tune_duty_complement * cs->tune_period)
 	            / 25000;
 
+	/*
+	 * In tuning mode the effect set is ignored entirely and the motor is
+	 * driven straight from the calibration, so what you feel is exactly
+	 * what you are adjusting.
+	 */
+	if (cs->tune_mode & CORE_TUNE_ACTIVE) {
+		intensity = (cs->tune_duty * cs->tune_period + 999) / 1000;
+	}
+
 	if (intensity < 1) {
 		intensity = 0;
 	} else if (intensity < 32) {
@@ -725,6 +764,27 @@ int core_effect_pulse(core_state *cs, s32 intensity, s32 base_tick)
 
 	if (cs->accumulator > 100) {
 		cs->accumulator = 100;
+	}
+
+	/*
+	 * Tuning mode drives the motor from a 12-slot counter instead of the
+	 * modulator, forcing a pulse for the first N slots of every twelve.
+	 * That gives a steady, obviously periodic buzz to calibrate against
+	 * rather than the dithered pattern the modulator produces.
+	 */
+	if (cs->tune_mode & CORE_TUNE_ACTIVE) {
+		s32 slots = cs->tune_duty_complement * cs->tune_period;
+
+		if (slots > 0) {
+			slots = (slots + 8000) / 11112 + 1;
+		}
+		if (cs->tune_counter < slots) {
+			pulse = 1;
+		}
+		cs->tune_counter++;
+		if (cs->tune_counter > 11) {
+			cs->tune_counter = 0;
+		}
 	}
 	return pulse;
 }
@@ -880,6 +940,135 @@ void core_effect_window(core_state *cs, s32 start_tick, u8 *payload)
 	cs->ring_head      = 0;
 	cs->ring_base_tick = start_tick;
 	core_effect_evaluate(cs, 1, start_tick, payload);
+}
+
+/* ------------------------------------------------------------------ */
+/* On-controller tuning mode                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Hold L + R + Z + Start and the controller stops being input: the stick
+ * and D-pad become live calibration controls for the motor. Nothing in user
+ * mode is involved, which is presumably the point - you can feel the motor
+ * while you adjust it.
+ *
+ *     stick X   the motor PERIOD, on a quadratic curve. About 250 at
+ *               centre and 1000 at full right.
+ *     stick Y   the DUTY cycle, 0 to 100, and its complement
+ *     D-pad     one of five STRENGTH presets
+ *
+ * The entry test accepts Reset in place of Start, because pressing
+ * L + R + Start is exactly what makes an N64 controller assert its own
+ * Reset bit - so the combination would otherwise be unusable.
+ */
+
+/* The five D-pad strength presets, indexed by the D-pad nibble. */
+static s32 core_tune_strength_for(u32 dpad)
+{
+	switch (dpad) {
+	case 0x1:                       /* D-right          */
+	case 0x2: return 25;            /* D-left           */
+	case 0x4: return 0;             /* D-down           */
+	case 0x5:                       /* D-down + right   */
+	case 0x6: return 12;            /* D-down + left    */
+	case 0x8: return 100;           /* D-up             */
+	case 0x9:                       /* D-up + right     */
+	case 0xA: return 50;            /* D-up + left      */
+	default:  return -1;            /* leave it alone   */
+	}
+}
+
+int core_tune_update(core_state *cs, u8 buttons_hi, u8 buttons_lo,
+                     s32 raw_x, s32 raw_y)
+{
+	s32 was_mode, x, y, period, duty, strength;
+	int kick = 0;
+
+	if (cs == 0) {
+		return 0;
+	}
+
+	/* Entry: L + R, no C buttons, Z, nothing else on the face, and either
+	 * Start or the Reset bit that L + R + Start itself asserts. */
+	if ((buttons_hi & CORE_BTN_HI_SHOULDER_C) == CORE_BTN_HI_LR &&
+	    (buttons_lo & CORE_BTN_LO_NO_START) == CORE_BTN_LO_Z &&
+	    ((buttons_hi & CORE_BTN_HI_RESET) ||
+	     (buttons_lo & CORE_BTN_LO_START))) {
+		if ((cs->tune_mode & CORE_TUNE_ACTIVE) == 0) {
+			cs->tune_period = 0;    /* a fresh entry starts from zero */
+		}
+		cs->tune_mode = CORE_TUNE_ACTIVE | CORE_TUNE_HELD;
+	}
+
+	was_mode = cs->tune_mode;
+
+	if (cs->tune_mode & CORE_TUNE_ACTIVE) {
+		/*
+		 * Y IS NEGATED HERE, exactly as it is for a normal report. In the
+		 * original that is not a separate step: the stick path overwrites
+		 * its Y local with the negated value and the tuning block, lower
+		 * in the same function, reads that local. So pushing the stick UP
+		 * lowers the duty cycle rather than raising it - confirmed by
+		 * emulation, where a full-up stick gives duty 0 and complement
+		 * 100.
+		 */
+		y = -raw_y;
+		if (y > 127) {
+			y = -128;               /* the same 8-bit wrap */
+		}
+
+		x = raw_x * CORE_STICK_SCALE;
+		y = y * CORE_STICK_SCALE;
+		if (x >  CORE_STICK_LIMIT) { x =  CORE_STICK_LIMIT; }
+		if (x < -CORE_STICK_LIMIT) { x = -CORE_STICK_LIMIT; }
+		if (y >  CORE_STICK_LIMIT) { y =  CORE_STICK_LIMIT; }
+		if (y < -CORE_STICK_LIMIT) { y = -CORE_STICK_LIMIT; }
+
+		x += CORE_STICK_LIMIT;              /* 0..2400 */
+		duty = (y + CORE_STICK_LIMIT) / 24; /* 0..100  */
+
+		/*
+		 * Period is quadratic in the stick, which spreads the useful
+		 * range over the travel instead of bunching it at one end.
+		 * Guarded against a divide by zero at the far left.
+		 */
+		if (x < 76 || x > 2399999) {
+			period = 0;
+		} else {
+			period = 2400000 / x;
+			period = 1000000000 / (period * period);
+		}
+
+		if (period != cs->tune_period || duty != cs->tune_duty) {
+			kick = 1;
+		}
+		cs->tune_period          = period;
+		cs->tune_duty            = duty;
+		cs->tune_duty_complement = 100 - duty;
+
+		strength = core_tune_strength_for(buttons_lo & CORE_BTN_LO_DPAD);
+		if (strength >= 0) {
+			cs->tune_strength = strength;
+		}
+	}
+
+	/*
+	 * Exit is two-stage, and the D-pad is deliberately not part of it so
+	 * that holding a direction keeps you in the mode.
+	 *
+	 * Releasing the shoulder and face buttons drops the HELD bit, leaving
+	 * the mode ACTIVE and still tracking the stick. Pressing any of them
+	 * again from that state leaves the mode altogether and kicks the
+	 * engine, so the new calibration takes effect.
+	 */
+	if ((buttons_hi & CORE_BTN_HI_SHOULDER_C) == 0 &&
+	    (buttons_lo & CORE_BTN_LO_FACE) == 0) {
+		cs->tune_mode = was_mode & ~CORE_TUNE_HELD;
+	} else if (was_mode == CORE_TUNE_ACTIVE) {
+		cs->tune_mode = 0;
+		kick = 1;
+	}
+	return kick;
 }
 
 /* ------------------------------------------------------------------ */

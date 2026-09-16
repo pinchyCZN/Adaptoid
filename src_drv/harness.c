@@ -1519,6 +1519,128 @@ static int test_pak_change(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* On-controller tuning mode                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Every expectation below was emulated out of drv_BuildJoystickReport with
+ * the button bytes and stick placed by hand and TuneMode seeded, then read
+ * back out of the device extension.
+ */
+static int test_tune_mode(void)
+{
+	core_state cs;
+	int bad = 0;
+	int k;
+
+	static const struct {
+		u8  hi, lo;
+		s32 x, y;
+		s32 mode_in;
+		s32 mode, period, duty, comp, strength;
+		const char *what;
+	} TUNE[] = {
+	  {0x30, 0x30,   0,   0, 0,  3,  250, 50, 50, 100, "enter with Start"   },
+	  {0xB0, 0x20,   0,   0, 0,  3,  250, 50, 50, 100, "enter with Reset"   },
+	  {0x30, 0x30,  75,   0, 3,  3, 1000, 50, 50, 100, "stick full right"   },
+	  {0x30, 0x30, -75,   0, 3,  3,    0, 50, 50, 100, "stick full left"    },
+	  {0x30, 0x30,   0,  75, 3,  3,  250,  0,100, 100, "full up: duty 0"    },
+	  {0x30, 0x30,   0, -75, 3,  3,  250,100,  0, 100, "full down: duty 100"},
+	  {0x30, 0x38,   0,   0, 3,  3,  250, 50, 50, 100, "D-up preset"        },
+	  {0x30, 0x34,   0,   0, 3,  3,  250, 50, 50,   0, "D-down preset"      },
+	  {0x30, 0x31,   0,   0, 3,  3,  250, 50, 50,  25, "D-right preset"     },
+	  {0x30, 0x35,   0,   0, 3,  3,  250, 50, 50,  12, "D-down and right"   },
+	  {0x00, 0x00,   0,   0, 3,  1,  250, 50, 50, 100, "release: held drops"},
+	  {0x00, 0x80,   0,   0, 1,  0,  250, 50, 50, 100, "press A: exit"      },
+	  {0x20, 0x30,   0,   0, 0,  0,  500, 50, 50, 100, "only L: no entry"   }
+	};
+
+	for (k = 0; k < (int)(sizeof(TUNE) / sizeof(TUNE[0])); k++) {
+		core_init(&cs, 0, 0);
+		cs.tune_mode = TUNE[k].mode_in;
+		/*
+		 * The two stick cases that move the period need it seeded, since
+		 * entry only zeroes it when the mode was not already active.
+		 */
+		if (TUNE[k].mode_in != 0) {
+			cs.tune_period = 250;
+		}
+		core_tune_update(&cs, TUNE[k].hi, TUNE[k].lo, TUNE[k].x, TUNE[k].y);
+
+		if (cs.tune_mode != TUNE[k].mode) {
+			hlog("  FAIL tune %-20s mode %d, want %d\n",
+			     TUNE[k].what, (int)cs.tune_mode, (int)TUNE[k].mode);
+			bad++;
+		}
+		if (cs.tune_period != TUNE[k].period) {
+			hlog("  FAIL tune %-20s period %d, want %d\n",
+			     TUNE[k].what, (int)cs.tune_period, (int)TUNE[k].period);
+			bad++;
+		}
+		if (cs.tune_duty != TUNE[k].duty ||
+		    cs.tune_duty_complement != TUNE[k].comp) {
+			hlog("  FAIL tune %-20s duty %d/%d, want %d/%d\n",
+			     TUNE[k].what, (int)cs.tune_duty,
+			     (int)cs.tune_duty_complement,
+			     (int)TUNE[k].duty, (int)TUNE[k].comp);
+			bad++;
+		}
+		if (cs.tune_strength != TUNE[k].strength) {
+			hlog("  FAIL tune %-20s strength %d, want %d\n",
+			     TUNE[k].what, (int)cs.tune_strength,
+			     (int)TUNE[k].strength);
+			bad++;
+		}
+		htrace("tune %-22s -> mode %d period %5d duty %3d comp %3d str %3d\n",
+		       TUNE[k].what, (int)cs.tune_mode, (int)cs.tune_period,
+		       (int)cs.tune_duty, (int)cs.tune_duty_complement,
+		       (int)cs.tune_strength);
+	}
+
+	/* Leaving the mode kicks the engine so the new calibration takes hold. */
+	core_init(&cs, 0, 0);
+	cs.tune_mode = CORE_TUNE_ACTIVE;
+	if (!core_tune_update(&cs, 0x00, 0x80, 0, 0)) {
+		hlog("  FAIL tune exit did not ask for a kick\n");
+		bad++;
+	}
+
+	/*
+	 * While tuning, the motor is driven from the calibration and not from
+	 * the effect set - so a window comes out even with nothing playing,
+	 * which is the whole point of being able to feel the adjustment.
+	 */
+	{
+		u8 pay[CORE_EFFECT_PAYLOAD];
+		int idle_pulses, tuning_pulses;
+
+		core_init(&cs, 0, 0);
+		core_effect_window(&cs, 0, pay);
+		idle_pulses = popcount32(pay);
+
+		core_init(&cs, 0, 0);
+		cs.tune_mode = CORE_TUNE_ACTIVE;
+		core_effect_window(&cs, 0, pay);
+		tuning_pulses = popcount32(pay);
+
+		if (idle_pulses != 0) {
+			hlog("  FAIL tune: idle produced %d pulses\n", idle_pulses);
+			bad++;
+		}
+		if (tuning_pulses == 0) {
+			hlog("  FAIL tune: tuning mode produced no pulses\n");
+			bad++;
+		}
+		htrace("tune drive: idle %d pulses, tuning %d pulses\n",
+		       idle_pulses, tuning_pulses);
+	}
+
+	hlog("Tuning mode            : %s (%d vectors)\n", bad ? "FAIL" : "ok",
+	     (int)(sizeof(TUNE) / sizeof(TUNE[0])) + 2);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1590,6 +1712,7 @@ int main(int argc, char **argv)
 	bad += test_effect_engine();
 	bad += test_effect_chain();
 	bad += test_pak_change();
+	bad += test_tune_mode();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

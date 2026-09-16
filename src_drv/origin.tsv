@@ -59,6 +59,8 @@ core_set_vendor_claim	core.c	new	-	-	-
 core_sine_lerp	core.c	port	wishk201.sys	000149a0	drv_SineLerp
 core_tick	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
 core_tick	core.c	part	wishk201.sys	00017980	drv_ScriptScheduler
+core_tune_strength_for	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
+core_tune_update	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
 core_zero	core.c	new	-	-	-
 ExAllocatePoolWithTag	harness.c	new	-	-	-
 ExFreePool	harness.c	new	-	-	-
@@ -97,6 +99,7 @@ test_effect_engine	harness.c	new	-	-	-
 test_joystick_report	harness.c	new	-	-	-
 test_pak_change	harness.c	new	-	-	-
 test_pak_crcs	harness.c	new	-	-	-
+test_tune_mode	harness.c	new	-	-	-
 usage	harness.c	new	-	-	-
 AdaptoidAddDevice	wdm.c	port	wishk201.sys	0001236e	drv_AddDevice
 AdaptoidCleanup	wdm.c	port	wishk201.sys	00011880	drv_CleanupTriage

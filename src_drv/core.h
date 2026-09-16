@@ -77,6 +77,29 @@ typedef signed   long long s64;
 #define CORE_STICK_STRETCH_DEF  10    /* octagon-to-square corner warp  */
 #define CORE_STICK_LIMIT        1200  /* 0x4B0, full scale on either axis */
 
+/*
+ * ON-CONTROLLER TUNING MODE.
+ *
+ * A live adjustment mode entered from the controller itself, with no user
+ * mode involved at all: hold L + R + Z + Start and the stick and D-pad stop
+ * being input and start being calibration controls for the motor.
+ *
+ * Masks are over the two raw button bytes. Remember the ordering: byte +4
+ * carries bit indices 0..7 and byte +3 carries 8..15, MSB first within each.
+ */
+#define CORE_BTN_HI_LR          0x30u   /* L and R, indices 10 and 11   */
+#define CORE_BTN_HI_SHOULDER_C  0x3Fu   /* L, R and the four C buttons  */
+#define CORE_BTN_HI_RESET       0x80u   /* index 8                      */
+#define CORE_BTN_LO_Z           0x20u   /* index 2                      */
+#define CORE_BTN_LO_START       0x10u   /* index 3                      */
+#define CORE_BTN_LO_NO_START    0xEFu   /* everything except Start      */
+#define CORE_BTN_LO_FACE        0xF0u   /* A, B, Z, Start               */
+#define CORE_BTN_LO_DPAD        0x0Fu   /* the four D-pad directions    */
+
+/* TuneMode is a two-bit state: bit 0 active, bit 1 the combination held. */
+#define CORE_TUNE_ACTIVE        0x1
+#define CORE_TUNE_HELD          0x2
+
 /* Report IDs, fixed by the composite descriptor in
  * ../docs/hid-descriptor.txt section 4. Keeping these values identical to the
  * original is deliberate: existing profiles and muscle memory depend on
@@ -404,6 +427,11 @@ typedef struct core_state {
 	s32             tune_duty_complement;
 	s32             tune_strength;
 
+	/* CORE_TUNE_*; non-zero means the stick is calibrating, not playing. */
+	s32             tune_mode;
+	u8              prev_raw_x;
+	u8              prev_raw_y;
+
 	/* The accessory probe. */
 	core_vendor_fn  vendor;
 	void           *vendor_ctx;
@@ -541,6 +569,19 @@ void core_set_vendor_claim(core_state *cs, core_vendor_claim_fn claim);
  * been idle long enough. If the vendor slot is busy the work is deferred.
  */
 void core_effect_on_pak_change(core_state *cs, int present);
+
+/*
+ * One poll of the tuning mode. Handles entry, the live adjustment and exit,
+ * and returns non-zero when the effect engine should be kicked - which
+ * happens on leaving the mode and whenever an adjustment actually changed a
+ * value. core_on_raw_packet calls it, so a driver does not have to.
+ *
+ * While the mode is active the stick and D-pad are NOT input: X sets the
+ * motor period on a quadratic curve, Y sets the duty cycle, and the D-pad
+ * picks one of five strength presets.
+ */
+int core_tune_update(core_state *cs, u8 buttons_hi, u8 buttons_lo,
+                     s32 raw_x, s32 raw_y);
 
 /*
  * core_effect_run claims the slot and runs one timer tick; core_effect_kick

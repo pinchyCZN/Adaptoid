@@ -465,7 +465,7 @@ Table of Contents
 
        stick X   devext+0x15E0 = 1e9 / (2400000 / v)^2, where v is the
                  clamped X plus 1200, giving 0..2400. About 250 at
-                 centre and 1000 at full right.
+                 centre and 1000 at full right. Below 76, v gives 0.
        stick Y   devext+0x15DC = (clamped Y + 1200) / 24, giving 0..100
                  devext+0x15D8 = 100 minus that
        D-pad     devext+0x15E8 from a fixed set:
@@ -475,9 +475,39 @@ Table of Contents
                      D-up + left/right   -> 50
                      D-up                -> 100
 
-   Releasing every button in the combination clears bit 1 of devext+0x15E4,
-   leaving 1. The next poll sees exactly 1, zeroes it and calls FUN_00013A60,
-   the effect engine rescan, committing the values.
+   THE Y USED HERE IS THE NEGATED ONE, which is easy to miss because the
+   negation is not part of the tuning code. The stick path earlier in the same
+   function overwrites its Y local with the HID-convention negated value, and
+   the tuning block further down reads that local. So pushing the stick UP
+   drives the duty cycle DOWN. Confirmed by emulation: full up gives duty 0
+   and complement 100, full down gives 100 and 0.
+
+   EXIT IS TWO-STAGE, and the D-pad is deliberately excluded from it so that
+   holding a direction keeps you in the mode:
+
+       releasing the shoulder and face buttons clears bit 1 of
+       devext+0x15E4, leaving 1 - still ACTIVE and still tracking the stick;
+
+       pressing any of those buttons again from that state zeroes it and
+       calls drv_EffectKick, committing the values.
+
+   So the mode is NOT left by releasing the combination. It is left by the
+   next button press after releasing it. An earlier revision of this section
+   said the next poll alone would zero it, which is wrong: with everything
+   released, every later poll takes the same branch and the mode stays at 1.
+   Verified by emulation.
+
+   WHAT THE MODE DOES TO THE ENGINE. Both branches sit inside
+   drv_EffectEvaluate and both bypass the effect set entirely:
+
+       intensity  replaced by (TuneDuty * TunePeriod + 999) / 1000
+       pulses     driven by a 12-slot counter instead of the modulator,
+                  forcing a pulse for the first N slots of every twelve,
+                  N = (TuneDutyComplement * TunePeriod + 8000) / 11112 + 1
+
+   So while tuning, the motor runs from the calibration alone and gives a
+   steady periodic buzz rather than the dithered pattern the modulator
+   produces - something to calibrate against.
 
    devext+0x15E8 then gates a scan of the 32 effect slots for one whose
    header field equals 0x40 and which is running.
