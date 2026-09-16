@@ -2627,6 +2627,467 @@ static int test_input_bind(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the native builtin library                                          */
+/* ------------------------------------------------------------------ */
+
+#define NAT_VARS   4
+
+/*
+ * Assemble "store the result of one builtin call into global 0".
+ *
+ *     LOAD &global0 ; PUSH          the destination, for the store at the end
+ *     [ LOC k ; PUSH ; LOAD v ; STORA ]   once per argument
+ *     CALL id
+ *     STORA                         global0 = the accumulator
+ *     RET
+ *
+ * The argument blocks return the stack to the depth they found it, so at the
+ * call the depth is 1 and LOC k names slot 1+k - exactly where the builtin
+ * reads argument k. That is the convention being exercised, not an accident
+ * of the encoding.
+ */
+static s32 nat_prog(u32 *c, u32 id, int argc, u32 a1, u32 a2)
+{
+	s32 n = 0;
+
+	c[n++] = 0x110;  c[n++] = CORE_TAG_GLOBAL | 0u;
+	c[n++] = 0x093;
+	if (argc >= 1) {
+		c[n++] = 0x192; c[n++] = 1;
+		c[n++] = 0x093;
+		c[n++] = 0x110; c[n++] = a1;
+		c[n++] = 0x231;
+	}
+	if (argc >= 2) {
+		c[n++] = 0x192; c[n++] = 2;
+		c[n++] = 0x093;
+		c[n++] = 0x110; c[n++] = a2;
+		c[n++] = 0x231;
+	}
+	c[n++] = 0x181; c[n++] = id;
+	c[n++] = 0x231;
+	c[n++] = 0x082;
+	return n;
+}
+
+/* Load that program as thread 0 and run one pass. */
+static void nat_run(core_sched *s, core_state *cs, u32 id, int argc,
+                    u32 a1, u32 a2, u64 now)
+{
+	u32 code[40];
+	s32 n = nat_prog(code, id, argc, a1, a2);
+
+	sched_test_open(s);
+	core_sched_set_core(s, cs);
+	core_sched_set_native(s, core_sched_native, s);
+	sched_reset_log();
+	core_sched_load(s, code, n, NAT_VARS, now);
+}
+
+static int test_natives(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_sched s;
+	core_state cs;
+
+	/* ---- 1. the builtins that post events -------------------------- */
+	{
+		static const struct {
+			u32 id;
+			u32 a1, a2;
+			u32 type, e1, e2;
+			const char *what;
+		} EV[] = {
+		  {CORE_FN_KEY,          0x04, 1, CORE_EVENT_KEY,          0x04, 1,
+		   "_key(A, down)"},
+		  {CORE_FN_KEY,          0xE1, 0, CORE_EVENT_KEY,          0xE1, 0,
+		   "_key(LShift, up)"},
+		  {CORE_FN_MOUSE_BUTTON, 2,    1, CORE_EVENT_MOUSE_BUTTON, 2,    1,
+		   "_mouse_button(2, down)"},
+		  {CORE_FN_MOUSE_REL,    0xFFFFFFF6u, 9, CORE_EVENT_MOUSE_REL,
+		   0xFFFFFFF6u, 9, "_mouse_relative(-10, 9)"},
+		  {CORE_FN_DEBUG,        111, 222, CORE_EVENT_DEBUG,       111, 222,
+		   "_debug(111, 222)"},
+		  /* clamped to 0..0xFFFF, both ends */
+		  {CORE_FN_MOUSE_ABS, 0xFFFFFFFBu, 70000, CORE_EVENT_MOUSE_ABS,
+		   0, 0xFFFF, "_mouse_absolute clamps"},
+		  {CORE_FN_MOUSE_ABS, 0x8000, 0x4000, CORE_EVENT_MOUSE_ABS,
+		   0x8000, 0x4000, "_mouse_absolute passes"}
+		};
+		int k;
+
+		for (k = 0; k < (int)(sizeof(EV) / sizeof(EV[0])); k++) {
+			core_init(&cs, 0, 0);
+			g_sched_live = 0;
+			nat_run(&s, &cs, EV[k].id, 2, EV[k].a1, EV[k].a2, 1000);
+
+			if (g_evcount != 1) {
+				hlog("  FAIL native %-24s posted %d events, want 1\n",
+				     EV[k].what, g_evcount);
+				bad++;
+			} else if (g_evlog[0].type != EV[k].type ||
+			           g_evlog[0].a1 != EV[k].e1 ||
+			           g_evlog[0].a2 != EV[k].e2) {
+				hlog("  FAIL native %-24s got (%u,%u,%u), want (%u,%u,%u)\n",
+				     EV[k].what, g_evlog[0].type, g_evlog[0].a1,
+				     g_evlog[0].a2, EV[k].type, EV[k].e1, EV[k].e2);
+				bad++;
+			}
+			htrace("native %-26s -> event %u (%u, %u)\n", EV[k].what,
+			       g_evlog[0].type, g_evlog[0].a1, g_evlog[0].a2);
+			core_sched_unload(&s);
+			sched_expect(g_sched_live == 0, "all memory returned",
+			             g_sched_live, 0, &bad);
+		}
+		groups++;
+	}
+
+	/* ---- 2. _button sets and clears HID button bits ----------------- */
+	{
+		core_init(&cs, 0, 0);
+		cs.buttons = 0;
+		g_sched_live = 0;
+		nat_run(&s, &cs, CORE_FN_BUTTON, 2, 1, 1, 1000);
+		sched_expect(cs.buttons == 0x0001, "_button(1, down)",
+		             cs.buttons, 0x0001, &bad);
+		core_sched_unload(&s);
+
+		nat_run(&s, &cs, CORE_FN_BUTTON, 2, 16, 1, 1000);
+		sched_expect(cs.buttons == 0x8001, "_button(16, down)",
+		             cs.buttons, 0x8001, &bad);
+		core_sched_unload(&s);
+
+		nat_run(&s, &cs, CORE_FN_BUTTON, 2, 1, 0, 1000);
+		sched_expect(cs.buttons == 0x8000, "_button(1, up)",
+		             cs.buttons, 0x8000, &bad);
+		core_sched_unload(&s);
+
+		/* out of range is ignored, not a fault */
+		nat_run(&s, &cs, CORE_FN_BUTTON, 2, 17, 1, 1000);
+		sched_expect(cs.buttons == 0x8000, "_button(17) ignored",
+		             cs.buttons, 0x8000, &bad);
+		sched_expect(s.fault_thread == 0, "and does not fault",
+		             s.fault_thread != 0, 0, &bad);
+		core_sched_unload(&s);
+
+		nat_run(&s, &cs, CORE_FN_BUTTON, 2, 0, 1, 1000);
+		sched_expect(cs.buttons == 0x8000, "_button(0) ignored",
+		             cs.buttons, 0x8000, &bad);
+		core_sched_unload(&s);
+		groups++;
+	}
+
+	/* ---- 3. _stick and _stick_relative, with the clamp -------------- */
+	{
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+
+		nat_run(&s, &cs, CORE_FN_STICK, 2, 300, 0xFFFFFED4u, 1000);
+		sched_expect(cs.stick_x == 300 && cs.stick_y == -300,
+		             "_stick(300, -300)", cs.stick_x, 300, &bad);
+		core_sched_unload(&s);
+
+		nat_run(&s, &cs, CORE_FN_STICK, 2, 9000, 0xFFFFDCD8u, 1000);
+		sched_expect(cs.stick_x == CORE_STICK_LIMIT, "_stick clamps high",
+		             cs.stick_x, CORE_STICK_LIMIT, &bad);
+		sched_expect(cs.stick_y == -CORE_STICK_LIMIT, "_stick clamps low",
+		             cs.stick_y, -CORE_STICK_LIMIT, &bad);
+		core_sched_unload(&s);
+
+		cs.stick_x = 100;
+		cs.stick_y = 100;
+		nat_run(&s, &cs, CORE_FN_STICK_REL, 2, 50, 0xFFFFFFCEu, 1000);
+		sched_expect(cs.stick_x == 150, "_stick_relative adds X",
+		             cs.stick_x, 150, &bad);
+		sched_expect(cs.stick_y == 50, "_stick_relative adds Y",
+		             cs.stick_y, 50, &bad);
+		core_sched_unload(&s);
+
+		cs.stick_x = 1190;
+		nat_run(&s, &cs, CORE_FN_STICK_REL, 2, 100, 0, 1000);
+		sched_expect(cs.stick_x == CORE_STICK_LIMIT,
+		             "_stick_relative clamps", cs.stick_x,
+		             CORE_STICK_LIMIT, &bad);
+		core_sched_unload(&s);
+		groups++;
+	}
+
+	/* ---- 4. _getpid, _time, and the ignored pair -------------------- */
+	{
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+
+		nat_run(&s, &cs, CORE_FN_GETPID, 0, 0, 0, 1000);
+		sched_expect(s.vm.vars[0] == 1, "_getpid of thread 0",
+		             (long)s.vm.vars[0], 1, &bad);
+		core_sched_unload(&s);
+
+		/* thread 0 wakes at the load time, so _time is 0 there */
+		nat_run(&s, &cs, CORE_FN_TIME, 0, 0, 0, 1000);
+		sched_expect(s.vm.vars[0] == 0, "_time at load", (long)s.vm.vars[0],
+		             0, &bad);
+		core_sched_unload(&s);
+
+		/* accepted, ignored, and NOT a fault - unlike an unknown id */
+		nat_run(&s, &cs, CORE_FN_STICK_SWAP, 2, 1, 2, 1000);
+		sched_expect(s.fault_thread == 0, "_stick_swap does not fault",
+		             s.fault_thread != 0, 0, &bad);
+		sched_expect(g_evcount == 0, "and posts nothing", g_evcount, 0,
+		             &bad);
+		core_sched_unload(&s);
+
+		nat_run(&s, &cs, CORE_FN_SET_RUMBLE, 2, 1, 2, 1000);
+		sched_expect(s.fault_thread == 0, "_set_rumble does not fault",
+		             s.fault_thread != 0, 0, &bad);
+		core_sched_unload(&s);
+
+		/* an unknown id IS a fault, status 8 */
+		nat_run(&s, &cs, 0x40000099u, 0, 0, 0, 1000);
+		sched_expect(s.fault_status == CORE_SCRIPT_BAD_NATIVE,
+		             "unknown builtin faults", s.fault_status,
+		             CORE_SCRIPT_BAD_NATIVE, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 5. _exit terminates without faulting ----------------------- */
+	{
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+		nat_run(&s, &cs, CORE_FN_EXIT, 0, 0, 0, 1000);
+
+		sched_expect(s.fault_thread == 0, "_exit is not a fault",
+		             s.fault_thread != 0, 0, &bad);
+		sched_expect(s.thread_count == 0, "and the thread is gone",
+		             s.thread_count, 0, &bad);
+		sched_expect(s.freepool.flink != &s.freepool,
+		             "its node went on the free pool", 1, 1, &bad);
+		core_sched_unload(&s);
+		groups++;
+	}
+
+	/* ---- 6. _sleep yields and resumes with 1 in the accumulator ----- */
+	{
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+		nat_run(&s, &cs, CORE_FN_SLEEP, 1, 250, 0, 1000);
+
+		sched_expect(s.thread_count == 1, "_sleep leaves it queued",
+		             s.thread_count, 1, &bad);
+		sched_expect(g_arm_time == 1000 + 250 * 10000,
+		             "armed 250ms later", (long)g_arm_time,
+		             1000 + 250 * 10000, &bad);
+		sched_expect(s.vm.vars[0] == 0, "nothing stored yet",
+		             (long)s.vm.vars[0], 0, &bad);
+
+		core_sched_run(&s, 1000 + 250 * 10000);
+		sched_expect(s.vm.vars[0] == 1, "_sleep returns 1 when it expires",
+		             (long)s.vm.vars[0], 1, &bad);
+		sched_expect(s.thread_count == 0, "and the thread finished",
+		             s.thread_count, 0, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 7. _wake cuts a sleep short and zeroes the accumulator ----- */
+	{
+		/*
+		 * Thread 0 sleeps 250ms and stores what _sleep returned. A second
+		 * thread, queued at pc `waker`, calls _wake(1). A sleep that runs
+		 * its course leaves 1; one that is cut short leaves 0, and that is
+		 * how a script tells the two apart.
+		 */
+		u32 code[48];
+		s32 n = nat_prog(code, CORE_FN_SLEEP, 1, 250, 0);
+		s32 waker = n;
+		core_sched_thread *t;
+
+		code[n++] = 0x192; code[n++] = 1;
+		code[n++] = 0x093;
+		code[n++] = 0x110; code[n++] = 1;      /* thread id 1 */
+		code[n++] = 0x231;
+		code[n++] = 0x181; code[n++] = CORE_FN_WAKE;
+		code[n++] = 0x082;
+
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_set_core(&s, &cs);
+		core_sched_set_native(&s, core_sched_native, &s);
+		sched_reset_log();
+		core_sched_load(&s, code, n, NAT_VARS, 1000);
+
+		sched_expect(s.thread_count == 1, "the sleeper is queued",
+		             s.thread_count, 1, &bad);
+
+		t = core_sched_thread_alloc(&s, 0);
+		t->pc        = waker;
+		t->wake_time = 2000;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 2000);
+
+		sched_expect(s.vm.vars[0] == 0,
+		             "_sleep returns 0 when woken early",
+		             (long)s.vm.vars[0], 0, &bad);
+		sched_expect(s.thread_count == 0, "both threads finished",
+		             s.thread_count, 0, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 8. _kill removes a thread and keeps the count honest ------- */
+	{
+		u32 code[48];
+		s32 n = nat_prog(code, CORE_FN_SLEEP, 1, 5000, 0);
+		s32 killer = n;
+		core_sched_thread *t;
+
+		code[n++] = 0x192; code[n++] = 1;
+		code[n++] = 0x093;
+		code[n++] = 0x110; code[n++] = 1;
+		code[n++] = 0x231;
+		code[n++] = 0x181; code[n++] = CORE_FN_KILL;
+		code[n++] = 0x082;
+
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_set_core(&s, &cs);
+		core_sched_set_native(&s, core_sched_native, &s);
+		sched_reset_log();
+		core_sched_load(&s, code, n, NAT_VARS, 1000);
+		sched_expect(s.thread_count == 1, "the victim is asleep",
+		             s.thread_count, 1, &bad);
+
+		t = core_sched_thread_alloc(&s, 0);
+		t->pc        = killer;
+		t->wake_time = 2000;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 2000);
+
+		sched_expect(s.thread_count == 0,
+		             "_kill decremented the count too", s.thread_count, 0,
+		             &bad);
+		sched_expect(s.vm.vars[0] == 0, "the victim never resumed",
+		             (long)s.vm.vars[0], 0, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 9. _fork: parent sees the child id, child sees zero -------- */
+	{
+		/*
+		 * Both halves resume at the instruction after the call, so the
+		 * only thing that tells them apart is the accumulator. The parent
+		 * stores the child id in global 0; the child takes the zero branch
+		 * and stores a marker in global 1, because storing the zero it
+		 * received would be indistinguishable from never having run.
+		 */
+		static const u32 FORK[] = {
+			0x181, CORE_FN_FORK,          /*  0 acc = child id, or 0     */
+			0x093,                        /*  2 push it                  */
+			0x172, 6,                     /*  3 if zero, go to 11        */
+			0x110, CORE_TAG_GLOBAL | 0u,  /*  5 parent: acc = &global0   */
+			0x230,                        /*  7 global0 = pop() = the id */
+			0x082,                        /*  8 ret                      */
+			0x082, 0x082,                 /*  9 never reached            */
+			0x294,                        /* 11 child: discard the zero  */
+			0x110, CORE_TAG_GLOBAL | 1u,  /* 12 acc = &global1           */
+			0x093,                        /* 14 push                     */
+			0x110, 77,                    /* 15 acc = 77                 */
+			0x231,                        /* 17 global1 = 77             */
+			0x082                         /* 18 ret                      */
+		};
+
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_set_core(&s, &cs);
+		core_sched_set_native(&s, core_sched_native, &s);
+		sched_reset_log();
+		core_sched_load(&s, FORK, (s32)(sizeof(FORK) / 4), NAT_VARS, 1000);
+
+		sched_expect(s.vm.vars[0] == 2, "parent got the child id",
+		             (long)s.vm.vars[0], 2, &bad);
+		sched_expect(s.vm.vars[1] == 77, "child took the zero branch",
+		             (long)s.vm.vars[1], 77, &bad);
+		sched_expect(s.thread_count == 0, "both threads finished",
+		             s.thread_count, 0, &bad);
+		sched_expect(s.fault_thread == 0, "neither faulted",
+		             s.fault_thread != 0, 0, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 10. _fork refuses past the thread ceiling ------------------ */
+	{
+		/*
+		 * Word 0 is a bare ret so thread 0 retires immediately; the fork
+		 * program sits at word 1 and is reached by a thread queued after
+		 * the ready list has been filled to the ceiling.
+		 */
+		static const u32 CAP[] = {
+			0x082,                        /* 0 thread 0: ret             */
+			0x110, CORE_TAG_GLOBAL | 0u,  /* 1 acc = &global0            */
+			0x093,                        /* 3 push                      */
+			0x181, CORE_FN_FORK,          /* 4 acc = id, or -1           */
+			0x231,                        /* 6 global0 = acc             */
+			0x082                         /* 7 ret                       */
+		};
+		core_sched_thread *t;
+		int k;
+
+		core_init(&cs, 0, 0);
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_set_core(&s, &cs);
+		core_sched_set_native(&s, core_sched_native, &s);
+		sched_reset_log();
+		core_sched_load(&s, CAP, (s32)(sizeof(CAP) / 4), NAT_VARS, 1000);
+		sched_expect(s.thread_count == 0, "thread 0 retired",
+		             s.thread_count, 0, &bad);
+
+		for (k = 0; k < CORE_SCHED_MAX_THREADS; k++) {
+			t = core_sched_thread_alloc(&s, 0);
+			t->pc        = 0;
+			t->wake_time = 999999;      /* parked, never due here */
+			core_sched_queue(&s, t);
+		}
+		t = core_sched_thread_alloc(&s, 0);
+		t->pc        = 1;
+		t->wake_time = 2000;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 2000);
+
+		sched_expect((s32)s.vm.vars[0] == -1,
+		             "_fork refuses at the ceiling",
+		             (long)(s32)s.vm.vars[0], -1, &bad);
+		sched_expect(s.thread_count == CORE_SCHED_MAX_THREADS,
+		             "and queued nothing", s.thread_count,
+		             CORE_SCHED_MAX_THREADS, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	hlog("Native builtins        : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -2702,6 +3163,7 @@ int main(int argc, char **argv)
 	bad += test_script();
 	bad += test_sched();
 	bad += test_input_bind();
+	bad += test_natives();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

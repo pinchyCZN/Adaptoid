@@ -7,26 +7,30 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Five defects have been found during reverse engineering: two
+   Nine defects have been found during reverse engineering: two
    arithmetic ones in wishk201.sys, a pair of unbounded string copies also
-   in the driver, a bounds check in the script interpreter that tests the
-   wrong value, and a race in wishh201.dll. This note records each one,
-   the exact condition that triggers it, what it would actually do, and
-   whether a user would be likely to notice. It also records claims that
-   were made here and later RETRACTED, in sections 3 and 7.
+   in the driver, a race in wishh201.dll, a bounds check in the script
+   interpreter that tests the wrong value, and four in the script engine's
+   native builtin library. This note records each one, the exact condition
+   that triggers it, what it would actually do, and whether a user would be
+   likely to notice. It also records claims that were made here and later
+   RETRACTED, in sections 3 and 7.
 
    The purpose is not to criticise a driver that shipped in 2001 and
    worked. It is to stop a clean-room replacement from faithfully
    reproducing a slip, and to record which observed behaviour is
    deliberate and which is accidental.
 
-   All five are in paths a normal session does not reach. Only one is in
-   the script interpreter, and that one is masked one instruction later
-   by a check that does fire, so it has no observable effect. None is in
-   the HID report descriptor, the keyboard or mouse report builders, or
-   the private IOCTL surface. A user running complex scripts would not
-   encounter any of them, which is consistent with the software's
-   reputation for robustness.
+   The first five are in paths a normal session does not reach. The four
+   in the builtin library, sections 10 to 13, are different: they sit in
+   _fork, _kill and _wake, which a concurrent script uses deliberately,
+   and two of them are reachable from an ordinary compiled script rather
+   than only from a hand-built one. They are still not the sort of thing a
+   simple remapping profile would hit, which is why the software's
+   reputation for robustness survives them.
+
+   None of the nine is in the HID report descriptor, the keyboard or mouse
+   report builders, or the private IOCTL surface.
 
 Table of Contents
 
@@ -38,7 +42,11 @@ Table of Contents
    6.  Defect 5: Unbounded String Copies Into Fixed Fields
    7.  RETRACTED: The Script State Field Is Not A Latch Bug
    8.  Defect 6: The Immediate Call Bounds-Checks The Wrong Value
-   9.  What Is Not Affected
+   9.  Defect 7: _fork Gives The Child The Parent's StackSize
+   10. Defect 8: _kill Never Decrements ThreadCount
+   11. Defect 9: _wake Leaves The Ready List Unsorted
+   12. Defect 10: The Native Argument Frame Is One Word Short
+   13. What Is Not Affected
 
 1.  Severity Summary
 
@@ -56,6 +64,15 @@ Table of Contents
        immediate call bounds      script engine    yes, but masked by
        check tests the wrong                       the next PC test,
        value                                       so it does nothing
+       _fork copies the parent   script engine    yes, whenever a
+       StackSize                                   script forks after
+                                                   a deep stack
+       _kill leaks ThreadCount   script engine    yes, disables
+                                                   _fork after 30
+       _wake leaves the list     script engine    yes, the wake is
+       unsorted                                    late or lost
+       native argument frame     script engine    no, needs a
+       over-reads at depth 200                     hand-built script
        (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
@@ -371,7 +388,155 @@ Table of Contents
    reproducing it would mean writing code that is wrong on purpose to
    preserve behaviour that cannot be observed.
 
-9.  What Is Not Affected
+9.  Defect 7: _fork Gives The Child The Parent's StackSize
+
+   Location:  drv_ScriptNativeCall, the _fork case, the copy at 00018a15
+
+   _fork allocates the child with drv_ScriptThreadAlloc(DevExt, depth),
+   where depth is the parent's CURRENT stack depth, and then copies the
+   whole 0x24-byte header from parent to child with one rep movsd:
+
+       00018a09  MOV EDX,[EAX+0x8]     ; save the child's own ThreadId
+       00018a0c  MOV ECX,0x9
+       00018a15  MOVSD.REP             ; 9 dwords = the entire header
+       00018a2c  MOV [EAX+0x8],EDX     ; restore ThreadId
+       00018a2f  MOV [EAX+0x10],0      ; SavedAcc = 0
+
+   Nine dwords is Link, ThreadId, Pc, SavedAcc, SavedDepth, WakeTime and
+   StackSize. Only ThreadId and SavedAcc are put back, so the child keeps
+   the PARENT'S StackSize while owning a node sized for the parent's
+   depth.
+
+   Trigger:  any fork by a thread whose StackSize exceeds its current
+   depth. StackSize is a high-water mark - drv_ScriptExecute raises it
+   whenever the stack outgrows the node and never lowers it - so a thread
+   that once ran deep and has since returned to a shallow frame is exactly
+   the case. Nothing exotic is needed: a script that calls a few levels
+   deep and then forks from the top level does it.
+
+   Effect:  the next time the child runs, the restore loop at 00017c10
+   copies StackSize words out of a node that holds far fewer, reading up
+   to (200 - 8) * 4 = 768 bytes of pool memory past the end of the
+   allocation. Those words land in the shared local region, where the
+   script can read them back as locals. It is an over-read only; the save
+   path writes just SavedDepth words, so nothing is corrupted.
+
+   Would a user notice:  not directly. Nothing crashes, because the read
+   stays inside the pool, and the junk sits in locals the script has not
+   initialised. It is a genuine out-of-bounds read and an information
+   leak into a script, not a visible malfunction.
+
+   In the replacement:  NOT reproduced. core_sched native_fork in
+   src_drv/sched.c copies the fields one at a time and the child keeps the
+   stack_size of the node it was actually given.
+
+10. Defect 8: _kill Never Decrements ThreadCount
+
+   Location:  drv_ScriptNativeCall, the _kill case
+
+   ThreadCount at devext+0x1658 is written in exactly three places, and a
+   search of the whole image confirms it: drv_ScriptLoad zeroes it,
+   drv_ScriptThreadQueue increments it, and drv_ScriptScheduler decrements
+   it when it takes a thread off the list to run. drv_ScriptNativeCall only
+   ever READS it, at 000189e1.
+
+   So _kill, which unlinks its victim from ReadyThreadList and pushes the
+   node onto FreeThreadList, leaves the count as if the thread were still
+   queued.
+
+   Trigger:  any _kill of another thread. Killing yourself falls through
+   into _exit and does not take this path.
+
+   Effect:  the count drifts upward by one per kill and never recovers.
+   _fork refuses once it exceeds 29:
+
+       000189e1  CMP dword ptr [EBP+0x1658], 0x1e
+       000189e8  JGE refuse
+
+   so after thirty kills _fork returns -1 for the rest of the script's
+   life, whatever the real thread count is. Only reloading the script
+   clears it, because that is the one place the count is zeroed.
+
+   Would a user notice:  yes, eventually, in a script that spawns and
+   kills helper threads in a loop - a hold-to-autofire pattern is exactly
+   that shape. The symptom is _fork quietly returning -1 and the script
+   losing its concurrency, with no error and no event.
+
+   In the replacement:  NOT reproduced. The count is decremented.
+
+11. Defect 9: _wake Leaves The Ready List Unsorted
+
+   Location:  drv_ScriptNativeCall, the _wake case
+
+   ReadyThreadList is kept sorted by WakeTime, which is what lets
+   drv_ScriptScheduler stop its sweep at the first thread that is not yet
+   due. _wake finds its target by walking that list and then writes the
+   new wake time into the node IN PLACE:
+
+       piVar9[6] = Thread->WakeTimeLow
+       piVar9[7] = Thread->WakeTimeHigh
+       piVar9[4] = 0                      ; SavedAcc, so the sleeper
+                                          ; learns it was woken early
+
+   The node is not moved. Since the target was asleep its old wake time
+   was later than the caller's, so after the write the list is out of
+   order.
+
+   Trigger:  _wake on a thread that is not the earliest sleeper.
+
+   Effect:  the woken thread sits behind a thread that is still not due,
+   and the sweep stops before reaching it. It does not run at the woken
+   time; it runs when the thread ahead of it becomes due. With
+
+       A asleep until 5000, B asleep until 9000, now 2000
+
+   waking B sets its time to 2000 but leaves it behind A, so B first runs
+   at 5000 - three seconds late. The timer is armed from the head, so
+   nothing corrects it earlier.
+
+   Would a user notice:  yes, as a script that responds late or appears to
+   miss a wake, and intermittently, since it depends on what else happens
+   to be sleeping. This is the most likely of the four to be seen in
+   practice and the hardest to attribute.
+
+   In the replacement:  NOT reproduced. The thread is unlinked and
+   requeued, so the list stays sorted.
+
+12. Defect 10: The Native Argument Frame Is One Word Short
+
+   Location:  drv_ScriptNativeCall, every case that reads ArgFrame[2]
+   Related:   the Vars allocation in drv_ScriptLoad
+
+   A native reads argument k from stack slot sp + k. Vars is allocated as
+   VarCount * 4 + 0x328, and 0x328 is 808 where the 200 locals need only
+   800, so the eight spare bytes are two extra words. That is not padding:
+   it is exactly the headroom a two-argument call needs at depth 199,
+   which is the deepest a script can address, since core index checking
+   rejects a local above 199 and opcode 0x192 therefore cannot name slot
+   200 or beyond.
+
+   It is one word short. The interpreter faults a depth only ABOVE 200, so
+   a script can reach depth 200 exactly, and a two-argument builtin called
+   there reads argument 2 from slot 202 - four bytes past the end of the
+   allocation.
+
+   Trigger:  a script that pushes to depth 200 and then calls a
+   two-argument builtin. The compiler does not emit that, so it needs a
+   hand-built download through IOCTL 0xb98c20f0.
+
+   Effect:  four bytes of adjacent pool are read and used as an argument.
+   Every consumer either clamps it, masks it, or passes it out as an event
+   argument, so the value is disclosed rather than acted on dangerously.
+   Nothing is written out of bounds.
+
+   Would a user notice:  no. It is not reachable from a compiled script,
+   and the argument could not have been written by the script anyway.
+
+   In the replacement:  NOT reproduced. native_arg bounds-checks the slot
+   and returns zero, which is indistinguishable from the original for any
+   argument a script could actually have set.
+
+13. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
@@ -382,8 +547,9 @@ Table of Contents
       100000-instruction budget. Its per-instruction PC check is sound;
       the one slip in its bounds checking is defect 6, section 8, and
       that slip is masked by the per-instruction check.
-   -  The native builtin library drv_ScriptNativeCall, including the
-      thread, sleep, button and stick primitives.
+   -  The input, button and stick primitives of the native builtin
+      library. Its THREAD primitives are not clean: see defects 7, 8 and
+      9, which are all in _fork, _kill and _wake.
    -  The keyboard and mouse report builders drv_HidKeyEvent,
       drv_HidMouseButtonEvent and drv_HidMouseMoveEvent, all of which
       assemble reports that match the descriptor byte for byte.
@@ -391,6 +557,7 @@ Table of Contents
    -  The private IOCTL surface and the dispatch wrapper triage.
    -  The Controller Pak CRCs, which are the genuine N64 algorithms.
 
-   A user writing complex scripts exercises every item in that list and
-   none of the five defects. That is the reason the software behaves
-   robustly in practice despite them.
+   A user writing complex scripts exercises every item in that list. That
+   no longer means they meet none of the defects: the three thread
+   primitives in sections 9 to 11 are reached by exactly the kind of
+   concurrent script this list was describing.

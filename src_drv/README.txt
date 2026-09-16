@@ -213,11 +213,11 @@ Table of Contents
    | core.c    |     1658 |   ~2100 | decode, effects, Pak CRCs, the N64    |
    |           |          |         | transaction, HID report state         |
    +-----------+----------+---------+---------------------------------------+
-   | script.c  |      382 |    ~570 | the bytecode interpreter and the      |
-   |           |          |         | native builtin library                |
+   | script.c  |      382 |     382 | the bytecode interpreter, and only    |
+   |           |          |         | that; it is finished                  |
    +-----------+----------+---------+---------------------------------------+
-   | sched.c   |      568 |    ~670 | thread pool, the scheduler, and the   |
-   |           |          |         | input binding that produces threads   |
+   | sched.c   |     1069 |    1069 | thread pool, scheduler, input         |
+   |           |          |         | binding, native builtins; finished    |
    +-----------+----------+---------+---------------------------------------+
    | ioctl.c   | not yet  |  ~1200  | the private IOCTL surface, the        |
    |           |          |         | control device, the notify queue      |
@@ -225,8 +225,15 @@ Table of Contents
    | wdm.c     |      195 |   ~1700 | DriverEntry, AddDevice, PnP, power,   |
    |           |          |         | polling, URB transport, device naming |
    +-----------+----------+---------+---------------------------------------+
-   | harness.c |     2474 |   ~3600 | main() and every test                 |
+   | harness.c |     3168 |   ~4000 | main() and every test                 |
    +-----------+----------+---------+---------------------------------------+
+
+   THE BUILTINS WENT INTO sched.c, NOT script.c as first planned. Eleven of
+   the seventeen are thread operations - _fork, _kill, _wake, _sleep, _exit,
+   _getpid - and the rest post events; all of that is scheduler state that
+   script.c deliberately cannot see. Moving them kept the layering intact at
+   the cost of one file being larger than estimated. The file SET is what
+   this section fixes, and that has not changed.
 
    WHY ioctl.c IS A FILE AND NOT PART OF wdm.c. It is not a size split. The
    IOCTL surface owns a DIFFERENT DEVICE OBJECT: drv_CreateControlDevice
@@ -239,11 +246,16 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 44 of the 146 functions in
-   wishk201.sys are ported, 14587 of 38690 bytes, so 38 percent by code
-   size. The 2608 lines written so far cover those 14587 bytes, which is 5.6
+   Measured against the Ghidra database: 46 of the 146 functions in
+   wishk201.sys are ported, 16331 of 38690 bytes, so 42 percent by code
+   size. The 3109 lines written so far cover those 16331 bytes, which is 5.3
    bytes of original per line of replacement and is the ratio the estimates
    below use.
+
+   THE WHOLE SCRIPT ENGINE IS NOW DONE: the interpreter, the thread
+   scheduler, the input binding and the native builtin library. What is left
+   is the OS-facing half of the driver plus two OS-free pieces, the N64
+   transaction and the HID report state machines.
 
    +--------------------------+-----+-------+----------+-----------+
    | Subsystem                | fns | bytes | ~C lines | Goes to   |
@@ -257,14 +269,12 @@ Table of Contents
    | N64 transaction          |   9 |  1360 |      226 | core.c    |
    | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
    | power                    |   7 |  1225 |      204 | wdm.c     |
-   | script natives           |   1 |  1120 |      186 | script.c  |
    | notification queue       |   6 |   832 |      138 | ioctl.c   |
    | kernel glue              |   8 |   703 |      117 | wdm.c     |
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
-   | script input binding     |   1 |   624 |      104 | sched.c   |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          | 102 | 24103 |     4017 |           |
+   | TOTAL REMAINING          | 100 | 22359 |     3726 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
@@ -283,17 +293,15 @@ Table of Contents
    | Piece                   | Specification                             |
    +=========================+===========================================+
    | Report descriptor       | ../docs/hid-descriptor.txt section 4      |
-   | Script input binding    | ../docs/script-bytecode.txt section 7     |
-   | Native builtins         | ../docs/script-bytecode.txt section 7     |
    | N64 transaction         | ../docs/usb-transport.txt                 |
    | PnP, power, URB plumbing| ../docs/driver-lifecycle.txt              |
    | Private IOCTL surface   | ../docs/ioctl-surface.txt                 |
    +-------------------------+-------------------------------------------+
 
-   Already ported, and specified where the table in section 1.1 points:
-   the raw packet decode, the joystick report, the accessory probe, the
-   Controller Pak CRCs, the effect engine and its ring, the bytecode
-   interpreter and the thread scheduler.
+   Already ported: the raw packet decode, the joystick report, the accessory
+   probe, the Controller Pak CRCs, the effect engine and its ring, and the
+   entire script engine - interpreter, scheduler, input binding and builtin
+   library, specified in ../docs/script-bytecode.txt sections 5, 6 and 9.
 
    Loading the driver is out of scope here. It is unsigned, and x64 Windows
    will not load an unsigned driver without test-signing mode; see

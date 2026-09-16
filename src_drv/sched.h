@@ -38,6 +38,9 @@
 /* drv_ScriptThreadAlloc clamps every request up to this many words. */
 #define CORE_SCHED_MIN_STACK    8
 
+/* _fork refuses once this many threads are on the ready list. */
+#define CORE_SCHED_MAX_THREADS  30
+
 /*
  * Event types, established in drv_DispatchEvents (00015e70) and named from
  * the compiler's own symbol table in wishd201.exe. Types 0..2 become real HID
@@ -75,6 +78,30 @@
 #define CORE_SCHED_SLOT_STICK   0x11  /* the stick moved     */
 #define CORE_SCHED_SLOT_PRE     0x12  /* anything, queued first */
 #define CORE_SCHED_SLOT_POST    0x13  /* anything, queued last  */
+
+/*
+ * The native builtin ids, tag 0x40000000. The names are established from the
+ * configurator's own symbol table: wishd201.exe predeclares them in
+ * cfg_PredeclareSymbols from a table at 00421350, and in ascending id order
+ * that table lines up one for one with the dispatch in drv_ScriptNativeCall.
+ */
+#define CORE_FN_BUTTON          0x40000000u   /* _button(n, state)         */
+#define CORE_FN_STICK           0x40000001u   /* _stick(x, y)              */
+#define CORE_FN_STICK_REL       0x40000002u   /* _stick_relative(dx, dy)   */
+#define CORE_FN_KEY             0x40000003u   /* _key(usage, down)         */
+#define CORE_FN_MOUSE_BUTTON    0x40000004u   /* _mouse_button(b, down)    */
+#define CORE_FN_MOUSE_REL       0x40000005u   /* _mouse_relative(dx, dy)   */
+#define CORE_FN_MOUSE_ABS       0x40000006u   /* _mouse_absolute(x, y)     */
+#define CORE_FN_EXIT            0x40000007u   /* _exit()                   */
+#define CORE_FN_TIME            0x40000008u   /* _time()                   */
+#define CORE_FN_SLEEP           0x40000009u   /* _sleep(ms)                */
+#define CORE_FN_WAKE            0x4000000Au   /* _wake(pid)                */
+#define CORE_FN_KILL            0x4000000Bu   /* _kill(pid)                */
+#define CORE_FN_FORK            0x4000000Cu   /* _fork()                   */
+#define CORE_FN_GETPID          0x4000000Du   /* _getpid()                 */
+#define CORE_FN_STICK_SWAP      0x4000000Eu   /* accepted and ignored      */
+#define CORE_FN_SET_RUMBLE      0x4000000Fu   /* accepted and ignored      */
+#define CORE_FN_DEBUG           0x40000010u   /* _debug(a, b)              */
 
 typedef struct core_sched_event {
 	u32 type;
@@ -138,6 +165,17 @@ typedef struct core_sched {
 	 */
 	core_script vm;
 	u32        *code;           /* our copy, freed on unload */
+
+	/*
+	 * The decoded controller state the builtins write: _button sets HID
+	 * button bits, _stick and _stick_relative set the axes. The report
+	 * builder reads them back, which is how a script takes over the stick.
+	 * Optional - the builtins that need it do nothing when it is null.
+	 */
+	core_state *cs;
+
+	/* When the script was loaded. _time measures from here. */
+	u64 load_time;
 
 	core_sched_thread ready;    /* list head sentinel, sorted by wake time */
 	core_sched_thread freepool; /* list head sentinel                      */
@@ -258,5 +296,14 @@ void core_sched_post_event(core_sched *s, u32 type, u32 arg1, u32 arg2);
  * no thread was queued.
  */
 int core_sched_on_input(core_sched *s, const u8 *raw, u64 now);
+
+/* Point the builtins at the decoded controller state they write. */
+void core_sched_set_core(core_sched *s, core_state *cs);
+
+/*
+ * The builtin library, installed by core_sched_init. Exposed so a caller can
+ * wrap or replace it; core_sched_set_native does that.
+ */
+int core_sched_native(void *ctx, core_script *vm, u32 id);
 
 #endif /* ADAPTOID_SCHED_H */

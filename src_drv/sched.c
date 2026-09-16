@@ -8,6 +8,9 @@
 
 #include "sched.h"
 
+/* Defined below; core_sched_init installs it. */
+int core_sched_native(void *ctx, core_script *vm, u32 id);
+
 /* ---- list primitives --------------------------------------------------- */
 
 static void list_init(core_sched_thread *head)
@@ -125,6 +128,8 @@ void core_sched_init(core_sched *s, core_sched_alloc_fn alloc,
 	s->pending_valid = 0;
 	s->pending_time  = 0;
 
+	s->cs           = 0;
+	s->load_time    = 0;
 	s->current      = 0;
 	s->fault_thread = 0;
 	s->fault_vars   = 0;
@@ -152,6 +157,17 @@ void core_sched_init(core_sched *s, core_sched_alloc_fn alloc,
 	s->arm_ctx   = 0;
 	s->emit      = 0;
 	s->emit_ctx  = 0;
+
+	/* The builtin library is on by default; a caller that wants something
+	 * else installs it with core_sched_set_native. */
+	core_script_set_native(&s->vm, core_sched_native, s);
+}
+
+void core_sched_set_core(core_sched *s, core_state *cs)
+{
+	if (s != 0) {
+		s->cs = cs;
+	}
 }
 
 void core_sched_set_arm(core_sched *s, core_sched_arm_fn fn, void *ctx)
@@ -358,6 +374,7 @@ int core_sched_load(core_sched *s, const u32 *code, s32 code_count,
 	s->vm.var_count  = var_count;
 
 	s->sched_time = now;
+	s->load_time  = now;
 	s->budget     = CORE_SCRIPT_BUDGET;
 
 	t = core_sched_thread_alloc(s, 0);
@@ -486,6 +503,305 @@ static void sched_fault(core_sched *s, core_sched_thread *t, int status)
 	sched_free(s, old_vars);
 
 	core_sched_post_event(s, CORE_EVENT_FAULT, (u32)status, s->device_tag);
+}
+
+/*
+ * THE NATIVE BUILTIN LIBRARY - the scripting language's standard library.
+ *
+ * drv_ScriptNativeCall (000186a0) is the original. The names are established
+ * rather than inferred: wishd201.exe predeclares them in cfg_PredeclareSymbols
+ * from a table at 00421350, and read in ascending id order that table lines up
+ * one for one with the dispatch below.
+ *
+ * THE ARGUMENT CONVENTION. A native reads its arguments from the slots ABOVE
+ * the operand stack pointer: argument k is stack slot sp + k, one based. The
+ * caller puts them there with opcode 0x192, which yields the address of local
+ * (depth + operand), and never pushes them, so sp is unchanged by the call and
+ * the caller does not clean up.
+ *
+ * That also settles how a SCRIPT function receives arguments, which an earlier
+ * pass left open. Opcode 0x181 pushes the return address at slot sp before
+ * jumping, so the callee runs at depth sp+1 and its own local 0 is slot sp+1 -
+ * the same slot the caller wrote argument 1 into. The two conventions are one
+ * convention. A thread created by the input binding starts at depth 0 with its
+ * arguments already at slots 0, 1, ... for the same reason: there is no return
+ * address to push.
+ *
+ * A native returns its value by writing the accumulator, and yields or stops
+ * by returning a status other than CORE_SCRIPT_RUNNING.
+ */
+
+
+/* A millisecond in 100ns units. */
+#define CORE_MS_100NS           10000
+
+/*
+ * Argument k, one based, from the slots above the stack pointer.
+ *
+ * BOUNDS-CHECKED, and the original is not. Its Vars allocation carries eight
+ * bytes past the 200 locals - two spare words, which is exactly enough for a
+ * two-argument call made at depth 199, so the slack is argument headroom and
+ * not padding. It is one word short: a call at depth 200, which the interpreter
+ * permits because only a depth ABOVE 200 faults, reads argument 2 from four
+ * bytes past the end of the allocation. A script cannot put a value there -
+ * core_script_var_index rejects a local index above 199, so opcode 0x192 cannot
+ * address it - which makes the over-read reachable but never useful. Returning
+ * zero is both safe and indistinguishable for any script that could have
+ * written the argument.
+ */
+static u32 native_arg(core_script *vm, s32 k)
+{
+	s32 slot = vm->sp + k;
+
+	if (slot < 0 || slot >= CORE_SCRIPT_LOCALS) {
+		return 0;
+	}
+	return vm->vars[vm->var_count + slot];
+}
+
+static s32 clamp_s32(s32 v, s32 lo, s32 hi)
+{
+	if (v < lo) {
+		return lo;
+	}
+	if (v > hi) {
+		return hi;
+	}
+	return v;
+}
+
+/* Find a thread on the ready list by id, or 0. */
+static core_sched_thread *find_thread(core_sched *s, u32 id)
+{
+	core_sched_thread *t;
+
+	for (t = s->ready.flink; t != &s->ready; t = t->flink) {
+		if (t->thread_id == id) {
+			return t;
+		}
+	}
+	return 0;
+}
+
+/*
+ * _fork. The child resumes at the same pc with a copy of the parent's live
+ * stack, so the parent sees the child's id in the accumulator and the child
+ * sees zero.
+ *
+ * DIVERGENCE, and it fixes a real over-read. The original copies the whole
+ * 0x24-byte header from parent to child with one rep movsd at 00018a15 and
+ * then restores only ThreadId and SavedAcc - so the child keeps the PARENT's
+ * StackSize while owning a node that drv_ScriptThreadAlloc sized for the
+ * parent's current DEPTH. A thread whose stack was once deep and is now
+ * shallow therefore forks a child whose StackSize exceeds its allocation, and
+ * the next drv_ScriptExecute restores that many words from the short node,
+ * reading up to 768 bytes of pool past its end into the script's own locals.
+ * Here the fields are copied one at a time and the child keeps the stack_size
+ * of the node it actually got. See ../docs/known-defects.txt.
+ */
+static int native_fork(core_sched *s, core_script *vm)
+{
+	core_sched_thread *parent = s->current;
+	core_sched_thread *child;
+	s32 depth = vm->sp;
+	s32 i;
+
+	if (s->thread_count > CORE_SCHED_MAX_THREADS - 1) {
+		vm->acc = (u32)-1;
+		return CORE_SCRIPT_RUNNING;
+	}
+	if (depth < 0) {
+		depth = 0;
+	}
+	child = core_sched_thread_alloc(s, depth);
+	if (child == 0) {
+		vm->acc = (u32)-1;
+		return CORE_SCRIPT_RUNNING;
+	}
+
+	/* Everything the header copy carries, EXCEPT stack_size and the list
+	 * links, and with thread_id and saved_acc as the original restores them. */
+	child->pc          = vm->pc;
+	child->saved_depth = depth;
+	child->wake_time   = parent->wake_time;
+	child->saved_acc   = 0;
+
+	for (i = 0; i < depth && i < child->stack_size; i++) {
+		child->stack[i] = vm->vars[vm->var_count + i];
+	}
+
+	/* The parent's own saved depth is written here too; it is already this
+	 * value, but the original stores it and so does this. */
+	parent->saved_depth = depth;
+
+	vm->acc = child->thread_id;
+	core_sched_queue(s, child);
+	return CORE_SCRIPT_RUNNING;
+}
+
+int core_sched_native(void *ctx, core_script *vm, u32 id)
+{
+	core_sched *s = (core_sched *)ctx;
+	core_state *cs;
+	u32 a1, a2;
+
+	if (s == 0 || vm == 0 || s->current == 0) {
+		return CORE_SCRIPT_BAD_NATIVE;
+	}
+	cs = s->cs;
+	a1 = native_arg(vm, 1);
+	a2 = native_arg(vm, 2);
+
+	switch (id) {
+
+	case CORE_FN_BUTTON: {
+		/* n is 1..16, a HID button number, not a raw bit index. Out of
+		 * range is silently ignored, not a fault. */
+		s32 n = (s32)a1;
+
+		if (cs != 0 && n > 0 && n < 17) {
+			u16 bit = (u16)(1u << (n - 1));
+
+			if (a2 == 0) {
+				cs->buttons = (u16)(cs->buttons & (u16)~bit);
+			} else {
+				cs->buttons = (u16)(cs->buttons | bit);
+			}
+		}
+		return CORE_SCRIPT_RUNNING;
+	}
+
+	case CORE_FN_STICK:
+	case CORE_FN_STICK_REL:
+		if (cs != 0) {
+			s32 x = (s32)a1;
+			s32 y = (s32)a2;
+
+			if (id == CORE_FN_STICK_REL) {
+				x += cs->stick_x;
+				y += cs->stick_y;
+			}
+			cs->stick_x = (s16)clamp_s32(x, -CORE_STICK_LIMIT,
+			                                 CORE_STICK_LIMIT);
+			cs->stick_y = (s16)clamp_s32(y, -CORE_STICK_LIMIT,
+			                                 CORE_STICK_LIMIT);
+		}
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_KEY:
+		core_sched_post_event(s, CORE_EVENT_KEY, a1, a2);
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_MOUSE_BUTTON:
+		core_sched_post_event(s, CORE_EVENT_MOUSE_BUTTON, a1, a2);
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_MOUSE_REL:
+		core_sched_post_event(s, CORE_EVENT_MOUSE_REL, a1, a2);
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_MOUSE_ABS:
+		/* An absolute 16-bit pointer position, 0x8000 the centre. The
+		 * relative mouse collection cannot express this, which is why it
+		 * goes to user mode instead of becoming a HID report. */
+		core_sched_post_event(s, CORE_EVENT_MOUSE_ABS,
+		                      (u32)clamp_s32((s32)a1, 0, 0xFFFF),
+		                      (u32)clamp_s32((s32)a2, 0, 0xFFFF));
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_DEBUG:
+		core_sched_post_event(s, CORE_EVENT_DEBUG, a1, a2);
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_EXIT:
+		return CORE_SCRIPT_TERMINATED;
+
+	case CORE_FN_TIME:
+		/*
+		 * Milliseconds since the script loaded - measured from this
+		 * THREAD'S WAKE TIME, not from the clock. Two threads in the same
+		 * pass can therefore see different times, and a thread sees the
+		 * time it was scheduled for rather than the time it ran.
+		 */
+		vm->acc = (u32)(s32)((s64)(s->current->wake_time - s->load_time)
+		                     / CORE_MS_100NS);
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_SLEEP:
+		/*
+		 * Relative to this thread's CURRENT wake time, not to now, so a
+		 * loop of sleeps does not drift by however long each pass took.
+		 * The original multiplies in 32 bits, so a sleep beyond about
+		 * 214748 ms wraps; reproduced, because a script relying on that
+		 * is already broken and widening it would change behaviour.
+		 */
+		s->current->wake_time += (u64)(s64)(s32)((s32)a1 * CORE_MS_100NS);
+		vm->acc = 1;
+		return CORE_SCRIPT_SLEEPING;
+
+	case CORE_FN_WAKE: {
+		/*
+		 * Reschedule another thread for this thread's wake time and clear
+		 * its accumulator, which is how it learns it was woken early: a
+		 * _sleep that runs to completion leaves 1 there.
+		 *
+		 * DIVERGENCE: the thread is requeued so the ready list stays
+		 * sorted. The original writes the wake time in place and leaves
+		 * the node where it was, which breaks the sort the scheduler
+		 * relies on - see ../docs/known-defects.txt.
+		 */
+		core_sched_thread *t = find_thread(s, a1);
+
+		if (t != 0) {
+			t->wake_time = s->current->wake_time;
+			t->saved_acc = 0;
+			list_unlink(t);
+			s->thread_count--;
+			core_sched_queue(s, t);
+		}
+		return CORE_SCRIPT_RUNNING;
+	}
+
+	case CORE_FN_KILL: {
+		core_sched_thread *t;
+
+		if (s->current->thread_id == a1) {
+			return CORE_SCRIPT_TERMINATED;   /* killing yourself is _exit */
+		}
+		t = find_thread(s, a1);
+		if (t != 0) {
+			list_unlink(t);
+			/* DIVERGENCE: the count is decremented. The original does not,
+			 * so every kill permanently inflates it and thirty fork-and-kill
+			 * pairs disable _fork for good. See ../docs/known-defects.txt. */
+			s->thread_count--;
+			thread_release(s, t);
+		}
+		return CORE_SCRIPT_RUNNING;
+	}
+
+	case CORE_FN_FORK:
+		return native_fork(s, vm);
+
+	case CORE_FN_GETPID:
+		vm->acc = s->current->thread_id;
+		return CORE_SCRIPT_RUNNING;
+
+	case CORE_FN_STICK_SWAP:
+	case CORE_FN_SET_RUMBLE:
+		/*
+		 * ACCEPTED AND IGNORED, deliberately. Both get their own case in
+		 * the original and both do nothing - no return value, no status.
+		 * That is distinct from an unknown id, which faults with status 8.
+		 * The compiler accepts a call to either and the driver discards it
+		 * without complaint. _set_rumble reads as force feedback that moved
+		 * out to the separate rumble driver.
+		 */
+		return CORE_SCRIPT_RUNNING;
+
+	default:
+		return CORE_SCRIPT_BAD_NATIVE;
+	}
 }
 
 /*

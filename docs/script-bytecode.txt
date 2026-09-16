@@ -41,6 +41,8 @@ Table of Contents
    8.  Consequences For The Replacement Driver
    9.  The Thread Scheduler
    9.7.  Input Binding
+   9.8.  The Calling Convention
+   9.9.  The Native Builtin Library
    10. Open Questions
 
 1.  Evidence That It Is Flex And Bison
@@ -849,14 +851,142 @@ Table of Contents
    A failed thread allocation silently drops that handler. The original has
    no other response and neither does the replacement.
 
+9.8.  The Calling Convention
+
+   A native reads argument k, one based, from stack slot sp + k - the slots
+   ABOVE the operand stack pointer. The caller puts them there with opcode
+   0x192, which yields the address of local (depth + operand), and never
+   pushes them, so sp is the same after the call as before and there is
+   nothing to clean up.
+
+   THAT ALSO SETTLES HOW A SCRIPT FUNCTION RECEIVES ITS ARGUMENTS, which
+   earlier revisions of this document left open. Opcode 0x181 pushes the
+   return address at slot sp before jumping, so the callee runs at depth
+   sp+1 and its own local 0 is slot sp+1 - the same slot the caller wrote
+   argument 1 into. The two are one convention, seen from either side:
+
+       caller at depth d          writes arg k to slot d + k via 0x192
+       native called at depth d   reads  arg k from slot d + k
+       script fn called at d      runs at depth d+1, arg k is its local k-1
+
+   A thread created by the input binding starts at depth 0 with its
+   arguments already at slots 0, 1, ... for the same reason: no return
+   address was pushed, so its local 0 is argument 1.
+
+   A native returns a value by writing the accumulator and yields or stops
+   by writing a status. The caller is responsible for any stack it
+   reserved.
+
+9.9.  The Native Builtin Library
+
+   drv_ScriptNativeCall (000186a0) is the standard library. The names are
+   established rather than inferred: wishd201.exe predeclares them in
+   cfg_PredeclareSymbols from a table at 00421350, and read in ascending id
+   order that table lines up one for one with the dispatch.
+
+   +------------+---------------------+---------------------------------+
+   | Id         | Name                | Behaviour                       |
+   +============+=====================+=================================+
+   | 0x40000000 | _button(n, state)   | n is 1..16, a HID button        |
+   |            |                     | number; sets or clears that bit |
+   |            |                     | of CurButtons. Out of range is  |
+   |            |                     | ignored, not a fault.           |
+   +------------+---------------------+---------------------------------+
+   | 0x40000001 | _stick(x, y)        | absolute, clamped to +/-1200,   |
+   |            |                     | the range the joystick          |
+   |            |                     | collection declares             |
+   +------------+---------------------+---------------------------------+
+   | 0x40000002 | _stick_relative     | adds to the current position,   |
+   |            | (dx, dy)            | same clamp                      |
+   +------------+---------------------+---------------------------------+
+   | 0x40000003 | _key(usage, down)   | event type 0                    |
+   +------------+---------------------+---------------------------------+
+   | 0x40000004 | _mouse_button       | event type 1                    |
+   |            | (b, down)           |                                 |
+   +------------+---------------------+---------------------------------+
+   | 0x40000005 | _mouse_relative     | event type 2                    |
+   |            | (dx, dy)            |                                 |
+   +------------+---------------------+---------------------------------+
+   | 0x40000006 | _mouse_absolute     | event type 3, both arguments    |
+   |            | (x, y)              | clamped to 0..0xFFFF            |
+   +------------+---------------------+---------------------------------+
+   | 0x40000007 | _exit()             | status 1, thread terminated     |
+   +------------+---------------------+---------------------------------+
+   | 0x40000008 | _time()             | milliseconds since the script   |
+   |            |                     | loaded, measured from THIS      |
+   |            |                     | THREAD'S wake time              |
+   +------------+---------------------+---------------------------------+
+   | 0x40000009 | _sleep(ms)          | adds ms to this thread's wake   |
+   |            |                     | time and yields with status 9;  |
+   |            |                     | returns 1                       |
+   +------------+---------------------+---------------------------------+
+   | 0x4000000A | _wake(pid)          | reschedules that thread for the |
+   |            |                     | caller's wake time and zeroes   |
+   |            |                     | its accumulator                 |
+   +------------+---------------------+---------------------------------+
+   | 0x4000000B | _kill(pid)          | unlinks it and returns the node |
+   |            |                     | to the free pool; killing       |
+   |            |                     | yourself is _exit               |
+   +------------+---------------------+---------------------------------+
+   | 0x4000000C | _fork()             | child resumes at the same pc    |
+   |            |                     | with a copy of the live stack;  |
+   |            |                     | parent gets the child id, child |
+   |            |                     | gets 0, -1 if refused           |
+   +------------+---------------------+---------------------------------+
+   | 0x4000000D | _getpid()           | this thread's id                |
+   +------------+---------------------+---------------------------------+
+   | 0x4000000E | _stick_swap         | ACCEPTED AND IGNORED            |
+   +------------+---------------------+---------------------------------+
+   | 0x4000000F | _set_rumble         | ACCEPTED AND IGNORED            |
+   +------------+---------------------+---------------------------------+
+   | 0x40000010 | _debug(a, b)        | event type 0x4D, a script trace |
+   |            |                     | channel rather than input       |
+   +------------+---------------------+---------------------------------+
+   | anything   |                     | status 8, unknown builtin       |
+   | else       |                     |                                 |
+   +------------+---------------------+---------------------------------+
+
+   TWO BUILTINS ARE SILENTLY DEAD. _stick_swap and _set_rumble each get
+   their own switch case and each does nothing - no return value, no
+   status. That is deliberate and distinct from an unknown id, which the
+   default case faults with status 8. A script may call either, the
+   compiler accepts it, and the driver discards it without error.
+   _set_rumble in particular reads as force feedback that moved out to the
+   separate rumble driver described in the product readme.
+
+   SO THE LANGUAGE IS GENUINELY CONCURRENT. A script can fork threads,
+   sleep in milliseconds, and wake or kill its siblings. That is the
+   machinery behind behaviour like hold-a-button-to-autofire: a forked
+   thread loops with sleeps while the parent carries on.
+
+9.9.1.  Details Worth Carrying Into A Port
+
+   _time AND _sleep BOTH WORK FROM THE THREAD'S WAKE TIME, not from the
+   clock. _time therefore reports the time a thread was SCHEDULED for
+   rather than when it ran, and two threads in one pass can report
+   different times. _sleep adds to the existing wake time rather than to
+   now, so a loop of sleeps does not drift by however long each pass took.
+   Both are deliberate and a port that substitutes the current time will
+   drift.
+
+   _sleep MULTIPLIES IN 32 BITS: ms * 10000 overflows above about 214748
+   milliseconds, roughly 3.5 minutes. A script asking for longer gets a
+   wrapped, possibly negative, delay.
+
+   _wake ZEROES THE TARGET'S ACCUMULATOR, and that is the mechanism by
+   which a sleeper learns it was woken early - _sleep leaves 1 there when
+   it runs its course, so 0 on resume means somebody called _wake.
+
+   _fork IS REFUSED once ThreadCount exceeds 29, so thirty threads on the
+   ready list is the ceiling, and it returns -1 rather than faulting.
+
+   Three of these five primitives carry defects: see known-defects.txt
+   sections 9, 10 and 11 for _fork, _kill and _wake.
+
 10. Open Questions
    - The six opcodes the interpreter decodes but the compiler was not seen to
    emit: 0x095, 0x171, 0x181, 0x192, 0x230 and 0x294. Which grammar
    productions reach them, if any.
-
-   - The drv_QueueEvent event types 0, 1, 2, 3 and 0x4D used by the native
-   builtins. These are how a script actually produces HID input, so decoding
-   them closes the last gap between a script and a report.
 
    - The meaning of the flags word at buffer +0x04, sourced from
    DAT_0045b608, and whether the top two bits of the count dword are flags.
