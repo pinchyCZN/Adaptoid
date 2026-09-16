@@ -26,10 +26,16 @@ Table of Contents
    1.  Request Framing
    2.  Asynchronous Chaining
    3.  Known Vendor Requests
-   4.  The Accessory Probe
-   5.  Accessory State
-   6.  Notes For The Replacement Driver
-   7.  Open Questions
+   4.  The Raw N64 Transaction
+   4.1.  Two Encodings, Chosen By The Command Length
+   4.2.  The Reply
+   4.3.  The Shipped Callers
+   4.4.  The Controller Reset
+   5.  The Accessory Probe
+   6.  Accessory State
+   7.  Notes For The Replacement Driver
+   7.1.  The DirectInput Escape API Is In Another Binary
+   8.  Open Questions
 
 1.  Request Framing
 
@@ -312,7 +318,108 @@ Table of Contents
    transparent bridge onto the controller bus. The replacement implements
    them in src_drv/core.c and asserts the vectors above in its harness.
 
-4.  The Accessory Probe
+4.  The Raw N64 Transaction
+
+   drv_N64Transaction (000137c0) wraps a single transaction on the N64
+   controller bus and blocks until it finishes, so it runs at PASSIVE_LEVEL
+   only. It is what the Controller Pak IOCTLs are built on.
+
+       drv_N64Transaction(devext, TxLen, RxLen, &ActualRx, Tx, Rx)
+
+   Tx holds the N64 command bytes; Rx receives the reply; ActualRx is set to
+   how many bytes came back, or zero if the reply was rejected.
+
+4.1.  Two Encodings, Chosen By The Command Length
+
+   SHORT FORM, TxLen < 5. The command rides in the setup packet and the
+   reply is the data stage:
+
+       bmRequestType  0xC0                 vendor IN
+       bRequest       0x20 + TxLen         so 0x21 .. 0x24
+       wValue         Tx[0], Tx[1]         zero-filled past TxLen
+       wIndex         Tx[2], Tx[3]
+       wLength        RxLen + 1
+
+   LONG FORM, TxLen >= 5. Two transfers. First the command goes out, with
+   everything past the third byte as the data stage:
+
+       bmRequestType  0x40                 vendor OUT
+       bRequest       0x20
+       wValue         RxLen, Tx[0]         low byte, then high
+       wIndex         Tx[1], Tx[2]
+       data           Tx[3 ..], TxLen - 3 bytes
+
+   then the reply is collected:
+
+       bmRequestType  0xC0                 vendor IN
+       bRequest       0x71
+       wValue         0x0030
+       wIndex         0
+       wLength        RxLen + 1
+
+   THE ENTRY GUARD IS (TxLen < 5 || RxLen < 4), and it is worth reading
+   twice. A long-form transfer expecting four or more bytes back is refused
+   outright - silently, without even writing ActualRx. So the long form is
+   usable only for commands whose reply is three bytes or fewer, which is
+   why the only shipped user of it is the accessory WRITE, whose reply is a
+   single CRC byte.
+
+4.2.  The Reply
+
+   Both forms receive one leading byte before the payload, and the two forms
+   check it differently.
+
+       short   any NON-ZERO value is accepted
+       long    bit 7 must be set AND the low six bits must equal RxLen
+
+   The payload is then BYTE-REVERSED in place: the device delivers N64
+   replies last-byte-first and this undoes it. Anything that calls
+   drv_SendVendorRequest directly rather than going through here sees the
+   raw reversed order - the accessory probe does exactly that, which is why
+   it reads its controller identifier backwards. See section 5.
+
+4.3.  The Shipped Callers
+
+   +-------+----------+-------+-------+-----------------------------------+
+   | fn    | N64 cmd  | TxLen | RxLen | What it does                      |
+   +=======+==========+=======+=======+===================================+
+   | 0x840 | 0x00     |     1 |     3 | request info: the 0x05 0x00       |
+   |       |          |       |       | identifier and the status byte    |
+   +-------+----------+-------+-------+-----------------------------------+
+   | 0x841 | 0x02     |     3 |  0x21 | read accessory: 32 data bytes     |
+   |       |          |       |       | plus the CRC, address encoded by  |
+   |       |          |       |       | drv_N64PakAddrCrc5                |
+   +-------+----------+-------+-------+-----------------------------------+
+   | 0x842 | 0x03     |  0x23 |     1 | write accessory: 32 data bytes    |
+   |       |          |       |       | out, one CRC byte back            |
+   +-------+----------+-------+-------+-----------------------------------+
+   | 0x83a | any      |   var |   var | passthrough; BOTH lengths come    |
+   |       |          |       |       | straight from the request         |
+   +-------+----------+-------+-------+-----------------------------------+
+
+   The first three pass their lengths as literals. The fourth does not, and
+   that is defect 11: the reply buffer is 64 bytes of stack and nothing on
+   the path bounds RxLen against it. See known-defects.txt section 13. A
+   replacement must cap the receive length at 63, and should do it where the
+   request is parsed as well as in the transaction helper.
+
+4.4.  The Controller Reset
+
+   drv_SendControllerReset (00015850) is not a transaction: it is one
+   fire-and-forget vendor OUT with no data stage and no completion routine.
+
+       bmRequestType  0x40
+       bRequest       0x72          the same request the probe uses for its
+                                    five register writes
+       wValue         0x0F20
+       wIndex         0
+
+   drv_BuildJoystickReport sends it when a controller packet arrives with a
+   status byte it does not recognise. Note that the original then submits
+   the unrecognised packet anyway rather than dropping it; only the reset is
+   worth carrying over.
+
+5.  The Accessory Probe
 
    Entered from drv_BuildJoystickReport whenever devext+0x3E4 is 0, which
    happens at first poll and again whenever the controller status byte
@@ -392,7 +499,7 @@ Table of Contents
    the second state is still found. Which accessory kind ends up in state 2
    versus state 3 is NOT established from this binary.
 
-5.  Accessory State
+6.  Accessory State
 
    devext+0x3E4 holds the result:
 
@@ -409,7 +516,7 @@ Table of Contents
    And drv_BuildJoystickReport refuses to build any report until
    devext+0x3E4 is 2 or more, so the probe gates all controller input.
 
-6.  Notes For The Replacement Driver
+7.  Notes For The Replacement Driver
 
    -  This is the layer that actually talks to the hardware. A
       replacement can change the HID descriptor, the IOCTL surface and
@@ -427,7 +534,7 @@ Table of Contents
       until the accessory state is known avoids a burst of garbage input
       at plug-in time.
 
-6.1.  The DirectInput Escape API Is In Another Binary
+7.1.  The DirectInput Escape API Is In Another Binary
 
    The Adaptoid SDK documents nine DirectInput driver escapes, numbered
    0x7834BB00 through 0x7834BB28, covering device identification, the port
@@ -445,7 +552,7 @@ Table of Contents
    IOCTL fn 0x83e and fn 0x83f. So the same tunables are reachable two ways,
    by two drivers, with the same defaults.
 
-7.  Open Questions
+8.  Open Questions
 
    - The meaning of the wValue and wIndex pairs in probe steps 1 to 5, and of
    request 0x74's 0x00C6 and 0x00A6. These are firmware register semantics

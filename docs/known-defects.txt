@@ -7,14 +7,21 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Nine defects have been found during reverse engineering: two
-   arithmetic ones in wishk201.sys, a pair of unbounded string copies also
-   in the driver, a race in wishh201.dll, a bounds check in the script
-   interpreter that tests the wrong value, and four in the script engine's
-   native builtin library. This note records each one, the exact condition
-   that triggers it, what it would actually do, and whether a user would be
-   likely to notice. It also records claims that were made here and later
-   RETRACTED, in sections 3 and 7.
+   Ten defects have been found during reverse engineering: two arithmetic
+   ones in wishk201.sys, a pair of unbounded string copies also in the
+   driver, a race in wishh201.dll, a bounds check in the script interpreter
+   that tests the wrong value, four in the script engine's native builtin
+   library, and an unbounded receive length on the raw N64 transaction.
+   This note records each one, the exact condition that triggers it, what it
+   would actually do, and whether a user would be likely to notice. It also
+   records claims that were made here and later RETRACTED, in sections 3
+   and 7.
+
+   ONE OF THEM, SECTION 13, IS DIFFERENT IN KIND from the rest. Every other
+   entry here is a correctness slip whose worst outcome is wrong behaviour.
+   That one is a memory-safety failure on a path that reaches the driver
+   from an ordinary user-mode request, and a replacement must not reproduce
+   it.
 
    The purpose is not to criticise a driver that shipped in 2001 and
    worked. It is to stop a clean-room replacement from faithfully
@@ -29,8 +36,10 @@ Abstract
    simple remapping profile would hit, which is why the software's
    reputation for robustness survives them.
 
-   None of the nine is in the HID report descriptor, the keyboard or mouse
-   report builders, or the private IOCTL surface.
+   None of the ten is in the HID report descriptor or the keyboard and
+   mouse report builders. The tenth is reached THROUGH the private IOCTL
+   surface, though the missing check is in the transaction helper rather
+   than in the dispatcher.
 
 Table of Contents
 
@@ -46,7 +55,8 @@ Table of Contents
    10. Defect 8: _kill Never Decrements ThreadCount
    11. Defect 9: _wake Leaves The Ready List Unsorted
    12. Defect 10: The Native Argument Frame Is One Word Short
-   13. What Is Not Affected
+   13. Defect 11: The N64 Transaction Receive Length Is Unbounded
+   14. What Is Not Affected
 
 1.  Severity Summary
 
@@ -73,6 +83,8 @@ Table of Contents
        unsorted                                    late or lost
        native argument frame     script engine    no, needs a
        over-reads at depth 200                     hand-built script
+       N64 transaction receive   raw N64 IOCTL    yes, reachable
+       length unbounded                             from user mode
        (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
@@ -536,7 +548,73 @@ Table of Contents
    and returns zero, which is indistinguishable from the original for any
    argument a script could actually have set.
 
-13. What Is Not Affected
+13. Defect 11: The N64 Transaction Receive Length Is Unbounded
+
+   Location:  drv_N64Transaction, the reply buffer and the short-form
+              transfer at 000138d8
+   Reached by: IOCTL 0xb98c20e8, function 0x83a
+
+   THIS IS THE ONE MEMORY-SAFETY DEFECT IN THE DRIVER. Everything else in
+   this note is a correctness slip; this one is a missing bounds check on a
+   length that comes from user mode.
+
+   The chain, verified end to end:
+
+   1.  drv_IoctlViaHidHandle (00012710) passes the IRP's
+       InputBufferLength and OutputBufferLength straight through as the
+       TxLen and RxLen arguments of drv_IoctlDeviceCommand. Neither is
+       inspected on the way.
+
+   2.  IOCTL 0xb98c20e8 dispatches to the case at 00012df3. Confirmed
+       through the jump table: 0xb98c20e8 + 0x4673df3c truncates to 0x24,
+       the index byte at 0x13664 is 8, and the entry at 0x13610 is
+       00012df3. That case tests only that both lengths are NON-ZERO and
+       then calls drv_N64Transaction.
+
+   3.  drv_N64Transaction's reply buffer is SIXTY-FOUR BYTES OF STACK -
+       one status byte plus a 63-byte payload. Its only length guard is
+       (TxLen < 5 || RxLen < 4), which tests whether RxLen is too SMALL.
+       There is no upper bound anywhere on the path.
+
+   4.  The short form then issues a vendor IN transfer of RxLen + 1 bytes
+       into that buffer, and on a non-zero first byte copies RxLen bytes
+       back out of it into the output buffer the caller receives.
+
+   Trigger:  a device-control request on this function code with a small
+   input length, so that the short form is selected, and an output length
+   larger than 63.
+
+   Effect:  two distinct problems, from the same missing check.
+
+       The copy back out reads past the 64-byte buffer and hands the
+       caller whatever follows it on the kernel stack. This needs no
+       cooperation from the hardware; the bytes are disclosed whether or
+       not the device answered with that many.
+
+       The transfer itself is set up to receive more bytes than the buffer
+       holds. How much is actually written depends on what the device
+       sends, so the genuine adapter will not overflow it - but the length
+       the driver promises the USB stack is attacker-chosen, and nothing
+       between the request and the stack buffer narrows it.
+
+   Would a user notice:  no, which is the point. Nothing misbehaves during
+   normal use, because every shipped caller passes a constant. Three of the
+   four call sites pass 3, 33 and 1 literally; only the passthrough takes
+   the length from the request.
+
+   In the replacement:  NOT reproduced, and this is the one divergence in
+   the port that is not optional. core_n64_transaction in src_drv/core.c
+   refuses any rx_len above CORE_N64_RX_MAX, which is 63 - the largest
+   reply the original's own buffer could ever have held. The harness
+   verifies the refusal, and removing that check makes the harness itself
+   die on the spot with a smashed stack, which is the most direct
+   demonstration of the defect available without a live driver.
+
+   A replacement should ALSO bound the length where the request is parsed,
+   rather than relying only on the helper. Defence in one place is how this
+   happened.
+
+14. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
@@ -554,7 +632,8 @@ Table of Contents
       drv_HidMouseButtonEvent and drv_HidMouseMoveEvent, all of which
       assemble reports that match the descriptor byte for byte.
    -  The HID report descriptors themselves and their selection.
-   -  The private IOCTL surface and the dispatch wrapper triage.
+   -  The dispatch wrapper triage. The private IOCTL surface itself is
+      NOT clean: function 0x83a reaches defect 11, section 13.
    -  The Controller Pak CRCs, which are the genuine N64 algorithms.
 
    A user writing complex scripts exercises every item in that list. That

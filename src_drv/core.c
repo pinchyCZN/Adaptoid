@@ -1403,6 +1403,201 @@ static const struct {
 	{ 0xFD23, 0x0000 }
 };
 
+/* ------------------------------------------------------------------ */
+/* the raw N64 controller-bus transaction                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One N64 bus transaction, synchronously. tx holds the command bytes, rx
+ * receives the reply, and *actual is set to how many bytes came back.
+ *
+ * Returns 1 if the transaction was attempted, 0 if it was refused. A return
+ * of 1 with *actual == 0 means the device answered but the reply was
+ * rejected.
+ *
+ * TWO ENCODINGS, chosen by tx_len.
+ *
+ * SHORT FORM, tx_len < 5. The command bytes ride in the setup packet and the
+ * reply is the data stage:
+ *
+ *     bmRequestType  0xC0                 vendor IN
+ *     bRequest       0x20 + tx_len        so 0x21..0x24
+ *     wValue         tx[0], tx[1]         zero-filled past tx_len
+ *     wIndex         tx[2], tx[3]
+ *
+ * LONG FORM, tx_len >= 5. Two transfers. The command and its data go out:
+ *
+ *     bmRequestType  0x40                 vendor OUT
+ *     bRequest       0x20
+ *     wValue         rx_len, tx[0]
+ *     wIndex         tx[1], tx[2]
+ *     data           tx[3 ..]
+ *
+ * then the reply is collected with bRequest 0x71, wValue 0x0030, wIndex 0.
+ * The long form validates its status byte - bit 7 set and the low six bits
+ * equal to rx_len - where the short form only requires a non-zero first byte.
+ *
+ * THE REPLY IS BYTE-REVERSED before returning: the device delivers N64
+ * replies last-byte-first and this undoes it. Anything going through the
+ * vendor seam directly, as the accessory probe does, sees the raw reversed
+ * order instead - which is why core_probe_classify reads its identifier
+ * backwards.
+ */
+int core_n64_transaction(core_state *cs, const u8 *tx, s32 tx_len,
+                         u8 *rx, s32 rx_len, s32 *actual)
+{
+	u8  reply[CORE_N64_RX_MAX + 1];
+	core_vendor_req req;
+	s32 i;
+	int ok;
+
+	/*
+	 * DIVERGENCE, and it matters. The original leaves *ActualRx untouched
+	 * on every path that refuses, so a caller that did not pre-zero it
+	 * reads a stale length. Three of its four callers do pre-zero; this
+	 * always does.
+	 */
+	if (actual != 0) {
+		*actual = 0;
+	}
+	if (cs == 0 || cs->vendor_sync == 0 || tx == 0 || rx == 0) {
+		return 0;
+	}
+	if (tx_len < 1) {
+		return 0;
+	}
+
+	/*
+	 * The original's guard, reproduced: it proceeds only when tx_len < 5
+	 * OR rx_len < 4, so a long-form transfer expecting four or more bytes
+	 * back is silently refused. That is a real restriction on the
+	 * passthrough IOCTL and not an accident of this reading - the two arms
+	 * below are selected by the same tx_len test.
+	 */
+	if (!(tx_len < 5 || rx_len < 4)) {
+		return 0;
+	}
+
+	/*
+	 * DIVERGENCE: the receive length is bounded. The original checks only
+	 * that it is not too SMALL, then asks the device for rx_len + 1 bytes
+	 * into a 64-byte stack buffer and copies rx_len bytes back out of it.
+	 * See ../docs/known-defects.txt section 13; this is the one defect
+	 * found in the driver that is reachable from user mode and matters.
+	 */
+	if (rx_len < 0 || rx_len > CORE_N64_RX_MAX) {
+		return 0;
+	}
+
+	/* One control transfer at a time. The original latches the vendor slot
+	 * here and relies on the transport to release it. */
+	if (cs->vendor_claim != 0 && !cs->vendor_claim(cs->vendor_ctx)) {
+		return 0;
+	}
+
+	for (i = 0; i <= rx_len; i++) {
+		reply[i] = 0;
+	}
+
+	if (tx_len < 5) {
+		u8 b1 = (tx_len >= 2) ? tx[1] : 0;
+		u8 b2 = (tx_len >= 3) ? tx[2] : 0;
+		u8 b3 = (tx_len >= 4) ? tx[3] : 0;
+
+		req.bmRequestType = CORE_VENDOR_IN;
+		req.bRequest      = (u8)(CORE_VENDOR_N64_BASE + (u8)tx_len);
+		req.wValue        = (u16)((u16)tx[0] | ((u16)b1 << 8));
+		req.wIndex        = (u16)((u16)b2 | ((u16)b3 << 8));
+		req.wLength       = (u16)(rx_len + 1);
+		if (!cs->vendor_sync(cs->vendor_ctx, &req, reply,
+		                     (u32)(rx_len + 1))) {
+			return 1;
+		}
+		/* The short form accepts anything with a non-zero first byte. */
+		ok = (reply[0] != 0);
+	} else {
+		req.bmRequestType = CORE_VENDOR_OUT;
+		req.bRequest      = CORE_VENDOR_N64_BASE;
+		req.wValue        = (u16)((u16)(u8)rx_len | ((u16)tx[0] << 8));
+		req.wIndex        = (u16)((u16)tx[1] | ((u16)tx[2] << 8));
+		req.wLength       = 0;
+		/* The data stage is the command bytes past the three in wValue
+		 * and wIndex. */
+		if (!cs->vendor_sync(cs->vendor_ctx, &req, (u8 *)tx + 3,
+		                     (u32)(tx_len - 3))) {
+			return 1;
+		}
+
+		req.bmRequestType = CORE_VENDOR_IN;
+		req.bRequest      = CORE_VENDOR_N64_FETCH;
+		req.wValue        = 0x0030;
+		req.wIndex        = 0;
+		req.wLength       = (u16)(rx_len + 1);
+		if (!cs->vendor_sync(cs->vendor_ctx, &req, reply,
+		                     (u32)(rx_len + 1))) {
+			return 1;
+		}
+		/* The long form checks its status byte properly. */
+		ok = ((reply[0] & 0x80u) != 0) &&
+		     ((s32)(reply[0] & 0x3Fu) == rx_len);
+	}
+
+	if (!ok) {
+		return 1;               /* *actual stays 0 */
+	}
+
+	for (i = 0; i < rx_len; i++) {
+		rx[i] = reply[i + 1];
+	}
+
+	/*
+	 * Reverse in place. DIVERGENCE: the original reverses whether or not
+	 * the reply was accepted, so a rejected transaction scrambles whatever
+	 * the caller happened to have in its buffer. Reversing bytes nobody
+	 * wrote is not behaviour worth preserving.
+	 */
+	for (i = 0; i < rx_len / 2; i++) {
+		u8 t = rx[i];
+
+		rx[i] = rx[rx_len - 1 - i];
+		rx[rx_len - 1 - i] = t;
+	}
+	if (actual != 0) {
+		*actual = rx_len;
+	}
+	return 1;
+}
+
+/*
+ * Reset the N64 controller: a fire-and-forget vendor OUT with no data stage.
+ *
+ *     bmRequestType 0x40, bRequest 0x72, wValue 0x0F20, wIndex 0
+ *
+ * drv_BuildJoystickReport sends this when a packet arrives with a status
+ * byte it does not recognise, which is the case core_decode currently
+ * rejects outright. Note that the original then goes on to submit the
+ * unrecognised packet anyway; only the reset is reproduced here.
+ *
+ * Returns 1 if the request was issued, 0 if the vendor slot was busy.
+ */
+int core_controller_reset(core_state *cs)
+{
+	core_vendor_req req;
+
+	if (cs == 0 || cs->vendor == 0) {
+		return 0;
+	}
+	if (cs->vendor_claim != 0 && !cs->vendor_claim(cs->vendor_ctx)) {
+		return 0;
+	}
+	req.bmRequestType = CORE_VENDOR_OUT;
+	req.bRequest      = CORE_VENDOR_RESET;
+	req.wValue        = 0x0F20;
+	req.wIndex        = 0;
+	req.wLength       = 0;
+	return cs->vendor(cs->vendor_ctx, &req) ? 1 : 0;
+}
+
 void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx)
 {
 	if (cs == 0) {
@@ -1410,6 +1605,13 @@ void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx)
 	}
 	cs->vendor     = fn;
 	cs->vendor_ctx = ctx;
+}
+
+void core_set_vendor_sync(core_state *cs, core_vendor_sync_fn fn)
+{
+	if (cs != 0) {
+		cs->vendor_sync = fn;
+	}
 }
 
 /* Give up and let a later poll try again. */

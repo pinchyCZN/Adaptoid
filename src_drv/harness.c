@@ -3088,6 +3088,344 @@ static int test_natives(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the raw N64 controller-bus transaction                              */
+/* ------------------------------------------------------------------ */
+
+#define N64LOG 8
+
+static struct {
+	core_vendor_req req;
+	u32 len;
+	u8  out[72];        /* what an OUT transfer carried */
+} g_n64log[N64LOG];
+static int g_n64count;
+
+/* What the fake device answers with, and how much of it. */
+static u8  g_n64reply[72];
+static u32 g_n64reply_len;
+static int g_n64fail_on;      /* 1-based transfer to refuse; 0 = never */
+
+static int n64_sync(void *ctx, const core_vendor_req *req, u8 *data, u32 len)
+{
+	int k = g_n64count;
+	u32 i;
+
+	(void)ctx;
+	if (k < N64LOG) {
+		g_n64log[k].req = *req;
+		g_n64log[k].len = len;
+		for (i = 0; i < len && i < sizeof(g_n64log[k].out); i++) {
+			g_n64log[k].out[i] = (req->bmRequestType == CORE_VENDOR_OUT
+			                      && data != 0) ? data[i] : 0;
+		}
+	}
+	g_n64count++;
+	if (g_n64fail_on == g_n64count) {
+		return 0;
+	}
+	if (req->bmRequestType == CORE_VENDOR_IN && data != 0) {
+		for (i = 0; i < len; i++) {
+			data[i] = (i < g_n64reply_len) ? g_n64reply[i] : 0;
+		}
+	}
+	return 1;
+}
+
+static void n64_reset_log(void)
+{
+	g_n64count     = 0;
+	g_n64fail_on   = 0;
+	g_n64reply_len = 0;
+}
+
+static void n64_set_reply(const u8 *b, u32 n)
+{
+	u32 i;
+
+	for (i = 0; i < n && i < sizeof(g_n64reply); i++) {
+		g_n64reply[i] = b[i];
+	}
+	g_n64reply_len = n;
+}
+
+static int test_n64_transaction(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_state cs;
+	u8  rx[80];
+	s32 actual;
+
+	/* ---- 1. the short form: request info ---------------------------- */
+	{
+		/* command 0x00, three bytes back. The device answers
+		 * length-then-payload, and the payload arrives reversed. */
+		static const u8 TX[]    = {CORE_N64_CMD_INFO};
+		static const u8 REPLY[] = {0x03, 0x02, 0x00, 0x05};
+
+		core_init(&cs, 0, 0);
+		core_set_vendor_sync(&cs, n64_sync);
+		n64_reset_log();
+		n64_set_reply(REPLY, 4);
+
+		sched_expect(core_n64_transaction(&cs, TX, 1, rx, 3, &actual) == 1,
+		             "info transaction ran", 1, 1, &bad);
+		sched_expect(g_n64count == 1, "one transfer", g_n64count, 1, &bad);
+		sched_expect(g_n64log[0].req.bmRequestType == CORE_VENDOR_IN,
+		             "vendor IN", g_n64log[0].req.bmRequestType,
+		             CORE_VENDOR_IN, &bad);
+		sched_expect(g_n64log[0].req.bRequest == 0x21,
+		             "bRequest 0x20 + tx_len", g_n64log[0].req.bRequest,
+		             0x21, &bad);
+		sched_expect(g_n64log[0].req.wValue == 0x0000,
+		             "wValue is the command, zero-filled",
+		             g_n64log[0].req.wValue, 0, &bad);
+		sched_expect(g_n64log[0].req.wIndex == 0x0000, "wIndex zero-filled",
+		             g_n64log[0].req.wIndex, 0, &bad);
+		sched_expect(g_n64log[0].req.wLength == 4, "asks for rx_len + 1",
+		             g_n64log[0].req.wLength, 4, &bad);
+		sched_expect(actual == 3, "three bytes back", actual, 3, &bad);
+		/* payload 02 00 05 reversed -> 05 00 02 */
+		sched_expect(rx[0] == 0x05 && rx[1] == 0x00 && rx[2] == 0x02,
+		             "reply is byte-reversed", rx[0], 0x05, &bad);
+		groups++;
+	}
+
+	/* ---- 2. all four short-form lengths pack the setup packet ------- */
+	{
+		static const u8 TX[] = {0xA1, 0xB2, 0xC3, 0xD4};
+		static const u8 REPLY[] = {0x01, 0x77};
+		static const struct {
+			s32 tx_len;
+			u8  request;
+			u16 value, index;
+		} W[] = {
+		  {1, 0x21, 0x00A1, 0x0000},
+		  {2, 0x22, 0xB2A1, 0x0000},
+		  {3, 0x23, 0xB2A1, 0x00C3},
+		  {4, 0x24, 0xB2A1, 0xD4C3}
+		};
+		int k;
+
+		for (k = 0; k < 4; k++) {
+			core_init(&cs, 0, 0);
+			core_set_vendor_sync(&cs, n64_sync);
+			n64_reset_log();
+			n64_set_reply(REPLY, 2);
+			core_n64_transaction(&cs, TX, W[k].tx_len, rx, 1, &actual);
+
+			if (g_n64log[0].req.bRequest != W[k].request ||
+			    g_n64log[0].req.wValue != W[k].value ||
+			    g_n64log[0].req.wIndex != W[k].index) {
+				hlog("  FAIL n64 tx_len %d -> %02x %04x %04x, "
+				     "want %02x %04x %04x\n", W[k].tx_len,
+				     g_n64log[0].req.bRequest, g_n64log[0].req.wValue,
+				     g_n64log[0].req.wIndex, W[k].request, W[k].value,
+				     W[k].index);
+				bad++;
+			}
+			htrace("n64 short tx_len %d -> %02x %04x %04x\n", W[k].tx_len,
+			       g_n64log[0].req.bRequest, g_n64log[0].req.wValue,
+			       g_n64log[0].req.wIndex);
+		}
+		groups++;
+	}
+
+	/* ---- 3. a zero first byte means the device did not answer ------- */
+	{
+		static const u8 TX[]    = {CORE_N64_CMD_INFO};
+		static const u8 REPLY[] = {0x00, 0xAA, 0xBB, 0xCC};
+
+		core_init(&cs, 0, 0);
+		core_set_vendor_sync(&cs, n64_sync);
+		n64_reset_log();
+		n64_set_reply(REPLY, 4);
+		rx[0] = 0xEE;
+
+		sched_expect(core_n64_transaction(&cs, TX, 1, rx, 3, &actual) == 1,
+		             "it still ran", 1, 1, &bad);
+		sched_expect(actual == 0, "but reported nothing back", actual, 0,
+		             &bad);
+		sched_expect(rx[0] == 0xEE, "and did not touch the buffer", rx[0],
+		             0xEE, &bad);
+		groups++;
+	}
+
+	/* ---- 4. the long form: write accessory -------------------------- */
+	{
+		/* 35 bytes out, one back. tx[0..2] ride in the setup packet and
+		 * the remaining 32 are the data stage. */
+		u8 tx[35];
+		static const u8 REPLY[] = {0x81, 0x5A};
+		int k;
+
+		/* tx[0] is deliberately NOT equal to rx_len, so that swapping
+		 * the two halves of wValue is detectable. */
+		for (k = 0; k < 35; k++) {
+			tx[k] = (u8)(k + 3);
+		}
+		core_init(&cs, 0, 0);
+		core_set_vendor_sync(&cs, n64_sync);
+		n64_reset_log();
+		n64_set_reply(REPLY, 2);
+
+		sched_expect(core_n64_transaction(&cs, tx, 35, rx, 1, &actual) == 1,
+		             "write transaction ran", 1, 1, &bad);
+		sched_expect(g_n64count == 2, "two transfers", g_n64count, 2, &bad);
+
+		sched_expect(g_n64log[0].req.bmRequestType == CORE_VENDOR_OUT,
+		             "first is vendor OUT", g_n64log[0].req.bmRequestType,
+		             CORE_VENDOR_OUT, &bad);
+		sched_expect(g_n64log[0].req.bRequest == 0x20, "bRequest 0x20",
+		             g_n64log[0].req.bRequest, 0x20, &bad);
+		sched_expect(g_n64log[0].req.wValue == 0x0301,
+		             "wValue is rx_len then tx[0]", g_n64log[0].req.wValue,
+		             0x0301, &bad);
+		sched_expect(g_n64log[0].req.wIndex == 0x0504,
+		             "wIndex is tx[1], tx[2]", g_n64log[0].req.wIndex,
+		             0x0504, &bad);
+		sched_expect(g_n64log[0].len == 32, "32 bytes of data stage",
+		             (long)g_n64log[0].len, 32, &bad);
+		sched_expect(g_n64log[0].out[0] == 6,
+		             "the data stage starts at tx[3]", g_n64log[0].out[0],
+		             6, &bad);
+
+		sched_expect(g_n64log[1].req.bmRequestType == CORE_VENDOR_IN,
+		             "second is vendor IN", g_n64log[1].req.bmRequestType,
+		             CORE_VENDOR_IN, &bad);
+		sched_expect(g_n64log[1].req.bRequest == 0x71, "bRequest 0x71",
+		             g_n64log[1].req.bRequest, 0x71, &bad);
+		sched_expect(g_n64log[1].req.wValue == 0x0030, "wValue 0x0030",
+		             g_n64log[1].req.wValue, 0x0030, &bad);
+		sched_expect(actual == 1, "one byte back", actual, 1, &bad);
+		sched_expect(rx[0] == 0x5A, "the CRC byte", rx[0], 0x5A, &bad);
+		groups++;
+	}
+
+	/* ---- 5. the long form validates its status byte ----------------- */
+	{
+		u8 tx[35];
+		int k;
+		static const struct {
+			u8 status;
+			s32 want;
+			const char *what;
+		} ST[] = {
+		  {0x81, 1, "bit 7 set, count matches"},
+		  {0x01, 0, "bit 7 clear"},
+		  {0x82, 0, "count disagrees"},
+		  {0xC1, 1, "spare bits ignored"}
+		};
+
+		for (k = 0; k < 35; k++) {
+			tx[k] = (u8)k;
+		}
+		for (k = 0; k < 4; k++) {
+			u8 reply[2];
+
+			reply[0] = ST[k].status;
+			reply[1] = 0x99;
+			core_init(&cs, 0, 0);
+			core_set_vendor_sync(&cs, n64_sync);
+			n64_reset_log();
+			n64_set_reply(reply, 2);
+			core_n64_transaction(&cs, tx, 35, rx, 1, &actual);
+			sched_expect(actual == ST[k].want, ST[k].what, actual,
+			             ST[k].want, &bad);
+		}
+		groups++;
+	}
+
+	/* ---- 6. the guard, and the bound the original does not have ----- */
+	{
+		static const u8 TX[] = {1, 2, 3, 4, 5, 6};
+
+		core_init(&cs, 0, 0);
+		core_set_vendor_sync(&cs, n64_sync);
+
+		/* tx_len >= 5 AND rx_len >= 4 is refused outright */
+		n64_reset_log();
+		actual = 0x5555;
+		sched_expect(core_n64_transaction(&cs, TX, 6, rx, 4, &actual) == 0,
+		             "long form with a big reply is refused", 0, 0, &bad);
+		sched_expect(g_n64count == 0, "and sends nothing", g_n64count, 0,
+		             &bad);
+		sched_expect(actual == 0, "actual is zeroed even when refused",
+		             actual, 0, &bad);
+
+		/* the receive bound this port adds */
+		n64_reset_log();
+		sched_expect(core_n64_transaction(&cs, TX, 1, rx,
+		                                  CORE_N64_RX_MAX, &actual) == 1,
+		             "63 bytes is allowed", 1, 1, &bad);
+		n64_reset_log();
+		sched_expect(core_n64_transaction(&cs, TX, 1, rx,
+		                                  CORE_N64_RX_MAX + 1, &actual) == 0,
+		             "64 is refused", 0, 0, &bad);
+		sched_expect(g_n64count == 0, "with no transfer attempted",
+		             g_n64count, 0, &bad);
+		n64_reset_log();
+		sched_expect(core_n64_transaction(&cs, TX, 1, rx, 4096, &actual) == 0,
+		             "and so is 4096", 0, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 7. a failed transfer is reported, not ignored -------------- */
+	{
+		static const u8 TX[] = {CORE_N64_CMD_INFO};
+		u8 tx35[35];
+		int k;
+
+		for (k = 0; k < 35; k++) {
+			tx35[k] = (u8)k;
+		}
+		core_init(&cs, 0, 0);
+		core_set_vendor_sync(&cs, n64_sync);
+
+		n64_reset_log();
+		g_n64fail_on = 1;
+		actual = 0x5555;
+		sched_expect(core_n64_transaction(&cs, TX, 1, rx, 3, &actual) == 1,
+		             "short form, transfer refused", 1, 1, &bad);
+		sched_expect(actual == 0, "reports nothing back", actual, 0, &bad);
+
+		n64_reset_log();
+		g_n64fail_on = 2;       /* the OUT succeeds, the fetch does not */
+		actual = 0x5555;
+		core_n64_transaction(&cs, tx35, 35, rx, 1, &actual);
+		sched_expect(actual == 0, "long form, fetch refused", actual, 0,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 8. the controller reset --------------------------------- */
+	{
+		core_init(&cs, 0, 0);
+		core_set_vendor(&cs, harness_vendor, 0);
+		bus_reset(0);
+
+		sched_expect(core_controller_reset(&cs) == 1, "reset was issued", 1,
+		             1, &bad);
+		sched_expect(g_bus_count == 1, "one transfer", g_bus_count, 1,
+		             &bad);
+		sched_expect(g_bus_log[0].bmRequestType == CORE_VENDOR_OUT,
+		             "vendor OUT", g_bus_log[0].bmRequestType,
+		             CORE_VENDOR_OUT, &bad);
+		sched_expect(g_bus_log[0].bRequest == 0x72, "bRequest 0x72",
+		             g_bus_log[0].bRequest, 0x72, &bad);
+		sched_expect(g_bus_log[0].wValue == 0x0F20, "wValue 0x0F20",
+		             g_bus_log[0].wValue, 0x0F20, &bad);
+		sched_expect(g_bus_log[0].wIndex == 0, "wIndex 0",
+		             g_bus_log[0].wIndex, 0, &bad);
+		groups++;
+	}
+
+	hlog("N64 transaction        : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -3164,6 +3502,7 @@ int main(int argc, char **argv)
 	bad += test_sched();
 	bad += test_input_bind();
 	bad += test_natives();
+	bad += test_n64_transaction();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

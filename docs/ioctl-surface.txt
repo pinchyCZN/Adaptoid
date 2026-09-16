@@ -270,7 +270,7 @@ Table of Contents
    | 0xb98c20d8 | 0x836 |    4 |    4 | read one counter, selector 1..4          |
    | 0xb98c20dc | 0x837 |    4 |    0 | zero counter 2 or 3                      |
    | 0xb98c20e4 | 0x839 |    4 |    0 | drv_SetDeviceEnable on/off toggle        |
-   | 0xb98c20e8 | 0x83a | var  | var  | drv_N64Transaction, raw N64 transfer     |
+   | 0xb98c20e8 | 0x83a | var  | var  | raw N64 transfer. UNBOUNDED, see below   |
    | 0xb98c20f0 | 0x83c | 8+4n |    0 | DOWNLOAD COMPILED SCRIPT, section 5a     |
    | 0xb98c20f4 | 0x83d |    0 |  var | drain the post-mortem dump of a fault    |
    | 0xb98c20f8 | 0x83e |  0/4 |  0/4 | get and/or set the DWORD at devext+0x3ec |
@@ -291,6 +291,15 @@ Table of Contents
    recognised code with the wrong buffer sizes gives
    STATUS_INVALID_PARAMETER (0xC000000D). The distinction is useful when
    probing a live device.
+
+   FN 0x83a IS THE ONE ENTRY ON THIS SURFACE WITH A MEMORY-SAFETY DEFECT.
+   Both of its lengths are the caller's InputBufferLength and
+   OutputBufferLength, passed through untouched, and the case tests only
+   that neither is zero. drv_N64Transaction then receives into a 64-byte
+   stack buffer sized for the largest reply the N64 bus produces. A
+   replacement must cap the output length at 63 here, in the dispatcher,
+   as well as in the transaction itself. See known-defects.txt section 13
+   and usb-transport.txt section 4.
 
    0x83c guards on the state word at devext+0x1640 and returns
    STATUS_DEVICE_BUSY (0x80000011) if a script load is already in

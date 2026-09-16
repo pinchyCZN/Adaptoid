@@ -164,6 +164,40 @@ typedef int (*core_vendor_fn)(void *ctx, const core_vendor_req *req);
  */
 typedef int (*core_vendor_claim_fn)(void *ctx);
 
+/*
+ * THE SYNCHRONOUS TRANSPORT SEAM.
+ *
+ * core_vendor_fn above is fire-and-forget: the probe asks for a transfer and
+ * is told later how it went. The raw N64 transaction is the other shape -
+ * drv_N64Transaction blocks on KeWaitForSingleObject after every transfer and
+ * therefore runs at PASSIVE_LEVEL only. Modelling that as the asynchronous
+ * seam would turn one readable function into a five-state machine for no
+ * gain, so it gets a seam of its own.
+ *
+ * data is the data stage: filled for an IN, sent for an OUT, and ignored when
+ * len is zero. Return non-zero if the transfer completed.
+ */
+typedef int (*core_vendor_sync_fn)(void *ctx, const core_vendor_req *req,
+                                   u8 *data, u32 len);
+
+/*
+ * THE RECEIVE BOUND. The original's reply buffer is 64 bytes of stack, and
+ * every transfer asks the device for rx_len + 1 bytes into it - one length or
+ * status byte, then the payload. 63 is therefore the largest reply that fits,
+ * and the original does not check. See core_n64_transaction.
+ */
+#define CORE_N64_RX_MAX         63
+
+/* N64 controller bus commands, as the shipped IOCTLs issue them. */
+#define CORE_N64_CMD_INFO       0x00u   /* request info, 3 bytes back      */
+#define CORE_N64_CMD_READ       0x02u   /* read accessory, 33 bytes back   */
+#define CORE_N64_CMD_WRITE      0x03u   /* write accessory, 1 byte back    */
+
+/* Vendor requests the transaction uses. */
+#define CORE_VENDOR_N64_BASE    0x20u   /* short form is base + tx_len     */
+#define CORE_VENDOR_N64_FETCH   0x71u   /* collect a long-form reply       */
+#define CORE_VENDOR_RESET       0x72u   /* also the probe's register write */
+
 /* Transfer direction, the two values bmRequestType ever takes here. */
 #define CORE_VENDOR_OUT         0x40u   /* host to device */
 #define CORE_VENDOR_IN          0xC0u   /* device to host */
@@ -435,6 +469,9 @@ typedef struct core_state {
 	/* The accessory probe. */
 	core_vendor_fn  vendor;
 	void           *vendor_ctx;
+
+	/* The blocking transport, used only by core_n64_transaction. */
+	core_vendor_sync_fn vendor_sync;
 	u8              accessory_state;
 	u8              accessory_status;   /* the N64 status byte the probe read */
 	u8              probe_step;
@@ -597,6 +634,19 @@ int  core_effect_run_deferred(core_state *cs, u64 now_100ns);
 void core_effect_update_complete(core_state *cs);
 
 void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx);
+
+/* Install the blocking transport; see core_vendor_sync_fn. */
+void core_set_vendor_sync(core_state *cs, core_vendor_sync_fn fn);
+
+/*
+ * One raw N64 controller-bus transaction. See core.c for the two encodings
+ * and for what is bounded here that the original left unbounded.
+ */
+int  core_n64_transaction(core_state *cs, const u8 *tx, s32 tx_len,
+                          u8 *rx, s32 rx_len, s32 *actual);
+
+/* Ask the controller to reset. Fire and forget. */
+int  core_controller_reset(core_state *cs);
 int  core_probe_start(core_state *cs);
 void core_probe_complete(core_state *cs, int ok, const u8 *reply, u32 len);
 

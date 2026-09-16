@@ -246,8 +246,8 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 46 of the 146 functions in
-   wishk201.sys are ported, 16331 of 38690 bytes, so 42 percent by code
+   Measured against the Ghidra database: 55 of the 146 functions in
+   wishk201.sys are ported, 17691 of 38690 bytes, so 46 percent by code
    size. The 3109 lines written so far cover those 16331 bytes, which is 5.3
    bytes of original per line of replacement and is the ratio the estimates
    below use.
@@ -266,7 +266,6 @@ Table of Contents
    | HID report plumbing      |  10 |  1680 |      280 | core+wdm  |
    | vendor transport         |   8 |  1522 |      253 | wdm.c     |
    | control device           |  10 |  1473 |      245 | ioctl.c   |
-   | N64 transaction          |   9 |  1360 |      226 | core.c    |
    | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
    | power                    |   7 |  1225 |      204 | wdm.c     |
    | notification queue       |   6 |   832 |      138 | ioctl.c   |
@@ -274,7 +273,7 @@ Table of Contents
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          | 100 | 22359 |     3726 |           |
+   | TOTAL REMAINING          |  91 | 20999 |     3499 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
@@ -293,15 +292,15 @@ Table of Contents
    | Piece                   | Specification                             |
    +=========================+===========================================+
    | Report descriptor       | ../docs/hid-descriptor.txt section 4      |
-   | N64 transaction         | ../docs/usb-transport.txt                 |
    | PnP, power, URB plumbing| ../docs/driver-lifecycle.txt              |
    | Private IOCTL surface   | ../docs/ioctl-surface.txt                 |
    +-------------------------+-------------------------------------------+
 
    Already ported: the raw packet decode, the joystick report, the accessory
-   probe, the Controller Pak CRCs, the effect engine and its ring, and the
-   entire script engine - interpreter, scheduler, input binding and builtin
-   library, specified in ../docs/script-bytecode.txt sections 5, 6 and 9.
+   probe, the Controller Pak CRCs, the effect engine and its ring, the raw
+   N64 transaction, and the entire script engine - interpreter, scheduler,
+   input binding and builtin library, specified in
+   ../docs/script-bytecode.txt sections 5, 6 and 9.
 
    Loading the driver is out of scope here. It is unsigned, and x64 Windows
    will not load an unsigned driver without test-signing mode; see
