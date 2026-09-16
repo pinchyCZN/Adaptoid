@@ -626,6 +626,12 @@ Table of Contents
    runaway loop with status 10. The operand stack is capped at 200 dwords. A
    faulted script is stopped and dumped rather than allowed to continue.
 
+   One of those checks is wrong and does not matter: opcode 0x181 compares
+   the accumulator against the code length rather than the call target it is
+   about to jump to. The per-instruction PC check catches the same fault one
+   dispatch later with the same status, so the slip has no observable
+   effect. See known-defects.txt section 8 for the evidence.
+
    What is NOT checked is the stream itself at load time. drv_ScriptLoad
    copies the opcode array in and begins executing it; there is no
    verification pass, no signing, and no check that the final instruction

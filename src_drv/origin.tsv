@@ -92,6 +92,7 @@ pak_poll	harness.c	new	-	-	-
 popcount32	harness.c	new	-	-	-
 probe_check_prefix	harness.c	new	-	-	-
 report_name	harness.c	new	-	-	-
+script_run_prog	harness.c	new	-	-	-
 simulate_add_device	harness.c	new	-	-	-
 test_accessory_probe	harness.c	new	-	-	-
 test_effect_chain	harness.c	new	-	-	-
@@ -99,8 +100,13 @@ test_effect_engine	harness.c	new	-	-	-
 test_joystick_report	harness.c	new	-	-	-
 test_pak_change	harness.c	new	-	-	-
 test_pak_crcs	harness.c	new	-	-	-
+test_script	harness.c	new	-	-	-
 test_tune_mode	harness.c	new	-	-	-
 usage	harness.c	new	-	-	-
+core_script_init	script.c	part	wishk201.sys	00017b90	drv_ScriptExecute
+core_script_run	script.c	port	wishk201.sys	00017b90	drv_ScriptExecute
+core_script_set_native	script.c	new	-	-	-
+core_script_var_index	script.c	port	wishk201.sys	00018640	drv_ScriptCheckVarIndex
 AdaptoidAddDevice	wdm.c	port	wishk201.sys	0001236e	drv_AddDevice
 AdaptoidCleanup	wdm.c	port	wishk201.sys	00011880	drv_CleanupTriage
 AdaptoidClose	wdm.c	port	wishk201.sys	00011910	drv_CloseTriage

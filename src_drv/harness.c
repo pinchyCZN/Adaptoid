@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "wdm.h"
+#include "script.h"
 
 /* ------------------------------------------------------------------ */
 /* Output                                                              */
@@ -1641,6 +1642,188 @@ static int test_tune_mode(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* The script interpreter                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Each program below computes a value into the accumulator and stores it to
+ * global 0, so the result is observable in MEMORY rather than in a return
+ * value. That matters for how these were verified: the same bytecode was run
+ * through drv_ScriptExecute under emulation and the resulting global read
+ * back, which is robust in a way that reading the status out of the original
+ * is not - its exit paths call the allocator, the spinlocks and the event
+ * queue, and stubbing those perturbs the register the status comes back in.
+ *
+ * So the EXPECTED VALUES here are the original's, byte for byte. The status
+ * codes are checked separately below against the documented table.
+ */
+#define SCRIPT_VARS 4
+
+static u32 script_run_prog(const u32 *code, s32 count, int *status_out)
+{
+	core_script vm;
+	u32 vars[SCRIPT_VARS + CORE_SCRIPT_LOCALS];
+	int i;
+
+	for (i = 0; i < SCRIPT_VARS + CORE_SCRIPT_LOCALS; i++) {
+		vars[i] = 0;
+	}
+	core_script_init(&vm, code, count, vars, SCRIPT_VARS);
+	i = core_script_run(&vm);
+	if (status_out) {
+		*status_out = i;
+	}
+	return vars[0];
+}
+
+/* load &global0; push; <body>; stora; ret */
+#define PROLOGUE 0x110, 0x20000000u, 0x093
+#define EPILOGUE 0x231, 0x082
+
+static const u32 P00[] = {PROLOGUE, 0x110,42, EPILOGUE};
+static const u32 P01[] = {PROLOGUE, 0x110,10,0x093,0x110,3,0x253, EPILOGUE};
+static const u32 P02[] = {PROLOGUE, 0x110,10,0x093,0x110,3,0x252, EPILOGUE};
+static const u32 P03[] = {PROLOGUE, 0x110,10,0x093,0x110,3,0x254, EPILOGUE};
+static const u32 P04[] = {PROLOGUE, 0x110,17,0x093,0x110,5,0x255, EPILOGUE};
+static const u32 P05[] = {PROLOGUE, 0x110,17,0x093,0x110,5,0x256, EPILOGUE};
+static const u32 P06[] = {PROLOGUE, 0x110,0xFFFFFFF7u,0x093,0x110,2,0x255, EPILOGUE};
+static const u32 P07[] = {PROLOGUE, 0x110,0xFFFFFFF7u,0x093,0x110,2,0x256, EPILOGUE};
+static const u32 P08[] = {PROLOGUE, 0x110,1,0x093,0x110,4,0x250, EPILOGUE};
+static const u32 P09[] = {PROLOGUE, 0x110,0xFFFFFF00u,0x093,0x110,4,0x251, EPILOGUE};
+static const u32 P10[] = {PROLOGUE, 0x110,5,0x093,0x110,3,0x262, EPILOGUE};
+static const u32 P11[] = {PROLOGUE, 0x110,3,0x093,0x110,5,0x262, EPILOGUE};
+static const u32 P12[] = {PROLOGUE, 0x110,0xFFFFFFFBu,0x093,0x110,3,0x263, EPILOGUE};
+static const u32 P13[] = {PROLOGUE, 0x110,5,0x093,0x110,5,0x264, EPILOGUE};
+static const u32 P14[] = {PROLOGUE, 0x110,0,0x093,0x110,7,0x266, EPILOGUE};
+static const u32 P15[] = {PROLOGUE, 0x110,0,0x093,0x110,7,0x267, EPILOGUE};
+static const u32 P16[] = {PROLOGUE, 0x110,5,0x040, EPILOGUE};
+static const u32 P17[] = {PROLOGUE, 0x110,5,0x041, EPILOGUE};
+static const u32 P18[] = {PROLOGUE, 0x110,5,0x042, EPILOGUE};
+static const u32 P19[] = {PROLOGUE, 0x110,1,0x172,2,0x110,111, EPILOGUE};
+static const u32 P20[] = {PROLOGUE, 0x110,0,0x172,2,0x110,111,0x110,222, EPILOGUE};
+static const u32 P21[] = {PROLOGUE, 0x110,9,0x093,0x110,4,0x095, EPILOGUE};
+
+static int test_script(void)
+{
+	int bad = 0;
+	int k, status;
+	u32 got;
+
+	static const struct {
+		const u32 *code;
+		s32        count;
+		s32        expect;
+		const char *what;
+	} PROGS[] = {
+	  {P00, (s32)(sizeof(P00)/4),   42, "load immediate"   },
+	  {P01, (s32)(sizeof(P01)/4),    7, "10 - 3"           },
+	  {P02, (s32)(sizeof(P02)/4),   13, "10 + 3"           },
+	  {P03, (s32)(sizeof(P03)/4),   30, "10 * 3"           },
+	  {P04, (s32)(sizeof(P04)/4),    3, "17 / 5"           },
+	  {P05, (s32)(sizeof(P05)/4),    2, "17 % 5"           },
+	  {P06, (s32)(sizeof(P06)/4),   -4, "-9 / 2"           },
+	  {P07, (s32)(sizeof(P07)/4),   -1, "-9 % 2"           },
+	  {P08, (s32)(sizeof(P08)/4),   16, "1 << 4"           },
+	  {P09, (s32)(sizeof(P09)/4),  -16, "-256 >> 4"        },
+	  {P10, (s32)(sizeof(P10)/4),    1, "5 > 3"            },
+	  {P11, (s32)(sizeof(P11)/4),    0, "3 > 5"            },
+	  {P12, (s32)(sizeof(P12)/4),    1, "-5 < 3"           },
+	  {P13, (s32)(sizeof(P13)/4),    1, "5 >= 5"           },
+	  {P14, (s32)(sizeof(P14)/4),    0, "0 && 7"           },
+	  {P15, (s32)(sizeof(P15)/4),    1, "0 || 7"           },
+	  {P16, (s32)(sizeof(P16)/4),    0, "!5"               },
+	  {P17, (s32)(sizeof(P17)/4),   -6, "~5"               },
+	  {P18, (s32)(sizeof(P18)/4),   -5, "-5"               },
+	  {P19, (s32)(sizeof(P19)/4),  111, "branch not taken" },
+	  {P20, (s32)(sizeof(P20)/4),  222, "branch taken"     },
+	  /*
+	   * swap leaves the wrong value where stora expects an index, so the
+	   * store is REJECTED and the global keeps its zero. Kept because it
+	   * pins down exactly that: a bad index stores nothing at all.
+	   */
+	  {P21, (s32)(sizeof(P21)/4),    0, "swap, then bad index" }
+	};
+
+	for (k = 0; k < (int)(sizeof(PROGS) / sizeof(PROGS[0])); k++) {
+		got = script_run_prog(PROGS[k].code, PROGS[k].count, &status);
+		if ((s32)got != PROGS[k].expect) {
+			hlog("  FAIL script %-20s global0 = %d, want %d\n",
+			     PROGS[k].what, (s32)got, (s32)PROGS[k].expect);
+			bad++;
+		}
+		htrace("script %-22s -> global0 %6d status %2d\n",
+		       PROGS[k].what, (s32)got, status);
+	}
+
+	/* Status codes, against the table in ../docs/script-bytecode.txt 6.4. */
+	{
+		static const u32 S_TERM[]    = {0x082};
+		static const u32 S_DIV[]     = {0x110,1,0x093,0x110,0,0x255};
+		static const u32 S_MOD[]     = {0x110,1,0x093,0x110,0,0x256};
+		static const u32 S_UNDER[]   = {0x294};
+		static const u32 S_ILLEGAL[] = {0x999};
+		static const u32 S_LOOP[]    = {0x170,0xFFFFFFFEu};
+		static const u32 S_BADVAR[]  = {0x110,0x20000004u,0x020};
+		static const u32 S_BADLOC[]  = {0x110,0x300000C8u,0x020};
+		/* 0x181 takes its target from the OPERAND, not the accumulator. */
+		static const u32 S_NATIVE[]  = {0x181,0x40000009u};
+		/* 0x080 is the one that calls through the accumulator. */
+		static const u32 S_NATIVEA[] = {0x110,0x40000009u,0x080};
+		static const u32 S_RANGE[]   = {0x110,42};
+		static const u32 S_OVER[]    = {0x190,201};
+
+		static const struct {
+			const u32 *code;
+			s32        count;
+			int        expect;
+			const char *what;
+		} ST[] = {
+		  {S_TERM,    1, CORE_SCRIPT_TERMINATED, "ret on empty stack"},
+		  {S_DIV,     6, CORE_SCRIPT_DIV_ZERO,   "divide by zero"    },
+		  {S_MOD,     6, CORE_SCRIPT_DIV_ZERO,   "modulo by zero"    },
+		  {S_UNDER,   1, CORE_SCRIPT_UNDERFLOW,  "stack underflow"   },
+		  {S_ILLEGAL, 1, CORE_SCRIPT_ILLEGAL,    "illegal opcode"    },
+		  {S_LOOP,    2, CORE_SCRIPT_BUDGET_OUT, "infinite loop"     },
+		  {S_BADVAR,  3, CORE_SCRIPT_BAD_VAR,    "global out of range"},
+		  {S_BADLOC,  3, CORE_SCRIPT_BAD_VAR,    "local 200"         },
+		  {S_NATIVE,  2, CORE_SCRIPT_BAD_NATIVE, "call native by operand"},
+		  {S_NATIVEA, 3, CORE_SCRIPT_BAD_NATIVE, "call native by acc"   },
+		  {S_RANGE,   2, CORE_SCRIPT_RANGE,      "ran off the end"   },
+		  {S_OVER,    2, CORE_SCRIPT_OVERFLOW,   "stack overflow"    }
+		};
+
+		for (k = 0; k < (int)(sizeof(ST) / sizeof(ST[0])); k++) {
+			script_run_prog(ST[k].code, ST[k].count, &status);
+			if (status != ST[k].expect) {
+				hlog("  FAIL script status %-20s got %d, want %d\n",
+				     ST[k].what, status, ST[k].expect);
+				bad++;
+			}
+			htrace("script status %-22s -> %2d\n", ST[k].what, status);
+		}
+	}
+
+	/* The budget really is spent, not just tested. */
+	{
+		core_script vm;
+		u32 vars[SCRIPT_VARS + CORE_SCRIPT_LOCALS];
+		static const u32 loop[] = {0x170, 0xFFFFFFFEu};
+
+		core_script_init(&vm, loop, 2, vars, SCRIPT_VARS);
+		core_script_run(&vm);
+		if (vm.budget > 0) {
+			hlog("  FAIL script budget: %d left after a runaway loop\n",
+			     (int)vm.budget);
+			bad++;
+		}
+	}
+
+	hlog("Script interpreter     : %s (%d programs)\n", bad ? "FAIL" : "ok",
+	     (int)(sizeof(PROGS) / sizeof(PROGS[0])) + 12);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1713,6 +1896,7 @@ int main(int argc, char **argv)
 	bad += test_effect_chain();
 	bad += test_pak_change();
 	bad += test_tune_mode();
+	bad += test_script();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

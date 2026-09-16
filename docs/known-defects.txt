@@ -7,9 +7,10 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Four defects have been found during reverse engineering: two
+   Five defects have been found during reverse engineering: two
    arithmetic ones in wishk201.sys, a pair of unbounded string copies also
-   in the driver, and a race in wishh201.dll. This note records each one,
+   in the driver, a bounds check in the script interpreter that tests the
+   wrong value, and a race in wishh201.dll. This note records each one,
    the exact condition that triggers it, what it would actually do, and
    whether a user would be likely to notice. It also records claims that
    were made here and later RETRACTED, in sections 3 and 7.
@@ -19,11 +20,13 @@ Abstract
    reproducing a slip, and to record which observed behaviour is
    deliberate and which is accidental.
 
-   All three are in peripheral paths. NONE of them is in the script
-   interpreter, the HID report descriptor, the keyboard or mouse report
-   builders, or the private IOCTL surface. A user running complex
-   scripts would not encounter any of them, which is consistent with the
-   software's reputation for robustness.
+   All five are in paths a normal session does not reach. Only one is in
+   the script interpreter, and that one is masked one instruction later
+   by a check that does fire, so it has no observable effect. None is in
+   the HID report descriptor, the keyboard or mouse report builders, or
+   the private IOCTL surface. A user running complex scripts would not
+   encounter any of them, which is consistent with the software's
+   reputation for robustness.
 
 Table of Contents
 
@@ -34,12 +37,13 @@ Table of Contents
    5.  Defect 4: Race On The Launch-Detection Path Buffer
    6.  Defect 5: Unbounded String Copies Into Fixed Fields
    7.  RETRACTED: The Script State Field Is Not A Latch Bug
-   8.  What Is Not Affected
+   8.  Defect 6: The Immediate Call Bounds-Checks The Wrong Value
+   9.  What Is Not Affected
 
 1.  Severity Summary
 
-       defect                     path            active by default
-       ------------------------   -------------   -----------------
+       defect                     path             active by default
+       -------------------------  ---------------  ------------------
        button map filler entries  joystick report  yes, but needs a
                                                    rare button combo
        (stick cross-coupling)     joystick report  RETRACTED, see 3
@@ -49,6 +53,9 @@ Table of Contents
                                                    Game Launches on
        unbounded string copies    device naming    no, needs an
                                                    over-long name
+       immediate call bounds      script engine    yes, but masked by
+       check tests the wrong                       the next PC test,
+       value                                       so it does nothing
        (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
@@ -298,15 +305,83 @@ Table of Contents
    drives it had been read. Where a field's PURPOSE is inferred from one of
    its users, a defect in it is only as sound as that inference.
 
-8.  What Is Not Affected
+8.  Defect 6: The Immediate Call Bounds-Checks The Wrong Value
+
+   Location:  drv_ScriptExecute, the 0x181 handler at 00017ff2, and in
+              particular the compare at 00017ffc
+   Compare:   the 0x080 handler at 00017e3c, compare at 00017e46
+
+   Both call opcodes resolve a tagged target and, when the tag says the
+   target is a script function (0x10000000), range-check the resulting
+   word index against the code length before jumping. The indirect form,
+   opcode 0x080, checks the value it is about to jump to:
+
+       target = acc & 0x0fffffff
+       if (target < CodeCount)  { push return address; PC = target }
+       else                       status = 6
+
+   The immediate form, opcode 0x181, takes its target from the operand
+   word that follows the opcode but performs the comparison on the
+   ACCUMULATOR:
+
+       target = operand & 0x0fffffff
+       if (acc < CodeCount)     { push return address; PC = target }
+       else                       status = 6
+
+   The two handlers are otherwise the same shape, which is what makes the
+   slip visible. In the disassembly the accumulator lives in ECX for the
+   whole dispatch loop:
+
+       0x080 at 00017e3c        0x181 at 00017ff2
+         MOV EAX,[ESP+0x34]       MOV EAX,[ESP+0x34]    ; CodeCount
+         AND ECX,0xfffffff        AND EDX,0xfffffff     ; the target
+         CMP ECX,EAX              CMP ECX,EAX           ; <-- ECX not EDX
+         JL  taken                MOV [ESP+0x18],EDX
+                                  JL  taken
+
+   The accumulator at that point is whatever the previous instruction
+   left behind, and it has no relation to the call target. The comparison
+   is therefore not a bounds check at all: it passes or fails on an
+   unrelated value.
+
+   Trigger:  a direct call whose target word index is >= CodeCount, made
+   at a point where the accumulator happens to be less than CodeCount.
+   Scripts are compiled rather than hand-written and the configurator
+   emits only targets it has itself laid out, so a target past the end of
+   the code does not arise from a valid compile. Reaching it needs either
+   a corrupted code array or a hand-built one delivered through IOCTL
+   0xb98c20f0, which section 8 of script-bytecode.txt already notes is
+   accepted without a verification pass.
+
+   Effect:  PC is set past the end of the code array. The next iteration
+   of the interpreter loop re-tests PC against the code end at 00017c6a
+   and stops the thread with status 6, so no word outside the array is
+   ever fetched. A negative index cannot occur: the tag mask leaves 28
+   unsigned bits, so the largest possible target is 0x0fffffff.
+
+   Would a user notice:  no. The failure this check exists to catch is
+   caught one instruction later by the loop's own PC test, with the same
+   status code. The defect costs one wasted dispatch and nothing else.
+   It is recorded because it is a real slip, not because it has
+   consequences.
+
+   In the replacement:  NOT reproduced. core_script_run in
+   src_drv/script.c checks the target for both opcodes. The divergence is
+   deliberate and is commented at the point it occurs, because
+   reproducing it would mean writing code that is wrong on purpose to
+   preserve behaviour that cannot be observed.
+
+9.  What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
    software depends on them:
 
    -  The script compiler in wishd201.exe and the bytecode it emits.
-   -  The bytecode interpreter drv_ScriptExecute, including its bounds
-      checks and the 100000-instruction budget.
+   -  The bytecode interpreter drv_ScriptExecute and its
+      100000-instruction budget. Its per-instruction PC check is sound;
+      the one slip in its bounds checking is defect 6, section 8, and
+      that slip is masked by the per-instruction check.
    -  The native builtin library drv_ScriptNativeCall, including the
       thread, sleep, button and stick primitives.
    -  The keyboard and mouse report builders drv_HidKeyEvent,
@@ -317,5 +392,5 @@ Table of Contents
    -  The Controller Pak CRCs, which are the genuine N64 algorithms.
 
    A user writing complex scripts exercises every item in that list and
-   none of the three defects. That is the reason the software behaves
+   none of the five defects. That is the reason the software behaves
    robustly in practice despite them.
