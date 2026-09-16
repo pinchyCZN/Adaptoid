@@ -33,6 +33,9 @@ Table of Contents
    7.  Driver Installation
    7.1.  What The Installer Lays Down
    7.2.  How It Installs
+   7.3.  wishna1.inf
+   7.4.  Why It Does Not Install On Windows 7
+   7.5.  The DirectInput Registration
    8.  Game Launch Detection And wishh201.dll
    9.  Process And Thread Structure
    10. Consequences For The Replacement
@@ -298,9 +301,7 @@ Table of Contents
 
    wishna1.inf IS THE AUTHORITATIVE RECORD of the hardware ID, the setup
    class, the service name and the registry values the driver expects. It is
-   not in decomp/ and has not been read; a replacement's own INF is
-   reconstructed from the driver's behaviour instead, which is weaker
-   evidence. See src_drv/README.txt section 7.
+   specified in section 7.3.
 
 7.2.  How It Installs
 
@@ -344,6 +345,147 @@ Table of Contents
 
    with SHDeleteKeyA, which is what clears Windows' cached driver ranking for
    the device.
+
+7.3.  wishna1.inf
+
+   5,452 bytes, dated 8 September 2001, DriverVer 09/8/2001,2.1.0. It is the
+   install contract for wishk201.sys and it is short - most of its length is
+   a DirectInput registration, not device installation.
+
+   +----------------------+---------------------------------------------+
+   | Version              |                                             |
+   +======================+=============================================+
+   | Signature            | $CHICAGO$                                   |
+   | Class                | GCAClass                                    |
+   | ClassGUID            | {93B41274-8DDB-11D5-A5E3-00A0C99B19DF}      |
+   | Provider             | Wish Technologies                           |
+   +----------------------+---------------------------------------------+
+
+   IT DECLARES ITS OWN SETUP CLASS rather than using HIDClass, and creates
+   it from [ClassInstall32]:
+
+       HKR,,,,"Game controller adapters"
+       HKR,,Icon,,-23
+       HKR,,NoInstallClass,,1
+
+   That is a presentation choice - a category and an icon in Device Manager
+   - and it buys nothing functional. hidclass.sys still owns the device,
+   because wishk201.sys registers through HidRegisterMinidriver whatever
+   class the INF names. Section 7.4 is why it matters anyway.
+
+   THE HARDWARE ID IS MATCHED UNDECORATED:
+
+       [Manufacturer]
+       %Wish%=Wish
+
+       [Wish]
+       %DeviceDescU%=ADAPTOID,USB\VID_06F7&PID_0001
+
+   with [ADAPTOID] carrying the Windows 9x path - DevLoader *ntkern and
+   NTMPDriver wishk201.sys - and [ADAPTOID.NT] carrying the NT path, which
+   is an AddReg and nothing else.
+
+   THE SERVICE IS NAMED wishna1k, NOT wishk201:
+
+       [ADAPTOID.NT.Services]
+       AddService = wishna1k,2,ServiceInstall
+
+       DisplayName    = "Adaptoid Driver Service"
+       ServiceType    = 1          kernel driver
+       StartType      = 3          demand start
+       ErrorControl   = 0          ignore
+       ServiceBinary  = %12%\wishk201.sys
+
+   The binary and the service have different names, so a search for a
+   service called wishk201 finds nothing and means nothing. The driver
+   object is \Driver\wishna1k.
+
+   THERE IS NO CopyFiles ANYWHERE, and no [SourceDisksNames] or
+   [SourceDisksFiles]. The INF never copies wishk201.sys; it expects the
+   file to be in %12% already, put there by the installer. An INF-only
+   install therefore produces a service pointing at a file that may not
+   exist.
+
+7.4.  Why It Does Not Install On Windows 7
+
+   THE PACKAGE STAGES AND THE DEVICE STILL DOES NOT BIND. SetupCopyOEMInf
+   copies the INF into the driver store and publishes it - on a test system
+   it became oem7.inf, and the registry recorded
+
+       HKLM\Software\Wish Technologies\Adaptoid
+           WdmInf    = C:\Windows\INF\oem7.inf
+           Installed = yes
+
+   so by every appearance the install succeeded. It did not. Staging a
+   package does NOT register a setup class, and a device cannot be
+   installed with an INF whose class does not exist. The result is silent:
+   the device falls through to input.inf and binds Microsoft's HidUsb on
+   the compatible-ID match USB\Class_03&SubClass_00, which produces a
+   working plain joystick and no Wish driver at all.
+
+   HOW TO RECOGNISE IT. pnputil -e lists the package with
+
+       Class : Unknown driver class
+
+   where every healthy entry names its class, and
+
+       HKLM\SYSTEM\CurrentControlSet\Control\Class
+            \{93B41274-8DDB-11D5-A5E3-00A0C99B19DF}
+
+   is absent. The device's own Enum key then reads Service = HidUsb and
+   Mfg = (Standard system devices).
+
+   WHAT WORKS. A manual install - Device Manager, Update Driver Software,
+   Browse, Let me pick, Have Disk, pointed at wishna1.inf - goes through
+   SetupDiInstallDevice, which runs the full class-install path: it
+   processes [ClassInstall32], creates the class, then runs
+   [ADAPTOID.NT.Services]. Confirmed working on 32-bit Windows 7 SP1.
+
+   THE NODE MATTERS. The INF matches USB\VID_06F7&PID_0001, which is the
+   USB device node - Device Manager shows it under Human Interface Devices
+   as "USB Input Device". The "HID-compliant game controller" beside it is
+   the HID child hidclass created underneath, and the INF does not match it.
+   Pointing the install at the child does nothing.
+
+   The device moves out of Human Interface Devices into "Game controller
+   adapters" when it takes, which is the custom class being created.
+
+7.5.  The DirectInput Registration
+
+   Two thirds of the INF is Joy.AddReg, which has nothing to do with
+   loading the driver. It populates
+
+       HKLM\System\CurrentControlSet\Control\MediaProperties
+            \PrivateProperties\Joystick\OEM\VID_06F7&PID_0001
+
+   which is where DirectInput looks for per-device presentation: the axis
+   names X and Y with their attribute blobs, fourteen button names, and a
+   force-feedback block.
+
+   THE BUTTON NAMES ARE A THIRD INDEPENDENT SOURCE for the button map and
+   the N64 bit order; see ioctl-surface.txt section 7.
+
+   The force-feedback registration is
+
+       OEMForceFeedback  CLSID  {C9BB1D41-B9A2-11d3-8527-00A0C99B19DF}
+
+   plus the twelve standard DirectInput effect GUIDs - ConstantForce,
+   RampForce, Square, Sine, Triangle, SawtoothUp, SawtoothDown, Spring,
+   Damper, Inertia, Friction, CustomForce - each with an attribute blob
+   giving a 1000ms nominal duration. The effect engine documented in
+   driver-structures.txt is what services them.
+
+   ALL THREE OF WISH'S GUIDS SHARE A NODE. The setup class, the device
+   interface class read out of the driver at 00010358, and the force-
+   feedback CLSID all end in 00A0C99B19DF:
+
+       {93B41274-8DDB-11D5-A5E3-00A0C99B19DF}   setup class
+       {827E71A1-2CAF-11D3-8527-00A0C99B19DF}   device interface
+       {C9BB1D41-B9A2-11D3-8527-00A0C99B19DF}   force feedback
+
+   They were generated on one machine from one MAC address, which
+   corroborates that the interface GUID found in the binary is genuinely
+   Wish's and not something inherited from a sample.
 
 8.  Game Launch Detection And wishh201.dll
 

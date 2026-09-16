@@ -1,0 +1,228 @@
+Adaptoid Reverse Engineering                               Analysis Note
+
+
+                   LIVE KERNEL DEBUGGING OF THE ORIGINAL
+
+
+Abstract
+
+   How to break into wishk201.sys while it runs, in a 32-bit Windows 7
+   VirtualBox guest, driven from the host - and how to reach that session
+   from an agent over MCP.
+
+   THE DEBUGGER DOES NOT GO IN THE VM. Windows already contains everything
+   the guest side needs; it is a boot flag, not an install. The debugger
+   runs on the HOST and talks to the guest's built-in stub over a serial
+   port, which VirtualBox presents as a named pipe.
+
+   Three pieces have to agree, and each is configured in a different place:
+
+       the virtual serial port      VirtualBox, VM powered off
+       the guest's debug stub       bcdedit inside the guest, then reboot
+       the debugger                 kd or WinDbg on the host
+
+Table of Contents
+
+   1.  The Virtual Serial Port
+   2.  The Guest
+   3.  The Host Debugger
+   4.  Order Of Operations
+   5.  Driving It From An Agent
+   6.  Working Without Symbols
+   7.  When It Does Not Connect
+
+
+1.  The Virtual Serial Port
+
+   THE VM MUST BE POWERED OFF. A saved or paused VM will refuse the change;
+   a saved one has to have its state discarded, which loses that session.
+
+       VBoxManage modifyvm "tiny7" --uart1 0x3F8 4
+       VBoxManage modifyvm "tiny7" --uartmode1 server \\.\pipe\adaptoid-dbg
+
+   0x3F8 and IRQ 4 are COM1, which is what debugport:1 means in the guest.
+   The two must match or nothing connects.
+
+   "server" MEANS VIRTUALBOX CREATES THE PIPE. The debugger is then the
+   client. Getting this backwards - "client" mode, where VirtualBox expects
+   something else to have made the pipe - is the most common reason a
+   first attempt sees nothing at all.
+
+   In the GUI the same thing is Settings -> Serial Ports -> Port 1:
+
+       Enable Serial Port          ticked
+       Port Number                 COM1
+       Port Mode                   Host Pipe
+       Connect to existing pipe    UNTICKED  (this is what "server" means)
+       Path/Address                \\.\pipe\adaptoid-dbg
+
+   To check what a VM currently has:
+
+       VBoxManage showvminfo "tiny7" --machinereadable | findstr uart
+
+
+2.  The Guest
+
+   Nothing is installed. From an ELEVATED command prompt inside the VM:
+
+       bcdedit /debug on
+       bcdedit /dbgsettings serial debugport:1 baudrate:115200
+
+   then reboot the guest.
+
+   MAKE A SEPARATE BOOT ENTRY IF THE VM IS ALSO USED FOR ANYTHING ELSE. A
+   debug-enabled boot is slower and stalls early if the pipe is not there:
+
+       bcdedit /copy {current} /d "Windows 7 [debug]"
+
+   which prints a GUID; then apply /debug on to that GUID instead of
+   {current} and pick the entry at boot.
+
+   BAUD RATE IS NOMINAL over a named pipe - there is no real UART to run
+   slowly - but both ends must still name the same number.
+
+   Confirm it took:
+
+       bcdedit /enum {current}
+
+   and look for debug = Yes.
+
+   TEST SIGNING IS A SEPARATE THING and is not needed here. wishk201.sys is
+   a signed 2001 driver and 32-bit Windows 7 does not enforce kernel-mode
+   signing anyway. Test signing matters only for loading the REPLACEMENT;
+   see src_drv/README.txt section 7.
+
+
+3.  The Host Debugger
+
+   Two debuggers are present on this machine. Prefer the newer:
+
+       C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\kd.exe
+       E:\DEV\WinDDK\Debuggers\kd.exe            (6.12, from 2010)
+
+   THE x86 BUILD IS THE RIGHT ONE for a 32-bit guest. The x64 debugger can
+   drive a 32-bit target but the x86 one avoids a class of confusion about
+   pointer widths in extension output.
+
+   Connect with:
+
+       kd.exe -k com:pipe,port=\\.\pipe\adaptoid-dbg,resets=0,reconnect
+
+   resets=0 is correct for a pipe; it is a real-serial-line workaround.
+   reconnect reopens the pipe when the VM restarts, which saves relaunching
+   the debugger after every guest reboot.
+
+   Symbols for the KERNEL are worth having even though the driver has none:
+
+       .sympath srv*C:\symbols*https://msdl.microsoft.com/download/symbols
+       .reload
+
+   Without them every stack frame through ntoskrnl is a bare address.
+
+
+4.  Order Of Operations
+
+   The pipe only exists while the VM is running, so:
+
+       1. Start the VM. VirtualBox creates \\.\pipe\adaptoid-dbg.
+       2. Start kd. It connects and sits there.
+       3. Press Ctrl-C in kd to break in and get a prompt.
+
+   Starting kd first fails to find the pipe. With reconnect it will keep
+   trying, so the order is a convenience rather than a rule.
+
+   THE GUEST IS FROZEN WHILE YOU SIT AT THE PROMPT. Type g to let it run.
+
+
+5.  Driving It From An Agent
+
+   tools/kdmcp.py is an MCP server that owns a kd process and exposes the
+   session as tools.
+
+       python tools/kdmcp.py --pipe adaptoid-dbg
+
+   Register it the way the Ghidra bridge is registered - a stdio server
+   with the same interpreter:
+
+       command  C:\Program Files\Python310\python.exe
+       args     N:\DEV\ADAPTOID\tools\kdmcp.py
+
+   THE GHIDRA BRIDGE'S OWN DEBUGGER TOOLS CANNOT DO THIS. They proxy to a
+   separate server on port 8099 that is not installed here, and their
+   attach call takes a process name or a PID - there is no transport or
+   connection string anywhere in that API, so they reach user-mode
+   processes on the host and nothing else. Do not spend time trying to
+   point them at a VM.
+
+   The tools, and the order they are normally used in:
+
+       kd_start        launch kd against the pipe
+       kd_break        break in and get a prompt
+       kd_sync         find where wishk201.sys is loaded - SEE SECTION 6
+       kd_breakpoint   set one on a Ghidra address
+       kd_go           let it run
+       kd_registers    kd_stack  kd_read  kd_disasm
+       kd_cmd          anything else
+
+   kd_cmd IS NOT A FALLBACK, it is the main tool. Kernel work lives in
+   extension commands - !process, !irp, !devobj, !devstack, !drvobj - and
+   no wrapper can usefully enumerate those.
+
+
+6.  Working Without Symbols
+
+   wishk201.sys ships with no PDB, so kd knows nothing about it beyond its
+   load range. Two consequences, and both have a workaround.
+
+   ADDRESSES DO NOT MATCH THE DATABASE. The Ghidra image base is 0x10000
+   and the kernel loads the driver wherever it likes, so every address in
+   the analysis is wrong by a constant. kd_sync reads the live base out of
+   lm and records the difference:
+
+       kd_sync("wishk201", 0x10000)
+
+   after which kd_to_live turns a Ghidra address into a breakpoint target
+   and kd_to_static turns a crash address or a stack frame back into
+   something the annotated database can be searched for. THE THREE IMAGE
+   BASES ARE 0x10000 for the driver, 0x400000 for wishd201.exe and
+   0x10000000 for wishh201.dll.
+
+   THE DRIVER MAY NOT BE LOADED YET when you first break in. To catch it
+   arriving:
+
+       sxe ld wishk201
+
+   which breaks at load, after which kd_sync will find it.
+
+   STACKS THROUGH THE DRIVER ARE GUESSES. 2001 code is frame-pointer-light
+   and kd has nothing to walk, so frames inside wishk201.sys are often
+   wrong. Frames through ntoskrnl and hidclass are reliable if their
+   symbols are loaded. Read a driver frame as a hint and confirm it by
+   converting the address and looking at what is really there.
+
+
+7.  When It Does Not Connect
+
+   +---------------------------------+-----------------------------------+
+   | Symptom                         | Cause                             |
+   +=================================+===================================+
+   | kd says it cannot open the pipe | the VM is not running, so the     |
+   |                                 | pipe does not exist yet           |
+   | kd connects, Ctrl-C does        | the guest is not debug-enabled;   |
+   | nothing                         | check bcdedit /enum {current}     |
+   | kd connects but output is       | baud rate or COM port mismatch    |
+   |                                 | between the VM and the guest      |
+   | garbage                         | the port is I/O 0x3F8 IRQ 4 for   |
+   |                                 | debugport:1                       |
+   | the guest hangs early in boot   | debug is on and nothing is        |
+   |                                 | listening; start kd, or use a     |
+   |                                 | separate boot entry               |
+   | works once, then never again    | VirtualBox pipe not recreated;    |
+   |                                 | reconnect handles it, otherwise   |
+   |                                 | restart kd after the guest        |
+   +---------------------------------+-----------------------------------+
+
+   VIRTUALBOX SERIAL DEBUGGING IS SLOW. A break-in takes a moment and a
+   .reload of kernel symbols can take a minute. That is the transport, not
+   a fault. The faster network transport, KDNET, needs Windows 8 or later
+   in the guest and is not an option for this target.

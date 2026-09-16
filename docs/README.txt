@@ -45,6 +45,7 @@ Table of Contents
    | python tools/originmap.py --check| every function maps to an original |
    | tools/mktestcert.cmd             | make the test certificate, ONCE    |
    | tools/signdriver.cmd             | sign a build for a test machine    |
+   | python tools/kdmcp.py --pipe N   | MCP server driving a live kd       |
    +----------------------------------+------------------------------------+
 
    Run asciify.py --check before treating any document as finished. The two
@@ -69,6 +70,11 @@ Table of Contents
    | ioctl-surface.txt     | DONE. Every IOCTL code shared between       |
    |                       | wishd201.exe and wishk201.sys, with its     |
    |                       | input and output buffer layout.             |
+   +-----------------------+---------------------------------------------+
+   | kernel-debugging.txt  | DONE. Breaking into wishk201.sys live in a  |
+   |                       | Win7 VM: the VirtualBox serial pipe, the    |
+   |                       | guest's boot flag, the host debugger, and   |
+   |                       | driving the session from an agent.          |
    +-----------------------+---------------------------------------------+
    | command-block.txt     | DONE. The control device's OTHER surface:   |
    |                       | the 64-byte joybus command block the vendor |

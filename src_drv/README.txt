@@ -375,6 +375,18 @@ Table of Contents
    mouse and a game controller, so installing it as a raw USB device loses
    the property the driver exists for.
 
+   IT DIVERGES FROM THE ORIGINAL'S INF DELIBERATELY. wishna1.inf declares a
+   CUSTOM setup class, GCAClass, and creates it from [ClassInstall32] - and
+   that is precisely what stops it installing on Windows 7, because staging
+   a package does not register a class and a device cannot bind to an INF
+   whose class does not exist. Using the standard HIDClass removes the
+   failure mode. The original's INF is specified in
+   ../docs/configurator-architecture.txt sections 7.3 to 7.5.
+
+   It also carries the DirectInput registration the original's Joy.AddReg
+   writes - axis and button names - minus the force-feedback CLSID, which
+   names a COM object only Wish shipped.
+
    It also writes the one setting the driver reads. Note where:
 
        HKLM\Software\Wish Technologies\Adaptoid    VirtualDevices

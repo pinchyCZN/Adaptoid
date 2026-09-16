@@ -7,8 +7,24 @@
 ; as a keyboard, a mouse and a game controller at once. Installing it as
 ; anything else loses the property the driver exists for.
 ;
-; The hardware ID is the adapter's own, read out of the original's
-; descriptors: vendor 0x06F7, product 0x0001.
+; A DELIBERATE DIVERGENCE FROM wishna1.inf, WHICH DECLARES ITS OWN CLASS.
+; The original creates a custom setup class, GCAClass
+; {93B41274-8DDB-11D5-A5E3-00A0C99B19DF}, "Game controller adapters", from
+; a [ClassInstall32] section. That buys nothing functional - hidclass still
+; owns the device either way - and it is exactly what makes the original
+; fail to install on Windows 7: staging a package does not register a
+; class, so the device silently falls through to Microsoft's HidUsb and
+; the driver never loads. See docs/configurator-architecture.txt 7.4.
+;
+; Using the standard HIDClass removes that failure mode entirely, at the
+; cost of the device appearing under Human Interface Devices rather than
+; in a category of its own.
+;
+; The hardware ID is the adapter's own: vendor 0x06F7, product 0x0001,
+; confirmed against live hardware and against wishna1.inf.
+;
+; THE ORIGINAL'S SERVICE IS NAMED wishna1k, not after its binary. This one
+; is named after its binary on purpose; nothing depends on the old name.
 ;
 ; UNSIGNED. 64-bit Windows will not load this without test signing enabled:
 ;
@@ -89,13 +105,59 @@ LoadOrderGroup = Base
 ; ---------------------------------------------------------------------
 
 [Adaptoid_Install.NT.HW]
-AddReg = Adaptoid_Settings
+AddReg = Adaptoid_Settings, Adaptoid_Joystick
+
+; ---------------------------------------------------------------------
+; The DirectInput presentation, from wishna1.inf's Joy.AddReg.
+;
+; WITHOUT THIS THE BUTTONS ARE NUMBERED, NOT NAMED. DirectInput and the
+; Game Controllers control panel read per-device names from here; with the
+; key absent an application shows "Button 1" where it could show "A".
+;
+; The names and their order are the original's, and they are the third
+; independent confirmation of the button map - see
+; ../docs/ioctl-surface.txt section 7. They are DESTINATION numbers, so
+; they follow drv_ButtonMap rather than the N64 bit order.
+;
+; THE FORCE-FEEDBACK BLOCK IS DELIBERATELY OMITTED. wishna1.inf also
+; registers OEMForceFeedback with CLSID
+; {C9BB1D41-B9A2-11D3-8527-00A0C99B19DF} and twelve effect GUIDs. That
+; CLSID names Wish's own COM object, which this replacement does not ship;
+; registering it would have DirectInput try to create something that is
+; not there. The rumble motor is driven through the private IOCTL surface
+; instead.
+; ---------------------------------------------------------------------
+
+[Adaptoid_Joystick]
+HKLM,%OEMKEY%\%VIDPID%,OEMName,,%DeviceName%
+
+HKLM,%OEMKEY%\%VIDPID%\Axes\0,,,"X axis"
+HKLM,%OEMKEY%\%VIDPID%\Axes\1,,,"Y axis"
+HKLM,%OEMKEY%\%VIDPID%\Axes\0,Attributes,1,01,01,00,00,01,00,30,00
+HKLM,%OEMKEY%\%VIDPID%\Axes\1,Attributes,1,01,01,00,00,01,00,31,00
+
+HKLM,%OEMKEY%\%VIDPID%\Buttons\0,,,"A"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\1,,,"C-Down"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\2,,,"C-Right"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\3,,,"B"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\4,,,"C-Left"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\5,,,"C-Up"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\6,,,"L"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\7,,,"R"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\8,,,"Start"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\9,,,"Z"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\10,,,"D-Up"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\11,,,"D-Down"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\12,,,"D-Left"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\13,,,"D-Right"
 
 [Adaptoid_Settings]
 HKLM,"Software\Wish Technologies\Adaptoid","VirtualDevices",0x00010001,7
 
 [Strings]
 ProviderName = "Adaptoid clean-room replacement"
+VIDPID       = "VID_06F7&PID_0001"
+OEMKEY       = "System\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM"
 DiskName     = "Adaptoid Driver Disk"
 DeviceName   = "Adaptoid N64 Controller Adapter"
 ServiceName  = "Adaptoid HID minidriver"

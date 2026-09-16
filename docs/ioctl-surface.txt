@@ -671,6 +671,24 @@ Table of Contents
        L -> 7        R -> 8
        C-up -> 6     C-down -> 2   C-left -> 5   C-right -> 3
 
+   A THIRD SOURCE AGREES, and it is the strongest of them because it was
+   written by the vendor for a different purpose entirely. wishna1.inf's
+   Joy.AddReg section registers DirectInput button names under
+
+       HKLM\System\CurrentControlSet\Control\MediaProperties
+             \PrivateProperties\Joystick\OEM\VID_06F7&PID_0001\Buttons
+
+   naming buttons 0 through 13 in order:
+
+       0 A          1 C-Down     2 C-Right    3 B
+       4 C-Left     5 C-Up       6 L          7 R
+       8 Start      9 Z         10 D-Up      11 D-Down
+      12 D-Left    13 D-Right
+
+   Those are the DESTINATION numbers, zero based, and all fourteen match
+   the table above exactly. So the bit order and the map are each confirmed
+   by the driver, the configurator and the INF independently.
+
    Indices 8 and 9 are the Reset and unused bit positions and hold 0. The
    builder does not special-case them, so either bit being set asserts HID
    button 1, the same bit as A. The configurator names those two slots
