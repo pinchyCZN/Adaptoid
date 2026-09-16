@@ -216,6 +216,35 @@ Table of Contents
    timer-tick claim and defers to drv_EffectTick if one is waiting, so a new
    tick always preempts a chain already in flight.
 
+   TWO MORE SUB-COMMANDS reach the same drv_EffectSendUpdate path when the
+   accessory comes or goes: 0x34 for an insert and 0x35 for a remove. They
+   carry the bitmap exactly as the other window sends do.
+
+   WHICH CHANGES FIRE THE HOOK IS ASYMMETRIC, and the asymmetry is easy to
+   misread as an oversight. drv_BuildJoystickReport acts only when the effect
+   state is 2 or more, and then:
+
+   +-------+---------+---------------------------------------------------+
+   | State | Change  | What happens                                      |
+   +=======+=========+===================================================+
+   | 1     | either  | nothing; the engine has not begun sending yet     |
+   | 2     | insert  | hook fires with 0x34, then the state becomes 3    |
+   | 2     | remove  | NO HOOK. The state simply becomes 3, and it is    |
+   |       |         | the NEXT change that is acted on.                 |
+   | 3     | either  | hook fires, 0x34 on insert and 0x35 on remove     |
+   +-------+---------+---------------------------------------------------+
+
+   Verified by emulating drv_BuildJoystickReport across all six
+   state-and-direction combinations and watching for the call.
+
+   ONE ORDERING DETAIL MATTERS MORE THAN IT LOOKS. drv_EffectSendUpdate
+   evaluates the ring BEFORE testing EffectIdleTicks, and that evaluation is
+   what drives the idle count up when nothing is playing. So a pak change
+   arriving while no effect is running sends the MOTOR STOP 0x32 rather than
+   a window, and clears RingCount as it goes. That is correct rather than
+   accidental: there is nothing to rumble, so the right answer is to stop the
+   motor.
+
    3.3.  The Two Accessory CRCs
 
    Accessory reads and writes carry two checksums, computed by

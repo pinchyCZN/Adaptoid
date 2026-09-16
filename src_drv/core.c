@@ -289,6 +289,32 @@ void core_on_raw_packet(core_state *cs, const u8 *raw)
 	    (cs->status & CORE_STATUS_PAK_REMOVED) == 0) {
 		cs->accessory_state = CORE_ACC_NEEDED;
 	}
+
+	/*
+	 * The accessory came or went. The effect engine only cares once it has
+	 * started sending - state PERIODIC or later - because before that there
+	 * is nothing playing to interrupt.
+	 *
+	 * NOTE THE ASYMMETRY, which is the original's and not an oversight
+	 * here: in state PERIODIC only an INSERT fires the hook. A remove in
+	 * that state merely promotes the state, and it is the next change that
+	 * is acted on. From state 3 onwards both directions fire.
+	 */
+	{
+		int was = (cs->prev_status & CORE_STATUS_PAK_PRESENT) ? 1 : 0;
+		int now = (cs->status & CORE_STATUS_PAK_PRESENT) ? 1 : 0;
+
+		if (cs->effect_state > CORE_FX_STATE_TICK && was != now) {
+			if (cs->effect_state > CORE_FX_STATE_PERIODIC || now) {
+				core_effect_on_pak_change(cs, now);
+			}
+			if (cs->effect_state == CORE_FX_STATE_PERIODIC) {
+				cs->effect_state = CORE_FX_STATE_PAK;
+				cs->prev_status  = cs->status;
+				return;
+			}
+		}
+	}
 	cs->prev_status = cs->status;
 
 	/*
@@ -973,6 +999,143 @@ int core_effect_tick(core_state *cs, u64 now_100ns)
 	 */
 	if (cs->effect_state == CORE_FX_STATE_TICK) {
 		return core_effect_keepalive(cs, now_100ns);
+	}
+	return 0;
+}
+
+void core_set_vendor_claim(core_state *cs, core_vendor_claim_fn claim)
+{
+	if (cs != 0) {
+		cs->vendor_claim = claim;
+	}
+}
+
+/* Take the single vendor slot, or record that this work still wants it. */
+static int core_effect_claim(core_state *cs, int *claim_flag)
+{
+	if (cs->vendor_claim == 0) {
+		return 1;               /* no arbitration installed */
+	}
+	if (cs->vendor_claim(cs->vendor_ctx)) {
+		return 1;
+	}
+	*claim_flag = 1;
+	return 0;
+}
+
+/*
+ * Extend the ring by a window and send it, tagged with the sub-command that
+ * says why. The idle case takes over entirely: once the engine has had
+ * nothing to play for more than four ticks it stops the motor instead and
+ * throws the precomputed ticks away, because they describe silence.
+ */
+static int core_effect_send_update(core_state *cs, u8 sub)
+{
+	u8 payload[CORE_EFFECT_PAYLOAD];
+
+	core_effect_evaluate(cs, 0, cs->next_tick, payload);
+	cs->next_tick += CORE_EFFECT_WINDOW;
+
+	if (cs->effect_idle_ticks > 4) {
+		core_effect_ring_reset(cs);
+		return core_effect_issue(cs, CORE_FX_CMD_STOP, 0, 0,
+		                         CORE_FX_NEXT_NONE);
+	}
+	return core_effect_send_bitmap(cs, sub, payload, CORE_FX_NEXT_NONE);
+}
+
+static int core_effect_on_pak_insert(core_state *cs)
+{
+	cs->claim_pak_insert = 0;
+	return core_effect_send_update(cs, CORE_FX_CMD_PAK_INSERT);
+}
+
+static int core_effect_on_pak_remove(core_state *cs)
+{
+	cs->claim_pak_remove = 0;
+	return core_effect_send_update(cs, CORE_FX_CMD_PAK_REMOVE);
+}
+
+void core_effect_on_pak_change(core_state *cs, int present)
+{
+	if (cs == 0) {
+		return;
+	}
+	if (present) {
+		if (core_effect_claim(cs, &cs->claim_pak_insert)) {
+			core_effect_on_pak_insert(cs);
+		}
+	} else {
+		if (core_effect_claim(cs, &cs->claim_pak_remove)) {
+			core_effect_on_pak_remove(cs);
+		}
+	}
+}
+
+void core_effect_update_complete(core_state *cs)
+{
+	if (cs != 0) {
+		cs->effect_state = CORE_FX_STATE_TICK;
+	}
+}
+
+int core_effect_run(core_state *cs, u64 now_100ns)
+{
+	if (cs == 0) {
+		return 0;
+	}
+	if (!core_effect_claim(cs, &cs->claim_effect_tick)) {
+		return 0;
+	}
+	if (core_effect_tick(cs, now_100ns)) {
+		return 1;
+	}
+	/* Nothing went out, so hand the slot on rather than holding it. */
+	return core_effect_run_deferred(cs, now_100ns);
+}
+
+int core_effect_kick(core_state *cs, u64 now_100ns)
+{
+	if (cs == 0) {
+		return 0;
+	}
+	cs->effect_idle_ticks = 0;
+	return core_effect_run(cs, now_100ns);
+}
+
+/*
+ * Drain deferred work in the original's fixed priority order, stopping as
+ * soon as something puts a transfer in flight - its completion will drain
+ * the rest. The idle-command claim sits above these in the original and is
+ * not part of the effect engine, so it is not handled here.
+ */
+int core_effect_run_deferred(core_state *cs, u64 now_100ns)
+{
+	int guard = 0;
+
+	if (cs == 0) {
+		return 0;
+	}
+	while (guard++ < CORE_EFFECT_SLOTS) {
+		if (cs->claim_effect_tick) {
+			if (core_effect_tick(cs, now_100ns)) {
+				return 1;
+			}
+			continue;
+		}
+		if (cs->claim_pak_insert) {
+			if (core_effect_on_pak_insert(cs)) {
+				return 1;
+			}
+			continue;
+		}
+		if (cs->claim_pak_remove) {
+			if (core_effect_on_pak_remove(cs)) {
+				return 1;
+			}
+			continue;
+		}
+		break;                  /* nothing pending; the slot is free */
 	}
 	return 0;
 }

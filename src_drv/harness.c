@@ -1324,6 +1324,201 @@ static int test_effect_chain(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Pak insert and remove                                               */
+/* ------------------------------------------------------------------ */
+
+/* The single vendor slot: claimable only while nothing is in flight. */
+static int harness_claim(void *ctx)
+{
+	(void)ctx;
+	return g_bus_busy ? 0 : 1;
+}
+
+/* A device that is past its probe and already playing something. */
+static void pak_arm(core_state *cs, s32 effect_state, u8 prev_status)
+{
+	core_init(cs, 0, 0);
+	core_set_vendor(cs, harness_vendor, 0);
+	core_set_vendor_claim(cs, harness_claim);
+	cs->accessory_state = CORE_ACC_FOUND_1;
+	cs->effect_state    = effect_state;
+	cs->prev_status     = prev_status;
+
+	/*
+	 * SOMETHING MUST BE PLAYING for the hook to send a window. The update
+	 * path evaluates the ring BEFORE testing the idle count, so with no
+	 * effect armed the idle count reaches the window length during that
+	 * very evaluation and the hook sends the motor-stop instead. That is
+	 * the original's ordering, not a quirk here - a pak change while
+	 * nothing is rumbling legitimately means "stop the motor".
+	 */
+	cs->effect[0].type       = CORE_FX_CONSTANT;
+	cs->effect[0].running    = 1;
+	cs->effect[0].start_tick = 0;
+	cs->effect[0].duration   = CORE_FX_INFINITE;
+	cs->effect[0].axis[0].periodic.magnitude = 40;
+	cs->effect[0].axis[1].periodic.magnitude = 40;
+	bus_reset(0);
+}
+
+/* One poll, carrying a status byte and nothing else. */
+static void pak_poll(core_state *cs, u8 status)
+{
+	u8 raw[CORE_RAW_PACKET_BYTES];
+
+	raw[CORE_RAW_X]          = 0;
+	raw[CORE_RAW_Y]          = 0;
+	raw[CORE_RAW_STATUS]     = status;
+	raw[CORE_RAW_BUTTONS_HI] = 0;
+	raw[CORE_RAW_BUTTONS_LO] = 0;
+	core_on_raw_packet(cs, raw);
+}
+
+#define PAK_IN  (CORE_STATUS_VALID | CORE_STATUS_PAK_PRESENT)
+#define PAK_OUT (CORE_STATUS_VALID)
+
+static int test_pak_change(void)
+{
+	core_state cs;
+	int bad = 0;
+
+	/* 1. Insert while the engine is sending: fires 0x34, state promotes. */
+	pak_arm(&cs, CORE_FX_STATE_PERIODIC, PAK_OUT);
+	pak_poll(&cs, PAK_IN);
+	if (g_bus_count != 1 || g_bus_log[0].bRequest != CORE_FX_CMD_PAK_INSERT) {
+		hlog("  FAIL pak insert: %d transfers, first %02X, want 1 and %02X\n",
+		     g_bus_count, g_bus_count ? g_bus_log[0].bRequest : 0,
+		     CORE_FX_CMD_PAK_INSERT);
+		bad++;
+	}
+	if (cs.effect_state != CORE_FX_STATE_PAK) {
+		hlog("  FAIL pak insert: state %d, want %d\n",
+		     (int)cs.effect_state, CORE_FX_STATE_PAK);
+		bad++;
+	}
+
+	/*
+	 * 2. REMOVE while merely sending does NOT fire - it only promotes the
+	 *    state. That asymmetry is the original's; see core_on_raw_packet.
+	 */
+	pak_arm(&cs, CORE_FX_STATE_PERIODIC, PAK_IN);
+	pak_poll(&cs, PAK_OUT);
+	if (g_bus_count != 0) {
+		hlog("  FAIL pak remove in periodic: %d transfers, want 0\n",
+		     g_bus_count);
+		bad++;
+	}
+	if (cs.effect_state != CORE_FX_STATE_PAK) {
+		hlog("  FAIL pak remove in periodic: state %d, want %d\n",
+		     (int)cs.effect_state, CORE_FX_STATE_PAK);
+		bad++;
+	}
+
+	/* 3. From the pak state, a remove does fire, with 0x35. */
+	pak_arm(&cs, CORE_FX_STATE_PAK, PAK_IN);
+	pak_poll(&cs, PAK_OUT);
+	if (g_bus_count != 1 || g_bus_log[0].bRequest != CORE_FX_CMD_PAK_REMOVE) {
+		hlog("  FAIL pak remove: %d transfers, first %02X, want 1 and %02X\n",
+		     g_bus_count, g_bus_count ? g_bus_log[0].bRequest : 0,
+		     CORE_FX_CMD_PAK_REMOVE);
+		bad++;
+	}
+
+	/* 4. Before the engine starts sending, nothing is interrupted. */
+	pak_arm(&cs, CORE_FX_STATE_TICK, PAK_OUT);
+	pak_poll(&cs, PAK_IN);
+	if (g_bus_count != 0) {
+		hlog("  FAIL pak in tick state: %d transfers, want 0\n",
+		     g_bus_count);
+		bad++;
+	}
+
+	/* 5. No change in the bit means no hook, however often it is polled. */
+	pak_arm(&cs, CORE_FX_STATE_PAK, PAK_IN);
+	pak_poll(&cs, PAK_IN);
+	pak_poll(&cs, PAK_IN);
+	if (g_bus_count != 0) {
+		hlog("  FAIL pak steady: %d transfers, want 0\n", g_bus_count);
+		bad++;
+	}
+
+	/*
+	 * 6. A busy slot defers the work rather than dropping it, and the
+	 *    deferred drain picks it up once the slot frees.
+	 */
+	pak_arm(&cs, CORE_FX_STATE_PAK, PAK_OUT);
+	g_bus_busy = 1;                     /* something already in flight */
+	pak_poll(&cs, PAK_IN);
+	if (g_bus_count != 0) {
+		hlog("  FAIL pak deferred: %d transfers while busy, want 0\n",
+		     g_bus_count);
+		bad++;
+	}
+	if (!cs.claim_pak_insert) {
+		hlog("  FAIL pak deferred: the claim was not recorded\n");
+		bad++;
+	}
+	g_bus_busy = 0;
+	core_effect_run_deferred(&cs, 100000000);
+	if (g_bus_count != 1 ||
+	    g_bus_log[0].bRequest != CORE_FX_CMD_PAK_INSERT) {
+		hlog("  FAIL pak deferred: drain issued %d transfers, first %02X\n",
+		     g_bus_count, g_bus_count ? g_bus_log[0].bRequest : 0);
+		bad++;
+	}
+	if (cs.claim_pak_insert) {
+		hlog("  FAIL pak deferred: the claim was not cleared\n");
+		bad++;
+	}
+
+	/*
+	 * 7. Once the engine has been idle long enough the hook stops the motor
+	 *    instead of sending a window, and throws the ring away because it
+	 *    describes silence.
+	 */
+	pak_arm(&cs, CORE_FX_STATE_PAK, PAK_OUT);
+	cs.effect[0].running = 0;           /* nothing playing -> goes idle */
+	cs.ring_count        = 32;
+	pak_poll(&cs, PAK_IN);
+	if (g_bus_count != 1 || g_bus_log[0].bRequest != CORE_FX_CMD_STOP) {
+		hlog("  FAIL pak idle: %d transfers, first %02X, want 1 and %02X\n",
+		     g_bus_count, g_bus_count ? g_bus_log[0].bRequest : 0,
+		     CORE_FX_CMD_STOP);
+		bad++;
+	}
+	if (cs.ring_count != 0) {
+		hlog("  FAIL pak idle: ring count %d, want 0\n", (int)cs.ring_count);
+		bad++;
+	}
+
+	/* 8. The motor-stop completion puts the engine back to the tick state. */
+	core_effect_update_complete(&cs);
+	if (cs.effect_state != CORE_FX_STATE_TICK) {
+		hlog("  FAIL update complete: state %d, want %d\n",
+		     (int)cs.effect_state, CORE_FX_STATE_TICK);
+		bad++;
+	}
+
+	/*
+	 * 9. Deferred work runs in priority order: a waiting timer tick beats
+	 *    an insert, which beats a remove.
+	 */
+	pak_arm(&cs, CORE_FX_STATE_PAK, PAK_OUT);
+	cs.claim_pak_remove  = 1;
+	cs.claim_pak_insert  = 1;
+	cs.claim_effect_tick = 1;
+	core_effect_run_deferred(&cs, 100000000);
+	if (g_bus_count < 1 || g_bus_log[0].bRequest != CORE_FX_CMD_TICK) {
+		hlog("  FAIL deferred priority: first was %02X, want %02X\n",
+		     g_bus_count ? g_bus_log[0].bRequest : 0, CORE_FX_CMD_TICK);
+		bad++;
+	}
+
+	hlog("Pak insert and remove  : %s (9 groups)\n", bad ? "FAIL" : "ok");
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1394,6 +1589,7 @@ int main(int argc, char **argv)
 	bad += test_accessory_probe();
 	bad += test_effect_engine();
 	bad += test_effect_chain();
+	bad += test_pak_change();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

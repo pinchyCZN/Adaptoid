@@ -123,6 +123,24 @@ typedef struct core_vendor_req {
  */
 typedef int (*core_vendor_fn)(void *ctx, const core_vendor_req *req);
 
+/*
+ * THE VENDOR SLOT.
+ *
+ * There is exactly one control transfer in flight at a time, and the
+ * original arbitrates it with a claim: take the slot if it is free,
+ * otherwise set a flag so the work is picked up when the slot frees.
+ *
+ * This callback is that claim. It returns non-zero if the slot was taken.
+ * Installing one is optional - with none, the slot is treated as always
+ * free, which is what the probe assumes.
+ *
+ * It matters because a step that cannot send must not evaluate the ring
+ * either: doing so would advance the window without transmitting it, and
+ * the next verify pass would then compare against a window the controller
+ * never received.
+ */
+typedef int (*core_vendor_claim_fn)(void *ctx);
+
 /* Transfer direction, the two values bmRequestType ever takes here. */
 #define CORE_VENDOR_OUT         0x40u   /* host to device */
 #define CORE_VENDOR_IN          0xC0u   /* device to host */
@@ -273,6 +291,8 @@ typedef struct core_effect_slot {
 #define CORE_FX_CMD_PERIODIC    0x35    /* continuation window        */
 #define CORE_FX_CMD_TICK        0x36    /* re-armed window            */
 #define CORE_FX_CMD_KEEPALIVE   0x72    /* the register poke          */
+#define CORE_FX_CMD_PAK_INSERT  0x34    /* an accessory arrived       */
+#define CORE_FX_CMD_PAK_REMOVE  0x35    /* an accessory left          */
 
 #define CORE_FX_KEEPALIVE_VALUE 0xFF22
 #define CORE_FX_KEEPALIVE_INDEX 0x0094
@@ -284,6 +304,7 @@ typedef struct core_effect_slot {
 #define CORE_FX_STATE_IDLE      0
 #define CORE_FX_STATE_TICK      1
 #define CORE_FX_STATE_PERIODIC  2
+#define CORE_FX_STATE_PAK       3   /* a pak change has been seen      */
 
 /* Which step owns the completion of the transfer now in flight. */
 #define CORE_FX_NEXT_NONE       0
@@ -359,8 +380,17 @@ typedef struct core_state {
 	s32             effect_state;   /* CORE_FX_STATE_*                     */
 	s32             next_tick;      /* first tick of the next window       */
 	u64             keepalive_time; /* raw 100ns of the last register poke */
-	int             claim_effect_tick; /* a timer tick is waiting          */
 	u8              effect_next;    /* CORE_FX_NEXT_*, owns the completion */
+
+	/*
+	 * Deferred work. Each flag means "this could not run because the
+	 * vendor slot was busy"; core_effect_run_deferred drains them in the
+	 * original's fixed priority order.
+	 */
+	int             claim_effect_tick;
+	int             claim_pak_insert;
+	int             claim_pak_remove;
+	core_vendor_claim_fn vendor_claim;
 
 	/*
 	 * Motor drive calibration. These are NOT tuning-mode-only values: the
@@ -495,6 +525,35 @@ void core_effect_ring_reset(core_state *cs);
  */
 int core_effect_tick(core_state *cs, u64 now_100ns);
 int core_effect_complete(core_state *cs, u64 now_100ns);
+
+/* Install the vendor-slot claim; see core_vendor_claim_fn. Optional. */
+void core_set_vendor_claim(core_state *cs, core_vendor_claim_fn claim);
+
+/*
+ * PAK INSERT AND REMOVE.
+ *
+ * core_on_raw_packet calls core_effect_on_pak_change by itself when the
+ * status byte says the accessory came or went, so a driver does not have to.
+ * present is non-zero when a Pak is now in the port.
+ *
+ * The hook sends an effect update carrying sub-command 0x34 for an insert
+ * and 0x35 for a remove - or the motor-stop 0x32 instead, if the engine has
+ * been idle long enough. If the vendor slot is busy the work is deferred.
+ */
+void core_effect_on_pak_change(core_state *cs, int present);
+
+/*
+ * core_effect_run claims the slot and runs one timer tick; core_effect_kick
+ * clears the idle count first, which is what a change to the effect set
+ * does. core_effect_run_deferred drains whatever could not run earlier and
+ * releases the slot when nothing is left.
+ *
+ * core_effect_update_complete is the completion of the motor-stop transfer.
+ */
+int  core_effect_run(core_state *cs, u64 now_100ns);
+int  core_effect_kick(core_state *cs, u64 now_100ns);
+int  core_effect_run_deferred(core_state *cs, u64 now_100ns);
+void core_effect_update_complete(core_state *cs);
 
 void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx);
 int  core_probe_start(core_state *cs);
