@@ -5349,6 +5349,529 @@ static int test_wdm_transport(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the fake device stack                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Every stage-three call the PnP dispatcher makes is recorded here in
+ * order. That ordering IS the thing worth testing: the original tears down
+ * before passing REMOVE and STOP down, and passes START and
+ * QUERY_CAPABILITIES down before acting, and getting those backwards would
+ * have the poll loop touching USB resources the bus driver has reclaimed.
+ */
+#define PNPLOG 32
+static const char *g_pnp_log[PNPLOG];
+static int         g_pnp_count;
+static PADAPTOID_DEVEXT g_pnp_devext;
+
+static void pnp_note(const char *what)
+{
+	if (g_pnp_count < PNPLOG) {
+		g_pnp_log[g_pnp_count] = what;
+	}
+	g_pnp_count++;
+}
+
+/* Where in the log a call appears, or -1. */
+static int pnp_at(const char *what)
+{
+	int i;
+
+	/* By CONTENT, not by pointer: the literals live in two translation
+	 * units and nothing guarantees the compiler pools them. */
+	for (i = 0; i < g_pnp_count && i < PNPLOG; i++) {
+		const char *a = g_pnp_log[i];
+		const char *b = what;
+
+		while (*a != 0 && *a == *b) {
+			a++;
+			b++;
+		}
+		if (*a == *b) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static NTSTATUS g_lower_status = STATUS_SUCCESS;
+static int      g_lower_calls;
+
+NTSTATUS IofCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	(void)DeviceObject;
+	pnp_note("passdown");
+	g_lower_calls++;
+	Irp->IoStatus.Status = g_lower_status;
+	return g_lower_status;
+}
+
+void IoCopyCurrentIrpStackLocationToNext(PIRP Irp) { (void)Irp; }
+void IoSkipCurrentIrpStackLocation(PIRP Irp)       { (void)Irp; }
+
+PADAPTOID_DEVEXT AdaptoidDevExtOf(PDEVICE_OBJECT DeviceObject)
+{
+	(void)DeviceObject;
+	return g_pnp_devext;
+}
+
+static NTSTATUS g_descriptor_status = STATUS_SUCCESS;
+static NTSTATUS g_selectcfg_status  = STATUS_SUCCESS;
+
+NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("descriptor"); return g_descriptor_status; }
+
+NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("selectcfg"); return g_selectcfg_status; }
+
+void AdaptoidSetDeviceName(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("name"); }
+
+void AdaptoidPollStart(PADAPTOID_DEVEXT DevExt, ULONG Reason)
+{ (void)DevExt; (void)Reason; pnp_note("pollstart"); }
+
+void AdaptoidPollStop(PADAPTOID_DEVEXT DevExt, ULONG Reason)
+{ (void)DevExt; (void)Reason; pnp_note("pollstop"); }
+
+void AdaptoidQuiesceIo(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("quiesce"); }
+
+void AdaptoidUnconfigureDevice(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("unconfigure"); }
+
+void AdaptoidAbortPipes(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("abortpipes"); }
+
+void AdaptoidFreeDeviceResources(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("freeres"); }
+
+void AdaptoidEnableInterface(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("enableiface"); }
+
+void AdaptoidRegistryRemove(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; pnp_note("unregister"); }
+
+void AdaptoidSetCompletionRoutine(PIRP Irp, PVOID Event)
+{
+	/* Nothing below will signal it, so signal it here - the dispatcher
+	 * only waits when the lower driver returned STATUS_PENDING, and the
+	 * fake one never does. */
+	(void)Irp;
+	((PKEVENT)Event)->Signalled = 1;
+}
+
+void AdaptoidStartNextPowerIrp(PIRP Irp) { (void)Irp; pnp_note("nextpower"); }
+
+/* Which handler a triaged request reached. */
+static const char *g_route_hit;
+
+static NTSTATUS NTAPI hidclass_stub(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "hidclass"; return STATUS_SUCCESS; }
+
+NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
+NTSTATUS NTAPI AdaptoidControlCleanup(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
+NTSTATUS NTAPI AdaptoidControlClose(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
+NTSTATUS NTAPI AdaptoidControlIoctl(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
+NTSTATUS NTAPI AdaptoidControlReadWrite(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
+NTSTATUS NTAPI AdaptoidChannelCreate(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "private"; return STATUS_SUCCESS; }
+NTSTATUS NTAPI AdaptoidChannelClose(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "private"; return STATUS_SUCCESS; }
+NTSTATUS NTAPI AdaptoidChannelIoctl(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; g_route_hit = "private"; return STATUS_SUCCESS; }
+
+NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT d, PIRP Irp)
+{ (void)d; (void)Irp; return STATUS_SUCCESS; }
+
+/* ------------------------------------------------------------------ */
+/* the dispatch triage and PnP                                         */
+/* ------------------------------------------------------------------ */
+
+/* Both remove locks back where wdm_reset left them. */
+static int dx_lock_balanced(PADAPTOID_DEVEXT dx)
+{
+	return dx->RemoveLockA.IoCount == 1 && dx->RemoveLockB.IoCount == 1;
+}
+
+static ULONG          g_cdo_ext[4];
+static ADAPTOID_DEVEXT g_hid_ext;
+static DEVICE_OBJECT  g_cdo_dev;
+static DEVICE_OBJECT  g_hid_dev;
+static IO_STACK_LOCATION g_sp;
+static FILE_OBJECT    g_file;
+static WCHAR          g_name[4];
+
+static void triage_setup(void)
+{
+	g_cdo_ext[0] = ADAPTOID_CDO_MAGIC0;
+	g_cdo_ext[1] = ADAPTOID_CDO_MAGIC1;
+	g_cdo_ext[2] = ADAPTOID_CDO_MAGIC2;
+	g_cdo_dev.DeviceExtension = g_cdo_ext;
+	g_hid_dev.DeviceExtension = &g_hid_ext;
+
+	AdaptoidSavedDispatch.Create        = hidclass_stub;
+	AdaptoidSavedDispatch.Cleanup       = hidclass_stub;
+	AdaptoidSavedDispatch.Close         = hidclass_stub;
+	AdaptoidSavedDispatch.Read          = hidclass_stub;
+	AdaptoidSavedDispatch.Write         = hidclass_stub;
+	AdaptoidSavedDispatch.DeviceControl = hidclass_stub;
+	AdaptoidSavedDispatch.Pnp           = hidclass_stub;
+	AdaptoidSavedDispatch.Power         = hidclass_stub;
+}
+
+/* Build an IRP whose FileName is the two WCHARs given, or none at all. */
+static void triage_irp(PIRP irp, int with_file, WCHAR c0, WCHAR c1,
+                       USHORT len)
+{
+	g_name[0] = c0;
+	g_name[1] = c1;
+	g_file.FileName.Buffer = g_name;
+	g_file.FileName.Length = len;
+	g_sp.FileObject = with_file ? &g_file : NULL;
+	g_sp.MajorFunction = 0;
+	irp->CurrentStackLocation = &g_sp;
+	irp->NextStackLocation    = &g_sp;
+	irp->IoStatus.Status      = 0;
+	irp->IoStatus.Information = 0;
+}
+
+static int test_triage_pnp(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	IRP irp;
+
+	/* ---- 1. the three routes ---------------------------------------- */
+	{
+		triage_setup();
+
+		/* the magic wins regardless of the FileName */
+		triage_irp(&irp, 1, L'\\', L'q', 4);
+		sched_expect(AdaptoidRouteOf(&g_cdo_dev, &irp) ==
+		             ADAPTOID_ROUTE_CONTROL,
+		             "the control device is recognised by its magic", 1, 1,
+		             &bad);
+
+		/* a four-byte name whose second WCHAR is 'q' */
+		sched_expect(AdaptoidRouteOf(&g_hid_dev, &irp) ==
+		             ADAPTOID_ROUTE_PRIVATE,
+		             "and the private channel by its suffix", 1, 1, &bad);
+
+		/* ONLY Buffer[1] is tested - the first character is not looked at */
+		triage_irp(&irp, 1, L'Z', L'q', 4);
+		sched_expect(AdaptoidRouteOf(&g_hid_dev, &irp) ==
+		             ADAPTOID_ROUTE_PRIVATE,
+		             "the first character is not examined", 1, 1, &bad);
+
+		/* everything else is hidclass's */
+		triage_irp(&irp, 1, L'\\', L'x', 4);
+		sched_expect(AdaptoidRouteOf(&g_hid_dev, &irp) ==
+		             ADAPTOID_ROUTE_HIDCLASS, "a different suffix is not ours",
+		             1, 1, &bad);
+		triage_irp(&irp, 1, L'\\', L'q', 6);
+		sched_expect(AdaptoidRouteOf(&g_hid_dev, &irp) ==
+		             ADAPTOID_ROUTE_HIDCLASS, "nor is a longer name", 1, 1,
+		             &bad);
+		triage_irp(&irp, 0, 0, 0, 0);
+		sched_expect(AdaptoidRouteOf(&g_hid_dev, &irp) ==
+		             ADAPTOID_ROUTE_HIDCLASS, "nor an open with no file",
+		             1, 1, &bad);
+
+		/* a near-miss on the magic is not the control device */
+		g_cdo_ext[2] = 0;
+		triage_irp(&irp, 0, 0, 0, 0);
+		sched_expect(AdaptoidRouteOf(&g_cdo_dev, &irp) ==
+		             ADAPTOID_ROUTE_HIDCLASS,
+		             "two thirds of the magic is not enough", 1, 1, &bad);
+		g_cdo_ext[2] = ADAPTOID_CDO_MAGIC2;
+		groups++;
+	}
+
+	/* ---- 2. the four-way wrappers ----------------------------------- */
+	{
+		triage_setup();
+
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_route_hit = 0;
+		AdaptoidCreate(&g_cdo_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'c',
+		             "create: magic goes to the control device", 1, 1,
+		             &bad);
+
+		triage_irp(&irp, 1, L'\\', L'q', 4);
+		g_route_hit = 0;
+		AdaptoidCreate(&g_hid_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'p',
+		             "create: 'q' goes to the private channel", 1, 1, &bad);
+
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_route_hit = 0;
+		AdaptoidCreate(&g_hid_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'h',
+		             "create: everything else chains to hidclass", 1, 1,
+		             &bad);
+
+		g_route_hit = 0;
+		AdaptoidDeviceControl(&g_hid_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'h',
+		             "and so does device control", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 3. the three-way and two-way shapes ----------------------- */
+	{
+		triage_setup();
+
+		/* READ and WRITE have no private path at all */
+		triage_irp(&irp, 1, L'\\', L'q', 4);
+		g_route_hit = 0;
+		AdaptoidRead(&g_hid_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'h',
+		             "read: the private channel is IOCTL-only", 1, 1, &bad);
+		g_route_hit = 0;
+		AdaptoidWrite(&g_hid_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'h',
+		             "and so is write", 1, 1, &bad);
+		g_route_hit = 0;
+		AdaptoidRead(&g_cdo_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'c',
+		             "but the control device still reads", 1, 1, &bad);
+
+		/* PNP and POWER refuse the control device outright */
+		g_route_hit = 0;
+		g_irp_count = 0;
+		sched_expect(AdaptoidPnpTriage(&g_cdo_dev, &irp) ==
+		             STATUS_NOT_SUPPORTED,
+		             "pnp on the control device is refused", 1, 1, &bad);
+		sched_expect(g_route_hit == 0, "without reaching hidclass", 1, 1,
+		             &bad);
+		g_route_hit = 0;
+		AdaptoidPnpTriage(&g_hid_dev, &irp);
+		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'h',
+		             "but a real device's pnp chains down", 1, 1, &bad);
+
+		/* the power path starts the next power IRP, which the original
+		 * omits */
+		g_pnp_count = 0;
+		AdaptoidPowerTriage(&g_cdo_dev, &irp);
+		sched_expect(pnp_at("nextpower") >= 0,
+		             "power on the control device starts the next one",
+		             pnp_at("nextpower") >= 0, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 4. a null saved handler is not a crash -------------------- */
+	{
+		triage_setup();
+		AdaptoidSavedDispatch.Create = NULL;
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_irp_count = 0;
+		sched_expect(AdaptoidCreate(&g_hid_dev, &irp) ==
+		             STATUS_NOT_SUPPORTED,
+		             "hidclass not claiming a major function is refused", 1,
+		             1, &bad);
+		sched_expect(g_irp_count == 1, "and the request is completed",
+		             g_irp_count, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 5. START brings the device up, bottom-up ------------------ */
+	{
+		wdm_reset(&g_hid_ext);
+		g_pnp_devext   = &g_hid_ext;
+		g_lower_status = STATUS_SUCCESS;
+		g_pnp_count    = 0;
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_sp.MinorFunction = IRP_MN_START_DEVICE;
+
+		sched_expect(AdaptoidPnp(&g_hid_dev, &irp) == STATUS_SUCCESS,
+		             "start succeeds", 1, 1, &bad);
+		sched_expect(g_hid_ext.Started == 1, "and the device is started",
+		             (long)g_hid_ext.Started, 1, &bad);
+
+		/* BOTTOM-UP: down first, then act */
+		sched_expect(pnp_at("passdown") == 0,
+		             "the IRP went down before anything else",
+		             pnp_at("passdown"), 0, &bad);
+		sched_expect(pnp_at("descriptor") > pnp_at("passdown"),
+		             "the descriptor came after",
+		             pnp_at("descriptor") > 0, 1, &bad);
+		sched_expect(pnp_at("selectcfg") > pnp_at("descriptor"),
+		             "then the configuration",
+		             pnp_at("selectcfg") > pnp_at("descriptor"), 1, &bad);
+		/* polling starts BEFORE the interface is published, so a listener
+		 * reacting to the event finds a device already producing reports */
+		sched_expect(pnp_at("pollstart") < pnp_at("enableiface"),
+		             "polling starts before the interface is published",
+		             pnp_at("pollstart") < pnp_at("enableiface"), 1, &bad);
+		sched_expect(dx_lock_balanced(&g_hid_ext), "and the locks balanced",
+		             1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 6. a lower driver that fails start stops the bring-up ----- */
+	{
+		wdm_reset(&g_hid_ext);
+		g_pnp_devext   = &g_hid_ext;
+		g_lower_status = STATUS_UNSUCCESSFUL;
+		g_pnp_count    = 0;
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_sp.MinorFunction = IRP_MN_START_DEVICE;
+
+		sched_expect(AdaptoidPnp(&g_hid_dev, &irp) == STATUS_UNSUCCESSFUL,
+		             "the failure is reported", 1, 1, &bad);
+		sched_expect(pnp_at("descriptor") < 0,
+		             "and nothing was brought up", pnp_at("descriptor"), -1,
+		             &bad);
+		sched_expect(g_hid_ext.Started == 0, "nor marked started",
+		             (long)g_hid_ext.Started, 0, &bad);
+		sched_expect(dx_lock_balanced(&g_hid_ext),
+		             "the locks balanced even so", 1, 1, &bad);
+
+		/* the same if the descriptor fetch is what fails */
+		wdm_reset(&g_hid_ext);
+		g_lower_status      = STATUS_SUCCESS;
+		g_descriptor_status = STATUS_UNSUCCESSFUL;
+		g_pnp_count = 0;
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(pnp_at("selectcfg") < 0,
+		             "a failed descriptor stops before the configuration",
+		             pnp_at("selectcfg"), -1, &bad);
+		sched_expect(g_hid_ext.Started == 0, "and does not start",
+		             (long)g_hid_ext.Started, 0, &bad);
+		g_descriptor_status = STATUS_SUCCESS;
+		groups++;
+	}
+
+	/* ---- 7. STOP tears down top-down ------------------------------- */
+	{
+		wdm_reset(&g_hid_ext);
+		g_pnp_devext = &g_hid_ext;
+		g_hid_ext.Started = 1;
+		g_lower_status = STATUS_SUCCESS;
+		g_pnp_count = 0;
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_sp.MinorFunction = IRP_MN_STOP_DEVICE;
+
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(pnp_at("pollstop") == 0, "polling stops first",
+		             pnp_at("pollstop"), 0, &bad);
+		sched_expect(pnp_at("unconfigure") < pnp_at("passdown"),
+		             "and the resources go BEFORE the IRP does",
+		             pnp_at("unconfigure") < pnp_at("passdown"), 1, &bad);
+		sched_expect(g_hid_ext.Started == 0, "the started flag is cleared",
+		             (long)g_hid_ext.Started, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 8. the query and cancel pairs, and the veto --------------- */
+	{
+		wdm_reset(&g_hid_ext);
+		g_pnp_devext = &g_hid_ext;
+		g_lower_status = STATUS_SUCCESS;
+		triage_irp(&irp, 0, 0, 0, 0);
+
+		/* an unstarted device leaves the status alone */
+		g_hid_ext.Started = 0;
+		g_sp.MinorFunction = IRP_MN_QUERY_REMOVE_DEVICE;
+		irp.IoStatus.Status = STATUS_NOT_SUPPORTED;
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(g_hid_ext.RemovePending == 0,
+		             "an unstarted device does not answer query-remove",
+		             (long)g_hid_ext.RemovePending, 0, &bad);
+
+		g_hid_ext.Started = 1;
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(g_hid_ext.RemovePending == 1, "a started one does",
+		             (long)g_hid_ext.RemovePending, 1, &bad);
+		g_sp.MinorFunction = IRP_MN_CANCEL_REMOVE_DEVICE;
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(g_hid_ext.RemovePending == 0, "and cancel undoes it",
+		             (long)g_hid_ext.RemovePending, 0, &bad);
+
+		/* the veto */
+		g_sp.MinorFunction = IRP_MN_QUERY_STOP_DEVICE;
+		g_hid_ext.StopVeto = 0;
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(g_hid_ext.StopPending == 1, "query-stop is accepted",
+		             (long)g_hid_ext.StopPending, 1, &bad);
+
+		g_hid_ext.StopPending = 0;
+		g_hid_ext.StopVeto    = 1;
+		sched_expect(AdaptoidPnp(&g_hid_dev, &irp) == STATUS_UNSUCCESSFUL,
+		             "but vetoed when the guard is set", 1, 1, &bad);
+		sched_expect(g_hid_ext.StopPending == 0, "and not recorded",
+		             (long)g_hid_ext.StopPending, 0, &bad);
+		sched_expect(dx_lock_balanced(&g_hid_ext),
+		             "a veto still balances the locks", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 9. capabilities gain Removable and SurpriseRemovalOK ------ */
+	{
+		DEVICE_CAPABILITIES caps;
+
+		wdm_reset(&g_hid_ext);
+		g_pnp_devext = &g_hid_ext;
+		g_lower_status = STATUS_SUCCESS;
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_sp.MinorFunction = IRP_MN_QUERY_CAPABILITIES;
+		caps.DeviceD1 = 1;                  /* whatever the bus set */
+		g_sp.Parameters.DeviceCapabilities.Capabilities = &caps;
+		g_pnp_count = 0;
+
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(pnp_at("passdown") == 0,
+		             "the bus driver fills it in first", pnp_at("passdown"),
+		             0, &bad);
+		sched_expect(caps.Removable != 0, "Removable is added",
+		             (long)caps.Removable, 1, &bad);
+		sched_expect(caps.SurpriseRemovalOK != 0, "and SurpriseRemovalOK",
+		             (long)caps.SurpriseRemovalOK, 1, &bad);
+		sched_expect(caps.DeviceD1 != 0,
+		             "without disturbing what was there",
+		             (long)caps.DeviceD1, 1, &bad);
+
+		/* a failure downstream must not touch them */
+		caps.Removable = 0;
+		caps.SurpriseRemovalOK = 0;
+		g_lower_status = STATUS_UNSUCCESSFUL;
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(caps.Removable == 0,
+		             "a failed query leaves the capabilities alone",
+		             (long)caps.Removable, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 10. anything unhandled just goes down --------------------- */
+	{
+		wdm_reset(&g_hid_ext);
+		g_pnp_devext = &g_hid_ext;
+		g_lower_status = STATUS_SUCCESS;
+		g_pnp_count = 0;
+		triage_irp(&irp, 0, 0, 0, 0);
+		g_sp.MinorFunction = 0x0C;          /* QUERY_RESOURCES, not ours */
+
+		AdaptoidPnp(&g_hid_dev, &irp);
+		sched_expect(g_pnp_count == 1 && pnp_at("passdown") == 0,
+		             "an unhandled minor function is passed straight down",
+		             g_pnp_count, 1, &bad);
+		sched_expect(dx_lock_balanced(&g_hid_ext), "with balanced locks", 1,
+		             1, &bad);
+		groups++;
+	}
+
+	hlog("Dispatch triage and PnP: %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -5430,6 +5953,7 @@ int main(int argc, char **argv)
 	bad += test_ioctl();
 	bad += test_control_device();
 	bad += test_wdm_transport();
+	bad += test_triage_pnp();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

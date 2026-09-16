@@ -54,6 +54,7 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	HID_MINIDRIVER_REGISTRATION reg;
 	ULONG                       i;
 	PDRIVER_DISPATCH           *mj;
+	NTSTATUS                    status;
 
 	/*
 	 * Register as a HID minidriver so hidclass stacks on top of us. This is
@@ -66,12 +67,15 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 		mj[i] = 0;
 	}
 
-	mj[IRP_MJ_CREATE]                  = AdaptoidCreate;
-	mj[IRP_MJ_CLOSE]                   = AdaptoidClose;
-	mj[IRP_MJ_CLEANUP]                 = AdaptoidCleanup;
-	mj[IRP_MJ_READ]                    = AdaptoidRead;
-	mj[IRP_MJ_WRITE]                   = AdaptoidWrite;
-	mj[IRP_MJ_DEVICE_CONTROL]          = AdaptoidDeviceControl;
+	/*
+	 * STEP 1: the MINIDRIVER's own handlers. HidRegisterMinidriver captures
+	 * these and calls them from inside hidclass, so they are the entry
+	 * points for traffic hidclass has already triaged - and the private
+	 * channel reuses the create and close ones rather than duplicating
+	 * them.
+	 */
+	mj[IRP_MJ_CREATE]                  = AdaptoidChannelCreate;
+	mj[IRP_MJ_CLOSE]                   = AdaptoidChannelClose;
 	mj[IRP_MJ_INTERNAL_DEVICE_CONTROL] = AdaptoidIntDeviceControl;
 	mj[IRP_MJ_PNP]                     = AdaptoidPnp;
 	mj[IRP_MJ_POWER]                   = AdaptoidPower;
@@ -86,7 +90,40 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	reg.Reserved[1]         = 0;
 	reg.Reserved[2]         = 0;
 
-	return HidRegisterMinidriver(&reg);
+	status = HidRegisterMinidriver(&reg);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	/*
+	 * STEP 2: hidclass has just OVERWRITTEN the dispatch table with its own
+	 * entry points. Save them.
+	 */
+	AdaptoidSavedDispatch.Create        = mj[IRP_MJ_CREATE];
+	AdaptoidSavedDispatch.Cleanup       = mj[IRP_MJ_CLEANUP];
+	AdaptoidSavedDispatch.Close         = mj[IRP_MJ_CLOSE];
+	AdaptoidSavedDispatch.Read          = mj[IRP_MJ_READ];
+	AdaptoidSavedDispatch.Write         = mj[IRP_MJ_WRITE];
+	AdaptoidSavedDispatch.DeviceControl = mj[IRP_MJ_DEVICE_CONTROL];
+	AdaptoidSavedDispatch.Pnp           = mj[IRP_MJ_PNP];
+	AdaptoidSavedDispatch.Power         = mj[IRP_MJ_POWER];
+
+	/*
+	 * STEP 3: install the triage wrappers ON TOP. Every request now lands
+	 * here first, and anything that is not ours is handed straight to the
+	 * pointer saved above. That is the whole trick: one driver object, three
+	 * kinds of client, and hidclass still owns the HID device.
+	 */
+	mj[IRP_MJ_CREATE]         = AdaptoidCreate;
+	mj[IRP_MJ_CLEANUP]        = AdaptoidCleanup;
+	mj[IRP_MJ_CLOSE]          = AdaptoidClose;
+	mj[IRP_MJ_READ]           = AdaptoidRead;
+	mj[IRP_MJ_WRITE]          = AdaptoidWrite;
+	mj[IRP_MJ_DEVICE_CONTROL] = AdaptoidDeviceControl;
+	mj[IRP_MJ_PNP]            = AdaptoidPnpTriage;
+	mj[IRP_MJ_POWER]          = AdaptoidPowerTriage;
+
+	return STATUS_SUCCESS;
 }
 
 void NTAPI AdaptoidUnload(PDRIVER_OBJECT DriverObject)
@@ -133,43 +170,11 @@ NTSTATUS NTAPI AdaptoidAddDevice(PDRIVER_OBJECT DriverObject,
 /* Dispatch                                                            */
 /* ------------------------------------------------------------------ */
 
-NTSTATUS NTAPI AdaptoidCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	return STATUS_SUCCESS;                  /* TODO */
-}
 
-NTSTATUS NTAPI AdaptoidClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	return STATUS_SUCCESS;                  /* TODO */
-}
 
-NTSTATUS NTAPI AdaptoidCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	return STATUS_SUCCESS;                  /* TODO */
-}
 
-NTSTATUS NTAPI AdaptoidRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	return STATUS_NOT_SUPPORTED;            /* TODO */
-}
 
-NTSTATUS NTAPI AdaptoidWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	return STATUS_NOT_SUPPORTED;            /* TODO */
-}
 
-NTSTATUS NTAPI AdaptoidDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	/* TODO: the private configuration surface.
-	 * See ../docs/ioctl-surface.txt. */
-	return STATUS_INVALID_DEVICE_REQUEST;
-}
 
 NTSTATUS NTAPI AdaptoidIntDeviceControl(PDEVICE_OBJECT DeviceObject,
                                         PIRP Irp)
@@ -180,19 +185,7 @@ NTSTATUS NTAPI AdaptoidIntDeviceControl(PDEVICE_OBJECT DeviceObject,
 	return STATUS_INVALID_DEVICE_REQUEST;
 }
 
-NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	/* TODO: START_DEVICE fetches descriptors, selects the configuration and
-	 * keeps the interrupt IN pipe; see ../docs/driver-lifecycle.txt 3.1. */
-	return STATUS_SUCCESS;
-}
 
-NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	(void)DeviceObject; (void)Irp;
-	return STATUS_SUCCESS;                  /* TODO */
-}
 
 /* ------------------------------------------------------------------ */
 /* the remove lock                                                     */
@@ -485,4 +478,484 @@ NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
 	UNREFERENCED_PARAMETER(TransferBuffer);
 	return STATUS_NOT_IMPLEMENTED;
 }
+#endif /* !ADAPTOID_USERMODE */
+
+/* ------------------------------------------------------------------ */
+/* the dispatch triage                                                 */
+/* ------------------------------------------------------------------ */
+
+ADAPTOID_SAVED_DISPATCH AdaptoidSavedDispatch;
+
+/*
+ * Which of the three clients this request belongs to.
+ *
+ * Both tests are on things the caller cannot forge from user mode: the
+ * extension belongs to a device object this driver created, and the
+ * FileName is what the I/O manager parsed out of the open path.
+ *
+ * NOTE ONLY Buffer[1] IS TESTED, not Buffer[0]. A four-byte FileName is two
+ * WCHARs, and the first is almost certainly a backslash - a relative open of
+ * "\q" - but the original never looks, so neither does this. Treating the
+ * first character as significant would reject opens the original accepts.
+ */
+int AdaptoidRouteOf(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	const ULONG *ext = (const ULONG *)DeviceObject->DeviceExtension;
+	PIO_STACK_LOCATION sp;
+	PFILE_OBJECT file;
+
+	if (ext != NULL &&
+	    ext[0] == ADAPTOID_CDO_MAGIC0 &&
+	    ext[1] == ADAPTOID_CDO_MAGIC1 &&
+	    ext[2] == ADAPTOID_CDO_MAGIC2) {
+		return ADAPTOID_ROUTE_CONTROL;
+	}
+
+	sp   = IoGetCurrentIrpStackLocation(Irp);
+	file = sp->FileObject;
+	if (file != NULL && file->FileName.Length == 4 &&
+	    file->FileName.Buffer != NULL &&
+	    file->FileName.Buffer[1] == ADAPTOID_PRIVATE_CHAR) {
+		return ADAPTOID_ROUTE_PRIVATE;
+	}
+	return ADAPTOID_ROUTE_HIDCLASS;
+}
+
+/* Chain to hidclass, or refuse if it did not claim this major function. */
+static NTSTATUS ToHidclass(PDRIVER_DISPATCH Saved, PDEVICE_OBJECT DeviceObject,
+                           PIRP Irp)
+{
+	if (Saved != NULL) {
+		return Saved(DeviceObject, Irp);
+	}
+	return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
+	       STATUS_NOT_SUPPORTED;
+}
+
+/*
+ * THE FOUR-WAY SHAPE: control device, private channel, or hidclass.
+ * CREATE, CLEANUP, CLOSE and DEVICE_CONTROL all take it.
+ */
+NTSTATUS NTAPI AdaptoidCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	switch (AdaptoidRouteOf(DeviceObject, Irp)) {
+	case ADAPTOID_ROUTE_CONTROL:
+		return AdaptoidControlCreate(DeviceObject, Irp);
+	case ADAPTOID_ROUTE_PRIVATE:
+		return AdaptoidChannelCreate(DeviceObject, Irp);
+	default:
+		return ToHidclass(AdaptoidSavedDispatch.Create, DeviceObject, Irp);
+	}
+}
+
+NTSTATUS NTAPI AdaptoidCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	switch (AdaptoidRouteOf(DeviceObject, Irp)) {
+	case ADAPTOID_ROUTE_CONTROL:
+		return AdaptoidControlCleanup(DeviceObject, Irp);
+	case ADAPTOID_ROUTE_PRIVATE:
+		return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS;
+	default:
+		return ToHidclass(AdaptoidSavedDispatch.Cleanup, DeviceObject, Irp);
+	}
+}
+
+NTSTATUS NTAPI AdaptoidClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	switch (AdaptoidRouteOf(DeviceObject, Irp)) {
+	case ADAPTOID_ROUTE_CONTROL:
+		return AdaptoidControlClose(DeviceObject, Irp);
+	case ADAPTOID_ROUTE_PRIVATE:
+		return AdaptoidChannelClose(DeviceObject, Irp);
+	default:
+		return ToHidclass(AdaptoidSavedDispatch.Close, DeviceObject, Irp);
+	}
+}
+
+NTSTATUS NTAPI AdaptoidDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	switch (AdaptoidRouteOf(DeviceObject, Irp)) {
+	case ADAPTOID_ROUTE_CONTROL:
+		return AdaptoidControlIoctl(DeviceObject, Irp);
+	case ADAPTOID_ROUTE_PRIVATE:
+		return AdaptoidChannelIoctl(DeviceObject, Irp);
+	default:
+		return ToHidclass(AdaptoidSavedDispatch.DeviceControl, DeviceObject,
+		                  Irp);
+	}
+}
+
+/*
+ * THE THREE-WAY SHAPE: READ and WRITE. There is no private-channel path -
+ * that channel is IOCTL-only.
+ */
+NTSTATUS NTAPI AdaptoidRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	if (AdaptoidRouteOf(DeviceObject, Irp) == ADAPTOID_ROUTE_CONTROL) {
+		return AdaptoidControlReadWrite(DeviceObject, Irp);
+	}
+	return ToHidclass(AdaptoidSavedDispatch.Read, DeviceObject, Irp);
+}
+
+NTSTATUS NTAPI AdaptoidWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	if (AdaptoidRouteOf(DeviceObject, Irp) == ADAPTOID_ROUTE_CONTROL) {
+		return AdaptoidControlReadWrite(DeviceObject, Irp);
+	}
+	return ToHidclass(AdaptoidSavedDispatch.Write, DeviceObject, Irp);
+}
+
+/*
+ * THE TWO-WAY SHAPE: PNP and POWER. The control device is a plain
+ * IoCreateDevice object with no PnP or power stack beneath it, so refusing
+ * is correct rather than lazy.
+ *
+ * DIVERGENCE on the power path: the original completes a power IRP aimed at
+ * the control device WITHOUT calling PoStartNextPowerIrp, which is a rule
+ * violation. It cannot happen in practice - nothing sends power IRPs to a
+ * bare control device - but the rule does not have an exception for that,
+ * so the call is made here.
+ */
+NTSTATUS NTAPI AdaptoidPnpTriage(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	if (AdaptoidRouteOf(DeviceObject, Irp) == ADAPTOID_ROUTE_CONTROL) {
+		return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
+		       STATUS_NOT_SUPPORTED;
+	}
+	return ToHidclass(AdaptoidSavedDispatch.Pnp, DeviceObject, Irp);
+}
+
+NTSTATUS NTAPI AdaptoidPowerTriage(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	if (AdaptoidRouteOf(DeviceObject, Irp) == ADAPTOID_ROUTE_CONTROL) {
+		AdaptoidStartNextPowerIrp(Irp);
+		return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
+		       STATUS_NOT_SUPPORTED;
+	}
+	return ToHidclass(AdaptoidSavedDispatch.Power, DeviceObject, Irp);
+}
+
+/* ------------------------------------------------------------------ */
+/* PnP                                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Bring the device up. Called from the PnP dispatcher on START_DEVICE after
+ * the IRP has been passed down and completed successfully, so the bus driver
+ * has already done its half.
+ *
+ *   1. fetch the device descriptor and cache it - IOCTL fn 0x836 selector 1
+ *      reads bcdDevice out of that cache
+ *   2. fetch the configuration descriptor, growing the buffer and retrying
+ *      if wTotalLength says it is bigger than asked for
+ *   3. select the configuration, and keep the FIRST pipe of the interface -
+ *      the poll loop reads it without inspecting its type or endpoint
+ *      address, which is a real assumption about this one device
+ *   4. mark started; the query and cancel paths test that flag
+ *   5. build the display name and re-sort the driver-wide list by it
+ *   6. start polling, clearing the stop reason STOP_DEVICE sets
+ *   7. publish the device interface, which posts the interface-changed event
+ *
+ * ORDER MATTERS: polling starts BEFORE the interface is published, so a
+ * listener that reacts to the event finds a device already producing reports.
+ */
+NTSTATUS AdaptoidStartDevice(PADAPTOID_DEVEXT DevExt)
+{
+	NTSTATUS status;
+
+	status = AdaptoidFetchDeviceDescriptor(DevExt);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = AdaptoidSelectConfiguration(DevExt);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	DevExt->Started = 1;
+	AdaptoidSetDeviceName(DevExt);
+	AdaptoidPollStart(DevExt, ADAPTOID_STOP_REASON_PNP);
+	AdaptoidEnableInterface(DevExt);
+	return STATUS_SUCCESS;
+}
+
+/* Pass the IRP down without touching it. */
+static NTSTATUS PassDown(PADAPTOID_DEVEXT DevExt, PIRP Irp)
+{
+	IoSkipCurrentIrpStackLocation(Irp);
+	return IofCallDriver(DevExt->NextDeviceObject, Irp);
+}
+
+/*
+ * Pass the IRP down and WAIT for it, so the caller can act on the result.
+ * START_DEVICE and QUERY_CAPABILITIES both need this; everything else the
+ * dispatcher handles acts before passing down, or does not pass down at all.
+ */
+static NTSTATUS PassDownAndWait(PADAPTOID_DEVEXT DevExt, PIRP Irp)
+{
+	KEVENT done;
+	NTSTATUS status;
+
+	KeInitializeEvent(&done, NotificationEvent, FALSE);
+	IoCopyCurrentIrpStackLocationToNext(Irp);
+	AdaptoidSetCompletionRoutine(Irp, &done);
+	status = IofCallDriver(DevExt->NextDeviceObject, Irp);
+	if (status == STATUS_PENDING) {
+		KeWaitForSingleObject(&done, Executive, KernelMode, FALSE, NULL);
+		status = Irp->IoStatus.Status;
+	}
+	return status;
+}
+
+/*
+ * IRP_MJ_PNP. Installed BEFORE HidRegisterMinidriver, so hidclass owns this
+ * entry and calls it; it is not the wrapper above.
+ *
+ * THE ASYMMETRY IS THE POINT and is worth preserving: START and
+ * QUERY_CAPABILITIES are handled BOTTOM-UP, passing down first and acting on
+ * the way back, while STOP and REMOVE are handled TOP-DOWN, tearing down
+ * before passing down. That ordering is what keeps the poll loop from
+ * touching USB resources the bus driver has already reclaimed.
+ */
+NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_DEVEXT DevExt = AdaptoidDevExtOf(DeviceObject);
+	PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+	NTSTATUS status;
+
+	status = AdaptoidLockAcquire(&DevExt->RemoveLockB);
+	if (!NT_SUCCESS(status)) {
+		return AdaptoidCompleteIrp(Irp, status, 0), status;
+	}
+
+	switch (sp->MinorFunction) {
+
+	case IRP_MN_START_DEVICE:
+		status = AdaptoidLockAcquire(&DevExt->RemoveLockA);
+		if (!NT_SUCCESS(status)) {
+			AdaptoidLockRelease(&DevExt->RemoveLockB);
+			return AdaptoidCompleteIrp(Irp, status, 0), status;
+		}
+		status = PassDownAndWait(DevExt, Irp);
+		if (NT_SUCCESS(status)) {
+			status = AdaptoidStartDevice(DevExt);
+		}
+		AdaptoidLockRelease(&DevExt->RemoveLockA);
+		Irp->IoStatus.Information = 0;
+		AdaptoidCompleteIrp(Irp, status, 0);
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
+		return status;
+
+	case IRP_MN_QUERY_REMOVE_DEVICE:
+		/* Only meaningful once started; an unstarted device leaves the
+		 * status alone and lets the bus driver answer. */
+		if (DevExt->Started) {
+			DevExt->RemovePending = 1;
+			Irp->IoStatus.Status = STATUS_SUCCESS;
+		}
+		break;
+
+	case IRP_MN_CANCEL_REMOVE_DEVICE:
+		if (DevExt->Started) {
+			DevExt->RemovePending = 0;
+			Irp->IoStatus.Status = STATUS_SUCCESS;
+		}
+		break;
+
+	case IRP_MN_QUERY_STOP_DEVICE:
+		if (DevExt->Started) {
+			/* The one veto this driver casts. */
+			if (DevExt->StopVeto) {
+				AdaptoidCompleteIrp(Irp, STATUS_UNSUCCESSFUL, 0);
+				AdaptoidLockRelease(&DevExt->RemoveLockB);
+				return STATUS_UNSUCCESSFUL;
+			}
+			DevExt->StopPending = 1;
+			Irp->IoStatus.Status = STATUS_SUCCESS;
+		}
+		break;
+
+	case IRP_MN_CANCEL_STOP_DEVICE:
+		if (DevExt->Started) {
+			DevExt->StopPending = 0;
+			Irp->IoStatus.Status = STATUS_SUCCESS;
+		}
+		break;
+
+	case IRP_MN_STOP_DEVICE:
+		/* TOP-DOWN: stop polling and release USB resources BEFORE the bus
+		 * driver reclaims them. */
+		AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_PNP);
+		AdaptoidQuiesceIo(DevExt);
+		AdaptoidUnconfigureDevice(DevExt);
+		DevExt->Started = 0;
+		Irp->IoStatus.Status = STATUS_SUCCESS;
+		break;
+
+	case IRP_MN_REMOVE_DEVICE:
+		DevExt->Removing = 1;
+		/* Drain A first: no new work may start while we tear down. */
+		AdaptoidLockAcquire(&DevExt->RemoveLockA);
+		AdaptoidLockReleaseAndWait(&DevExt->RemoveLockA);
+
+		AdaptoidRegistryRemove(DevExt);
+		AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_REMOVE);
+		AdaptoidQuiesceIo(DevExt);
+		AdaptoidAbortPipes(DevExt);
+
+		IoCopyCurrentIrpStackLocationToNext(Irp);
+		IofCallDriver(DevExt->NextDeviceObject, Irp);
+
+		/* Now wait for B, the one this dispatcher itself holds. */
+		AdaptoidLockReleaseAndWait(&DevExt->RemoveLockB);
+		AdaptoidFreeDeviceResources(DevExt);
+		return STATUS_SUCCESS;
+
+	case IRP_MN_QUERY_CAPABILITIES: {
+		PDEVICE_CAPABILITIES caps = sp->Parameters.DeviceCapabilities.
+			                        Capabilities;
+
+		/* BOTTOM-UP: let the bus driver fill it in, then add ours. */
+		status = PassDownAndWait(DevExt, Irp);
+		if (NT_SUCCESS(status) && caps != NULL) {
+			/*
+			 * Removable and SurpriseRemovalOK. The correct declaration
+			 * for something that can be unplugged mid-transfer, and
+			 * without it Windows warns the user to stop the device
+			 * first.
+			 */
+			caps->Removable         = 1;
+			caps->SurpriseRemovalOK = 1;
+		}
+		Irp->IoStatus.Information = 0;
+		AdaptoidCompleteIrp(Irp, status, 0);
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
+		return status;
+	}
+
+	case IRP_MN_SURPRISE_REMOVAL:
+		Irp->IoStatus.Status = STATUS_SUCCESS;
+		break;
+
+	default:
+		break;
+	}
+
+	status = PassDown(DevExt, Irp);
+	AdaptoidLockRelease(&DevExt->RemoveLockB);
+	return status;
+}
+
+/* ------------------------------------------------------------------ */
+/* stage three                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Everything below is named and shaped but not yet written. They are here
+ * rather than absent because the dispatcher above calls them, and having
+ * them compile fixes the interface the next stage has to satisfy.
+ *
+ * In the harness build these are supplied by harness.c instead, which is how
+ * the PnP dispatcher's ORDERING - what it calls, and in which order, for each
+ * minor function - is checked without a device stack underneath.
+ */
+#ifndef ADAPTOID_USERMODE
+
+PADAPTOID_DEVEXT AdaptoidDevExtOf(PDEVICE_OBJECT DeviceObject)
+{
+	/* hidclass owns the first level; ours hangs off it. */
+	return (PADAPTOID_DEVEXT)
+	       (((PHID_DEVICE_EXTENSION)DeviceObject->DeviceExtension)
+	        ->MiniDeviceExtension);
+}
+
+NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
+{
+	UNREFERENCED_PARAMETER(DevExt);
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
+{
+	UNREFERENCED_PARAMETER(DevExt);
+	return STATUS_SUCCESS;
+}
+
+void AdaptoidSetDeviceName(PADAPTOID_DEVEXT DevExt)
+{ UNREFERENCED_PARAMETER(DevExt); }
+
+void AdaptoidPollStart(PADAPTOID_DEVEXT DevExt, ULONG Reason)
+{ UNREFERENCED_PARAMETER(DevExt); UNREFERENCED_PARAMETER(Reason); }
+
+void AdaptoidPollStop(PADAPTOID_DEVEXT DevExt, ULONG Reason)
+{ UNREFERENCED_PARAMETER(DevExt); UNREFERENCED_PARAMETER(Reason); }
+
+void AdaptoidQuiesceIo(PADAPTOID_DEVEXT DevExt)
+{ UNREFERENCED_PARAMETER(DevExt); }
+
+void AdaptoidUnconfigureDevice(PADAPTOID_DEVEXT DevExt)
+{ UNREFERENCED_PARAMETER(DevExt); }
+
+void AdaptoidAbortPipes(PADAPTOID_DEVEXT DevExt)
+{ UNREFERENCED_PARAMETER(DevExt); }
+
+void AdaptoidFreeDeviceResources(PADAPTOID_DEVEXT DevExt)
+{ UNREFERENCED_PARAMETER(DevExt); }
+
+void AdaptoidEnableInterface(PADAPTOID_DEVEXT DevExt)
+{ UNREFERENCED_PARAMETER(DevExt); }
+
+void AdaptoidRegistryRemove(PADAPTOID_DEVEXT DevExt)
+{ UNREFERENCED_PARAMETER(DevExt); }
+
+void AdaptoidSetCompletionRoutine(PIRP Irp, PVOID Event)
+{ UNREFERENCED_PARAMETER(Irp); UNREFERENCED_PARAMETER(Event); }
+
+void AdaptoidStartNextPowerIrp(PIRP Irp)
+{ UNREFERENCED_PARAMETER(Irp); }
+
+NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+
+NTSTATUS NTAPI AdaptoidControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+
+NTSTATUS NTAPI AdaptoidControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+
+NTSTATUS NTAPI AdaptoidControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
+	     STATUS_NOT_SUPPORTED; }
+
+NTSTATUS NTAPI AdaptoidControlReadWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
+	     STATUS_NOT_SUPPORTED; }
+
+NTSTATUS NTAPI AdaptoidChannelCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+
+NTSTATUS NTAPI AdaptoidChannelClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+
+NTSTATUS NTAPI AdaptoidChannelIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{ UNREFERENCED_PARAMETER(DeviceObject);
+  return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
+	     STATUS_NOT_SUPPORTED; }
+
+NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_DEVEXT dx = AdaptoidDevExtOf(DeviceObject);
+
+	AdaptoidStartNextPowerIrp(Irp);
+	IoSkipCurrentIrpStackLocation(Irp);
+	return IofCallDriver(dx->NextDeviceObject, Irp);
+}
+
 #endif /* !ADAPTOID_USERMODE */

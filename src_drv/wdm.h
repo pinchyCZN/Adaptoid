@@ -122,6 +122,61 @@ void     AdaptoidVendorComplete(struct _ADAPTOID_DEVEXT *DevExt,
                                 NTSTATUS Status, ULONG Information);
 
 struct _ADAPTOID_DEVEXT;
+/* ======================================================================
+ * THE DISPATCH TRIAGE
+ *
+ * One driver object serves three kinds of client from a single dispatch
+ * table, with no filter driver and no second driver. DriverEntry fills the
+ * table, calls HidRegisterMinidriver - which OVERWRITES it with hidclass's
+ * entry points - then saves those pointers and installs wrappers on top.
+ *
+ *   1. the private control device, recognised by a magic number at the head
+ *      of its device extension
+ *   2. private per-device handles, recognised by a FileObject whose
+ *      FileName is four bytes and whose second WCHAR is 'q' - an open of the
+ *      ordinary HID interface path with a two-character suffix, claimed here
+ *      before hidclass can see it
+ *   3. everything else, chained to the saved hidclass handler untouched
+ *
+ * That is the whole trick behind the private configuration API, and it is
+ * why hidclass.sys still owns the HID device in every respect Windows cares
+ * about. See ../docs/ioctl-surface.txt section 1.
+ * ====================================================================== */
+
+/* The three dwords at the head of the control device's extension. Any value
+ * would do; these are the original's. */
+#define ADAPTOID_CDO_MAGIC0     0x3E178AA3u
+#define ADAPTOID_CDO_MAGIC1     0x7625F013u
+#define ADAPTOID_CDO_MAGIC2     0xED739374u
+
+/* The suffix character that claims an open for the private channel. */
+#define ADAPTOID_PRIVATE_CHAR   ((WCHAR)'q')
+
+/*
+ * The hidclass entry points HidRegisterMinidriver installed, saved so the
+ * wrappers can chain to them. A null one means hidclass did not claim that
+ * major function, and the wrapper answers STATUS_NOT_SUPPORTED.
+ */
+typedef struct _ADAPTOID_SAVED_DISPATCH {
+	PDRIVER_DISPATCH Create;
+	PDRIVER_DISPATCH Cleanup;
+	PDRIVER_DISPATCH Close;
+	PDRIVER_DISPATCH Read;
+	PDRIVER_DISPATCH Write;
+	PDRIVER_DISPATCH DeviceControl;
+	PDRIVER_DISPATCH Pnp;
+	PDRIVER_DISPATCH Power;
+} ADAPTOID_SAVED_DISPATCH;
+
+extern ADAPTOID_SAVED_DISPATCH AdaptoidSavedDispatch;
+
+/* Which of the three a request belongs to. Exposed because the decision is
+ * the interesting part and the harness checks it directly. */
+#define ADAPTOID_ROUTE_HIDCLASS 0
+#define ADAPTOID_ROUTE_CONTROL  1
+#define ADAPTOID_ROUTE_PRIVATE  2
+
+int AdaptoidRouteOf(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 typedef struct _ADAPTOID_DEVEXT {
 	PDEVICE_OBJECT  Self;
@@ -139,6 +194,11 @@ typedef struct _ADAPTOID_DEVEXT {
 	ADAPTOID_VENDOR_SLOT Vendor;
 
 	ULONG           Started;
+	ULONG           Removing;
+	ULONG           RemovePending;
+	ULONG           StopPending;
+	/* The one veto this driver casts on QUERY_STOP. */
+	ULONG           StopVeto;
 } ADAPTOID_DEVEXT, *PADAPTOID_DEVEXT;
 
 /*
@@ -164,6 +224,8 @@ NTSTATUS NTAPI AdaptoidDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS NTAPI AdaptoidIntDeviceControl(PDEVICE_OBJECT DeviceObject,
                                              PIRP Irp);
 NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidPnpTriage(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidPowerTriage(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 /*
@@ -187,5 +249,45 @@ void AdaptoidCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG Information);
 NTSTATUS AdaptoidVendorSubmitUrb(struct _ADAPTOID_DEVEXT *DevExt,
                                  const ADAPTOID_SETUP *Setup,
                                  ULONG TransferLength, PVOID TransferBuffer);
+
+/* Why polling is stopped. The reasons are a bitmask so that a stop for one
+ * reason cannot restart while another still holds it. */
+#define ADAPTOID_STOP_REASON_PNP    4
+#define ADAPTOID_STOP_REASON_REMOVE 8
+
+NTSTATUS AdaptoidStartDevice(struct _ADAPTOID_DEVEXT *DevExt);
+NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+
+/* Reach the minidriver extension from the device object. hidclass owns the
+ * first level; ours hangs off it. See ../docs/driver-structures.txt 1. */
+struct _ADAPTOID_DEVEXT *AdaptoidDevExtOf(PDEVICE_OBJECT DeviceObject);
+
+/*
+ * Stage-three stubs. Declared now because the dispatcher above names them,
+ * and naming them is what fixes the shape of the next stage.
+ */
+NTSTATUS AdaptoidFetchDeviceDescriptor(struct _ADAPTOID_DEVEXT *DevExt);
+NTSTATUS AdaptoidSelectConfiguration(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidSetDeviceName(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidPollStart(struct _ADAPTOID_DEVEXT *DevExt, ULONG Reason);
+void     AdaptoidPollStop(struct _ADAPTOID_DEVEXT *DevExt, ULONG Reason);
+void     AdaptoidQuiesceIo(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidUnconfigureDevice(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidAbortPipes(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidFreeDeviceResources(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidEnableInterface(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidRegistryRemove(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidSetCompletionRoutine(PIRP Irp, PVOID Event);
+void     AdaptoidStartNextPowerIrp(PIRP Irp);
+
+/* The control device and private channel handlers, stage three. */
+NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidControlReadWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidChannelCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidChannelClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS NTAPI AdaptoidChannelIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 #endif /* ADAPTOID_WDM_H */

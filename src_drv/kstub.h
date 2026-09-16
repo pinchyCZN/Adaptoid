@@ -123,6 +123,65 @@ typedef struct _DEVICE_OBJECT {
 	ULONG                   Flags;
 } DEVICE_OBJECT, *PDEVICE_OBJECT;
 
+/*
+ * The IRP stack, enough of it for the dispatch triage and the PnP switch.
+ * Field names and the shape of the Parameters union match the DDK so the
+ * same source compiles both ways; what is missing is everything nothing
+ * reaches yet.
+ */
+typedef struct _FILE_OBJECT {
+	UNICODE_STRING FileName;
+} FILE_OBJECT, *PFILE_OBJECT;
+
+/*
+ * The bitfields are declared in the DDK's order because their POSITIONS are
+ * the contract: the 2001 driver ORs 0x210 into the dword at offset 4, and
+ * 0x210 is bit 4 plus bit 9 - Removable and SurpriseRemovalOK. Setting them
+ * by name says the same thing and survives a recompile.
+ */
+typedef struct _DEVICE_CAPABILITIES {
+	USHORT Size;
+	USHORT Version;
+	ULONG  DeviceD1:1;
+	ULONG  DeviceD2:1;
+	ULONG  LockSupported:1;
+	ULONG  EjectSupported:1;
+	ULONG  Removable:1;             /* 0x010 */
+	ULONG  DockDevice:1;
+	ULONG  UniqueID:1;
+	ULONG  SilentInstall:1;
+	ULONG  RawDeviceOK:1;
+	ULONG  SurpriseRemovalOK:1;     /* 0x200 */
+	ULONG  WakeFromD0:1;
+} DEVICE_CAPABILITIES, *PDEVICE_CAPABILITIES;
+
+typedef struct _IO_STACK_LOCATION {
+	UCHAR        MajorFunction;
+	UCHAR        MinorFunction;
+	PFILE_OBJECT FileObject;
+	union {
+		struct {
+			ULONG OutputBufferLength;
+			ULONG InputBufferLength;
+			ULONG IoControlCode;
+		} DeviceIoControl;
+		struct {
+			PDEVICE_CAPABILITIES Capabilities;
+		} DeviceCapabilities;
+	} Parameters;
+} IO_STACK_LOCATION, *PIO_STACK_LOCATION;
+
+/* PnP minor function codes, the ones the dispatcher names. */
+#define IRP_MN_START_DEVICE             0x00
+#define IRP_MN_QUERY_REMOVE_DEVICE      0x01
+#define IRP_MN_REMOVE_DEVICE            0x02
+#define IRP_MN_CANCEL_REMOVE_DEVICE     0x03
+#define IRP_MN_STOP_DEVICE              0x04
+#define IRP_MN_QUERY_STOP_DEVICE        0x05
+#define IRP_MN_CANCEL_STOP_DEVICE       0x06
+#define IRP_MN_QUERY_CAPABILITIES       0x09
+#define IRP_MN_SURPRISE_REMOVAL         0x17
+
 /* Shaped like the DDK's, so wdm.c reaches IoStatus.Status in both builds. */
 typedef struct _IO_STATUS_BLOCK {
 	NTSTATUS    Status;
@@ -130,9 +189,21 @@ typedef struct _IO_STATUS_BLOCK {
 } IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
 
 typedef struct _IRP {
-	IO_STATUS_BLOCK IoStatus;
-	PVOID           SystemBuffer;
+	IO_STATUS_BLOCK    IoStatus;
+	PVOID              SystemBuffer;
+	PIO_STACK_LOCATION CurrentStackLocation;
+	/* The harness pre-builds both locations; the real thing walks an
+	 * array and the macros below hide the difference. */
+	PIO_STACK_LOCATION NextStackLocation;
 } IRP, *PIRP;
+
+/*
+ * The stack-location accessors, in the DDK's spelling. Real drivers use
+ * these rather than touching Tail.Overlay, which is exactly why wdm.c can
+ * be written once for both builds.
+ */
+#define IoGetCurrentIrpStackLocation(Irp)   ((Irp)->CurrentStackLocation)
+#define IoGetNextIrpStackLocation(Irp)      ((Irp)->NextStackLocation)
 
 struct _DRIVER_OBJECT;
 
@@ -232,5 +303,13 @@ ULONGLONG KeQueryInterruptTime(void);
 #define IO_NO_INCREMENT 0
 
 void     IoCompleteRequest(PIRP Irp, CHAR PriorityBoost);
+
+/*
+ * Passing an IRP down. The harness records the call rather than making one,
+ * which is what lets the PnP switch be tested without a device stack.
+ */
+NTSTATUS IofCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+void     IoCopyCurrentIrpStackLocationToNext(PIRP Irp);
+void     IoSkipCurrentIrpStackLocation(PIRP Irp);
 
 #endif /* ADAPTOID_KSTUB_H */

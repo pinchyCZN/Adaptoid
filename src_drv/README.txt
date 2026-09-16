@@ -234,7 +234,7 @@ Table of Contents
    | ioctl.c   |     1303 |    1303 | both IOCTL surfaces, the registry and |
    |           |          |         | the notify queue; finished            |
    +-----------+----------+---------+---------------------------------------+
-   | wdm.c     |      488 |   ~1900 | DriverEntry, AddDevice, PnP, power,   |
+   | wdm.c     |      961 |   ~1900 | DriverEntry, AddDevice, PnP, power,   |
    |           |          |         | polling, URB transport, device naming |
    +-----------+----------+---------+---------------------------------------+
    | harness.c |     5171 |   ~5600 | main() and every test                 |
@@ -273,17 +273,33 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 72 of the 146 functions in
-   wishk201.sys are ported, 24733 of 38690 bytes, so 64 percent by code
+   Measured against the Ghidra database: 91 of the 146 functions in
+   wishk201.sys are ported, 29380 of 38690 bytes, so 76 percent by code
    size.
 
+   THE COUNT NOW INCLUDES NAMED-BUT-EMPTY FUNCTIONS. Stage two declared and
+   shaped the whole of wdm.c's remaining surface so that the dispatchers
+   above it compile and can be tested; roughly twenty of those bodies are
+   still stubs. The origin map records them like any other row, because the
+   correspondence to the original is what the map is for and it is already
+   decided. Judge completeness by the test groups, not by this percentage.
+
    wdm.c IS BEING PORTED IN STAGES, because it is the OS-facing half and
-   most of it cannot be exercised the way the rest was. Stage one is the
-   remove lock and the vendor transport - the foundation the other
-   subsystems sit on, and the piece that turns core.c's transport seams into
-   something real. What is left is PnP and start/stop, power, interrupt
-   polling, device naming, USB port recovery, the HID read-IRP plumbing and
-   the control device object.
+   most of it cannot be exercised the way the rest was.
+
+   Stage one was the remove lock and the vendor transport - the foundation
+   the other subsystems sit on, and the piece that turns core.c's transport
+   seams into something real.
+
+   Stage two was the dispatch triage and PnP: the wrapper layer that lets
+   one driver object serve three kinds of client, and the PnP dispatcher
+   with its bring-up and tear-down ordering. Both are testable, and both
+   are tested.
+
+   Stage three is what the second stage named but left empty: the USB
+   descriptor fetch and configuration select, interrupt polling, device
+   naming, power, USB port recovery, the HID read-IRP plumbing and the
+   control device object.
 
    The 5332 lines of replacement written so far cover 24733 bytes of
    original, which is 4.6 bytes per line and is the ratio the estimates
@@ -298,8 +314,8 @@ Table of Contents
    +--------------------------+-----+-------+----------+-----------+
    | Subsystem                | fns | bytes | ~C lines | Goes to   |
    +==========================+=====+=======+==========+===========+
-   | IOCTL and CDO plumbing   |  21 |  4565 |      759 | wdm.c     |
-   | PnP, start and stop      |  14 |  2577 |      429 | wdm.c     |
+   | IOCTL and CDO plumbing   |  15 |  3009 |      501 | wdm.c     |
+   | PnP and start/stop, rest |   9 |  1526 |      254 | wdm.c     |
    | device naming            |   6 |  1808 |      301 | wdm.c     |
    | HID report IRP plumbing  |   6 |   768 |      128 | wdm.c     |
    | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
@@ -308,7 +324,7 @@ Table of Contents
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  74 | 13957 |     2326 |           |
+   | TOTAL REMAINING          |  55 |  9310 |     1551 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
