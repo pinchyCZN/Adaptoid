@@ -823,6 +823,15 @@ NTSTATUS AdaptoidVendorSubmitUrb(struct _ADAPTOID_DEVEXT *DevExt,
 #define ADAPTOID_IRP_BUFFER(Irp)      ((Irp)->AssociatedIrp.SystemBuffer)
 #endif
 
+/*
+ * The Type3InputBuffer VALUE. The HID minidriver codes pass a small integer
+ * where the DDK declares a pointer, so it is cast rather than dereferenced -
+ * and the cast goes through a pointer-sized integer so that it is the same
+ * on 32- and 64-bit.
+ */
+#define ADAPTOID_TYPE3_ARG(sl) \
+    ((u32)(ULONG_PTR)(sl)->Parameters.DeviceIoControl.Type3InputBuffer)
+
 void     AdaptoidDevExtInit(struct _ADAPTOID_DEVEXT *DevExt);
 NTSTATUS AdaptoidStartDevice(struct _ADAPTOID_DEVEXT *DevExt);
 NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);

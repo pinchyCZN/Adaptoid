@@ -8482,6 +8482,531 @@ static int test_power_and_control(void)
 	return bad;
 }
 
+/* ======================================================================
+ * THE HID MINIDRIVER CONTRACT
+ *
+ * The first group is the one that matters: the descriptor this driver
+ * hands Windows must be BYTE IDENTICAL to the original's, because it is
+ * the device's identity. Everything a user has bound, every game's saved
+ * configuration and the device's name in Control Panel follow from it.
+ *
+ * The vector below is the 185 bytes at 00019b40, which are also the
+ * contents of the shipped RPD1.bin. The descriptor in core.c was written
+ * out item by item from docs/hid-descriptor.txt section 4, so this is a
+ * conformance check of one against the other and not a copy compared with
+ * itself.
+ * ====================================================================== */
+
+static const u8 HID_DESC_ORIGINAL[185] = {
+	0x05,0x01,0x09,0x02,0xA1,0x01,0x09,0x01,0xA1,0x00,0x85,0x03,
+	0x05,0x09,0x19,0x01,0x29,0x03,0x15,0x00,0x25,0x01,0x75,0x01,
+	0x95,0x03,0x81,0x02,0x75,0x05,0x95,0x01,0x81,0x01,0x05,0x01,
+	0x09,0x30,0x09,0x31,0x09,0x38,0x15,0x81,0x25,0x7F,0x75,0x08,
+	0x95,0x03,0x81,0x06,0xC0,0xC0,
+	0x05,0x01,0x09,0x06,0xA1,0x01,0x85,0x02,0x05,0x07,0x19,0xE0,
+	0x29,0xE7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,
+	0x95,0x01,0x75,0x08,0x81,0x01,0x95,0x05,0x75,0x01,0x05,0x08,
+	0x19,0x01,0x29,0x05,0x91,0x02,0x95,0x01,0x75,0x03,0x91,0x01,
+	0x95,0x0A,0x75,0x08,0x05,0x07,0x19,0x00,0x2A,0xA5,0x00,0x15,
+	0x00,0x26,0xA5,0x00,0x81,0x00,0xC0,
+	0x05,0x01,0x09,0x04,0xA1,0x01,0x09,0x01,0xA1,0x00,0x85,0x01,
+	0x05,0x01,0x09,0x30,0x09,0x31,0x16,0x50,0xFB,0x26,0xB0,0x04,
+	0x36,0x00,0x00,0x46,0x60,0x09,0x75,0x0C,0x95,0x02,0x81,0x02,
+	0xC0,0x05,0x09,0x19,0x01,0x29,0x0E,0x15,0x00,0x25,0x01,0x35,
+	0x00,0x45,0x01,0x75,0x01,0x95,0x0E,0x81,0x02,0x95,0x02,0x75,
+	0x01,0x81,0x01,0xC0
+};
+
+/*
+ * Walk a report descriptor and pull out its shape: how many top-level
+ * application collections it has, how deep the nesting goes, and which
+ * report IDs appear. An INDEPENDENT check that the bytes are a well-formed
+ * descriptor rather than merely the right ones.
+ */
+typedef struct hid_shape {
+	int collections;        /* top-level Collection(Application)        */
+	int depth_ok;           /* every Collection has an End Collection   */
+	int report_ids[4];
+	int report_id_count;
+	int items;
+} hid_shape;
+
+static void hid_parse(const u8 *d, u32 len, hid_shape *sh)
+{
+	u32 i = 0;
+	int depth = 0;
+
+	memset(sh, 0, sizeof(*sh));
+	sh->depth_ok = 1;
+
+	while (i < len) {
+		u8  item = d[i];
+		u32 size = item & 0x03u;
+
+		if (size == 3) {
+			size = 4;                       /* the 3 means 4 */
+		}
+		sh->items++;
+
+		/* Collection (0xA0), End Collection (0xC0), Report ID (0x84) */
+		if ((item & 0xFCu) == 0xA0u) {
+			if (depth == 0 && i + 1 < len && d[i + 1] == 0x01) {
+				sh->collections++;
+			}
+			depth++;
+		} else if ((item & 0xFCu) == 0xC0u) {
+			depth--;
+			if (depth < 0) {
+				sh->depth_ok = 0;
+			}
+		} else if ((item & 0xFCu) == 0x84u) {
+			if (sh->report_id_count < 4 && i + 1 < len) {
+				sh->report_ids[sh->report_id_count++] =
+				        d[i + 1];
+			}
+		}
+		i += 1 + size;
+	}
+	if (depth != 0 || i != len) {
+		sh->depth_ok = 0;       /* unbalanced, or ran off the end */
+	}
+}
+
+static int test_hid_contract(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_state cs;
+	u8  out[256];
+	u32 info;
+	u32 st;
+	int i;
+
+	/* ---- 1. the descriptor is byte-identical to the original -------- */
+	{
+		const u8 *d;
+		u32       len;
+		int       diff = -1;
+
+		memset(&cs, 0, sizeof(cs));
+		cs.devices_mask = 7;
+
+		d = core_hid_descriptor(cs.devices_mask, &len);
+		sched_expect(len == 185, "the composite is 185 bytes", (long)len,
+		             185, &bad);
+		for (i = 0; i < 185; i++) {
+			if (d[i] != HID_DESC_ORIGINAL[i]) {
+				diff = i;
+				break;
+			}
+		}
+		sched_expect(diff < 0,
+		             "AND IT MATCHES THE ORIGINAL BYTE FOR BYTE",
+		             diff, -1, &bad);
+
+		/*
+		 * The two fragments are the prefix and the suffix of the
+		 * whole. That is what lets one array serve all three.
+		 */
+		cs.devices_mask = 6;
+		d = core_hid_descriptor(cs.devices_mask, &len);
+		sched_expect(len == 121 && d == core_hid_descriptor(7, 0),
+		             "mouse+keyboard is the PREFIX of the composite",
+		             (long)len, 121, &bad);
+
+		cs.devices_mask = 0;
+		d = core_hid_descriptor(cs.devices_mask, &len);
+		sched_expect(len == 64 && d == core_hid_descriptor(7, 0) + 121,
+		             "and joystick is its SUFFIX", (long)len, 64, &bad);
+		groups++;
+	}
+
+	/* ---- 2. it is a well-formed three-collection descriptor --------- */
+	{
+		hid_shape sh;
+
+		hid_parse(core_hid_descriptor(7, 0), 185, &sh);
+		sched_expect(sh.depth_ok,
+		             "the composite parses and its collections balance",
+		             sh.depth_ok, 1, &bad);
+		sched_expect(sh.collections == 3,
+		             "THREE top-level application collections",
+		             sh.collections, 3, &bad);
+		/*
+		 * In descriptor order: mouse is 3, keyboard 2, joystick 1.
+		 * The ORDER matters as much as the set - it is what fixes
+		 * which collection each report ID belongs to.
+		 */
+		sched_expect(sh.report_id_count == 3 &&
+		             sh.report_ids[0] == CORE_REPORT_MOUSE &&
+		             sh.report_ids[1] == CORE_REPORT_KEYBOARD &&
+		             sh.report_ids[2] == CORE_REPORT_JOYSTICK,
+		             "report IDs 3, 2, 1 in that order",
+		             sh.report_ids[0], CORE_REPORT_MOUSE, &bad);
+
+		hid_parse(core_hid_descriptor(6, 0), 121, &sh);
+		sched_expect(sh.depth_ok && sh.collections == 2,
+		             "the mouse+keyboard fragment stands alone",
+		             sh.collections, 2, &bad);
+
+		hid_parse(core_hid_descriptor(0, 0), 64, &sh);
+		sched_expect(sh.depth_ok && sh.collections == 1,
+		             "and so does the joystick one", sh.collections, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 3. the selection table, all eight indices ------------------ */
+	{
+		static const u32 want[8] = { 64, 64, 64, 64, 64, 64, 121, 185 };
+
+		for (i = 0; i < 8; i++) {
+			u32 len = 0;
+
+			core_hid_descriptor((u32)i, &len);
+			sched_expect(len == want[i],
+			             "the selection table is reproduced exactly",
+			             (long)len, (long)want[i], &bad);
+		}
+		/* Bits above the low three are ignored. */
+		{
+			u32 len = 0;
+
+			core_hid_descriptor(0xFFFFFFF8u | 7u, &len);
+			sched_expect(len == 185, "only the low three bits count",
+			             (long)len, 185, &bad);
+		}
+		groups++;
+	}
+
+	/* ---- 4. GET_DEVICE_DESCRIPTOR ---------------------------------- */
+	{
+		memset(&cs, 0, sizeof(cs));
+		cs.devices_mask = 7;
+		memset(out, 0xAA, sizeof(out));
+
+		st = core_hid_ioctl(&cs, CORE_HID_IOC_DEVICE_DESC, out, 9, 0, 0,
+		                    &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 9,
+		             "nine bytes of HID descriptor", (long)info, 9,
+		             &bad);
+		sched_expect(out[0] == 9 && out[1] == 0x21,
+		             "bLength and bDescriptorType", out[1], 0x21, &bad);
+		sched_expect(out[2] == 0x01 && out[3] == 0x00,
+		             "bcdHID is 0x0001, which the spec does not define",
+		             out[2], 1, &bad);
+		sched_expect(out[5] == 1 && out[6] == 0x22,
+		             "one report descriptor, type 0x22", out[6], 0x22,
+		             &bad);
+		sched_expect(out[7] == 185 && out[8] == 0,
+		             "and its length tracks the selection", out[7], 185,
+		             &bad);
+
+		/* the length follows the mask */
+		cs.devices_mask = 0;
+		core_hid_ioctl(&cs, CORE_HID_IOC_DEVICE_DESC, out, 9, 0, 0,
+		               &info);
+		sched_expect(out[7] == 64 && out[8] == 0,
+		             "joystick only says 64", out[7], 64, &bad);
+
+		sched_expect(core_hid_ioctl(&cs, CORE_HID_IOC_DEVICE_DESC, out,
+		                            8, 0, 0, &info) ==
+		             CORE_ST_BUFFER_TOO_SMALL,
+		             "eight bytes is refused", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 5. GET_REPORT_DESCRIPTOR ---------------------------------- */
+	{
+		memset(&cs, 0, sizeof(cs));
+		cs.devices_mask = 7;
+		memset(out, 0xAA, sizeof(out));
+
+		st = core_hid_ioctl(&cs, CORE_HID_IOC_REPORT_DESC, out,
+		                    sizeof(out), 0, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 185,
+		             "the whole descriptor comes back", (long)info, 185,
+		             &bad);
+		sched_expect(memcmp(out, HID_DESC_ORIGINAL, 185) == 0,
+		             "with the original's bytes", 1, 1, &bad);
+		sched_expect(out[185] == 0xAA,
+		             "and nothing past it is touched", out[185], 0xAA,
+		             &bad);
+
+		sched_expect(core_hid_ioctl(&cs, CORE_HID_IOC_REPORT_DESC, out,
+		                            184, 0, 0, &info) ==
+		             CORE_ST_BUFFER_TOO_SMALL,
+		             "one byte short is refused", 1, 1, &bad);
+
+		/* the joystick-only selection returns the suffix */
+		cs.devices_mask = 3;
+		memset(out, 0xAA, sizeof(out));
+		core_hid_ioctl(&cs, CORE_HID_IOC_REPORT_DESC, out, sizeof(out),
+		               0, 0, &info);
+		sched_expect(info == 64 &&
+		             memcmp(out, HID_DESC_ORIGINAL + 121, 64) == 0,
+		             "mask 3 gives the joystick descriptor", (long)info,
+		             64, &bad);
+		groups++;
+	}
+
+	/* ---- 6. GET_STRING --------------------------------------------- */
+	{
+		memset(&cs, 0, sizeof(cs));
+		memset(out, 0xAA, sizeof(out));
+
+		st = core_hid_ioctl(&cs, CORE_HID_IOC_GET_STRING, out,
+		                    sizeof(out), 0,
+		                    CORE_HID_STRING_MANUFACTURER, &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 0x30,
+		             "the manufacturer is 0x30 bytes", (long)info, 0x30,
+		             &bad);
+		sched_expect(out[0] == 'W' && out[1] == 0 && out[2] == 'i',
+		             "as UTF-16LE", out[0], 'W', &bad);
+		sched_expect(out[0x2E] == 0 && out[0x2F] == 0,
+		             "and terminated", out[0x2E], 0, &bad);
+
+		memset(out, 0xAA, sizeof(out));
+		core_hid_ioctl(&cs, CORE_HID_IOC_GET_STRING, out, sizeof(out),
+		               0, CORE_HID_STRING_PRODUCT, &info);
+		sched_expect(info == 0x12 && out[0] == 'A' && out[2] == 'd',
+		             "the product is 0x12 bytes of Adaptoid",
+		             (long)info, 0x12, &bad);
+
+		core_hid_ioctl(&cs, CORE_HID_IOC_GET_STRING, out, sizeof(out),
+		               0, CORE_HID_STRING_SERIAL, &info);
+		sched_expect(info == 0,
+		             "there is no serial number, reported as empty",
+		             (long)info, 0, &bad);
+
+		/* the language ID in the high half is ignored */
+		core_hid_ioctl(&cs, CORE_HID_IOC_GET_STRING, out, sizeof(out),
+		               0, 0x04090000u | CORE_HID_STRING_PRODUCT, &info);
+		sched_expect(info == 0x12,
+		             "and the language ID is ignored", (long)info, 0x12,
+		             &bad);
+
+		/*
+		 * A SHORT BUFFER TRUNCATES WITHOUT A TERMINATOR, which is the
+		 * original's behaviour - bounded, but the caller is told to
+		 * believe a string that has no end.
+		 */
+		memset(out, 0xAA, sizeof(out));
+		core_hid_ioctl(&cs, CORE_HID_IOC_GET_STRING, out, 10, 0,
+		               CORE_HID_STRING_MANUFACTURER, &info);
+		sched_expect(info == 10 && out[10] == 0xAA,
+		             "a short buffer is truncated, not refused",
+		             (long)info, 10, &bad);
+		sched_expect(out[8] != 0 || out[9] != 0,
+		             "AND IS LEFT UNTERMINATED", 1, 1, &bad);
+
+		sched_expect(core_hid_ioctl(&cs, CORE_HID_IOC_GET_STRING, out,
+		                            sizeof(out), 0, 0x11, &info) ==
+		             CORE_ST_NOT_SUPPORTED,
+		             "an unknown index is refused", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 7. GET_DEVICE_ATTRIBUTES ---------------------------------- */
+	{
+		memset(&cs, 0, sizeof(cs));
+		memset(out, 0xAA, sizeof(out));
+
+		st = core_hid_ioctl(&cs, CORE_HID_IOC_ATTRIBUTES, out, 0x20, 0,
+		                    0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 0x20,
+		             "thirty-two bytes of attributes", (long)info, 0x20,
+		             &bad);
+		sched_expect(out[0] == 0x20 && out[1] == 0 && out[2] == 0 &&
+		             out[3] == 0, "Size is the first dword", out[0],
+		             0x20, &bad);
+		sched_expect(out[4] == 0xF7 && out[5] == 0x06,
+		             "vendor 0x06F7", out[5], 0x06, &bad);
+		sched_expect(out[6] == 0x01 && out[7] == 0x00,
+		             "product 0x0001", out[6], 1, &bad);
+		sched_expect(out[8] == 0x00 && out[9] == 0x01,
+		             "version 0x0100", out[9], 1, &bad);
+		{
+			int zeroed = 1;
+
+			for (i = 10; i < 0x20; i++) {
+				if (out[i] != 0) {
+					zeroed = 0;
+				}
+			}
+			sched_expect(zeroed, "and the reserved words are zero",
+			             zeroed, 1, &bad);
+		}
+		sched_expect(core_hid_ioctl(&cs, CORE_HID_IOC_ATTRIBUTES, out,
+		                            0x1F, 0, 0, &info) ==
+		             CORE_ST_BUFFER_TOO_SMALL,
+		             "thirty-one bytes is refused", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 8. write, activate, deactivate, and the unknown code ------- */
+	{
+		memset(&cs, 0, sizeof(cs));
+
+		/*
+		 * A WRITE IS ACCEPTED AND DISCARDED. The keyboard collection
+		 * declares five LED bits as Output, so Windows really does
+		 * send Num Lock down - and refusing it would make Windows
+		 * think the keyboard was broken.
+		 */
+		st = core_hid_ioctl(&cs, CORE_HID_IOC_WRITE_REPORT, out,
+		                    sizeof(out), 42, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 42,
+		             "a write reports the INPUT length back",
+		             (long)info, 42, &bad);
+
+		for (i = 0; i < CORE_HID_COLLECTIONS; i++) {
+			core_hid_ioctl(&cs, CORE_HID_IOC_ACTIVATE, out,
+			               sizeof(out), 0, (u32)i, &info);
+		}
+		sched_expect(cs.collection_enabled[0] == 1 &&
+		             cs.collection_enabled[1] == 1 &&
+		             cs.collection_enabled[2] == 1,
+		             "activate sets all three collections",
+		             cs.collection_enabled[2], 1, &bad);
+
+		core_hid_ioctl(&cs, CORE_HID_IOC_DEACTIVATE, out, sizeof(out),
+		               0, 1, &info);
+		sched_expect(cs.collection_enabled[1] == 0 &&
+		             cs.collection_enabled[0] == 1,
+		             "and deactivate clears just the one named",
+		             cs.collection_enabled[1], 0, &bad);
+
+		/* out of range succeeds having done nothing */
+		st = core_hid_ioctl(&cs, CORE_HID_IOC_DEACTIVATE, out,
+		                    sizeof(out), 0, 99, &info);
+		sched_expect(st == CORE_ST_SUCCESS &&
+		             cs.collection_enabled[0] == 1,
+		             "an out-of-range collection SUCCEEDS silently",
+		             cs.collection_enabled[0], 1, &bad);
+
+		sched_expect(core_hid_ioctl(&cs, CORE_HID_IOC_READ_REPORT, out,
+		                            sizeof(out), 0, 0, &info) ==
+		             CORE_ST_NOT_SUPPORTED,
+		             "read report is the OS layer's, not this one's", 1,
+		             1, &bad);
+		sched_expect(core_hid_ioctl(&cs, 0x000B00FFu, out, sizeof(out),
+		                            0, 0, &info) ==
+		             CORE_ST_NOT_SUPPORTED,
+		             "and an unknown code is refused", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 9. the IRP half: what hidclass actually calls -------------- */
+	{
+		u8 buf[256];
+
+		power_setup();
+		core_init(&g_pw_ext.Core, harness_sink, &g_pw_ext);
+		g_pw_ext.Core.devices_mask = 7;
+		memset(buf, 0xAA, sizeof(buf));
+
+		g_pw_sp.MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
+		g_pw_irp.UserBuffer   = buf;
+		g_pw_sp.Parameters.DeviceIoControl.OutputBufferLength =
+		        sizeof(buf);
+		g_pw_sp.Parameters.DeviceIoControl.InputBufferLength  = 0;
+		g_pw_sp.Parameters.DeviceIoControl.Type3InputBuffer   = NULL;
+		g_pw_sp.Parameters.DeviceIoControl.IoControlCode =
+		        CORE_HID_IOC_REPORT_DESC;
+
+		g_irp_count = 0;
+		st = (u32)AdaptoidIntDeviceControl(&g_pw_dev, &g_pw_irp);
+		sched_expect(st == CORE_ST_SUCCESS && g_irp_count == 1,
+		             "the descriptor request is answered and completed",
+		             g_irp_count, 1, &bad);
+		sched_expect(g_pw_irp.IoStatus.Information == 185,
+		             "with 185 bytes",
+		             (long)g_pw_irp.IoStatus.Information, 185, &bad);
+		sched_expect(memcmp(buf, HID_DESC_ORIGINAL, 185) == 0,
+		             "into UserBuffer, not the system buffer", 1, 1,
+		             &bad);
+
+		/*
+		 * THE ARGUMENT IS A VALUE IN A POINTER FIELD. If the decode
+		 * dereferenced Type3InputBuffer instead of casting it, this
+		 * would fault rather than answer.
+		 */
+		g_pw_sp.Parameters.DeviceIoControl.IoControlCode =
+		        CORE_HID_IOC_GET_STRING;
+		g_pw_sp.Parameters.DeviceIoControl.Type3InputBuffer =
+		        (PVOID)(ULONG_PTR)CORE_HID_STRING_PRODUCT;
+		g_irp_count = 0;
+		AdaptoidIntDeviceControl(&g_pw_dev, &g_pw_irp);
+		sched_expect(g_pw_irp.IoStatus.Information == 0x12 &&
+		             buf[0] == 'A',
+		             "the string index arrives through Type3InputBuffer",
+		             (long)g_pw_irp.IoStatus.Information, 0x12, &bad);
+
+		/* the input length is what a write reports back */
+		g_pw_sp.Parameters.DeviceIoControl.IoControlCode =
+		        CORE_HID_IOC_WRITE_REPORT;
+		g_pw_sp.Parameters.DeviceIoControl.InputBufferLength = 7;
+		AdaptoidIntDeviceControl(&g_pw_dev, &g_pw_irp);
+		sched_expect(g_pw_irp.IoStatus.Information == 7,
+		             "and the input length through its own field",
+		             (long)g_pw_irp.IoStatus.Information, 7, &bad);
+
+		/*
+		 * READ_REPORT IS THE ONE THAT KEEPS THE IRP. It must park,
+		 * not complete - and the remove lock must come back balanced
+		 * even though the request is still outstanding.
+		 */
+		{
+			LONG before = g_pw_ext.RemoveLockA.IoCount;
+
+			g_pw_sp.Parameters.DeviceIoControl.IoControlCode =
+			        CORE_HID_IOC_READ_REPORT;
+			g_irp_count = 0;
+			st = (u32)AdaptoidIntDeviceControl(&g_pw_dev,
+			                                   &g_pw_irp);
+			sched_expect(st == (u32)STATUS_PENDING &&
+			             g_irp_count == 0,
+			             "a read PARKS rather than completing",
+			             g_irp_count, 0, &bad);
+			sched_expect(g_pw_ext.RemoveLockA.IoCount == before,
+			             "and balances the remove lock",
+			             g_pw_ext.RemoveLockA.IoCount, before,
+			             &bad);
+			AdaptoidCancelPendingReads(&g_pw_ext);
+		}
+
+		/* an unstarted device refuses a read specifically */
+		g_pw_ext.Started = 0;
+		g_irp_count = 0;
+		st = (u32)AdaptoidIntDeviceControl(&g_pw_dev, &g_pw_irp);
+		sched_expect(st == (u32)STATUS_DELETE_PENDING &&
+		             g_irp_count == 1,
+		             "an unstarted device refuses everything", 1, 1,
+		             &bad);
+
+		/*
+		 * AND SO DOES A DEVICE BEING REMOVED - the entry guard is
+		 * AdaptoidIsDeviceReady, so a descriptor request is refused
+		 * too, not just a read.
+		 */
+		g_pw_ext.Started       = 1;
+		g_pw_ext.RemovePending = 1;
+		g_pw_sp.Parameters.DeviceIoControl.IoControlCode =
+		        CORE_HID_IOC_REPORT_DESC;
+		g_irp_count = 0;
+		st = (u32)AdaptoidIntDeviceControl(&g_pw_dev, &g_pw_irp);
+		sched_expect(st == (u32)STATUS_DELETE_PENDING &&
+		             g_irp_count == 1,
+		             "and so does one that is being removed", 1, 1,
+		             &bad);
+		groups++;
+	}
+	hlog("HID minidriver contract: %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
 int main(int argc, char **argv)
 {
 	DRIVER_OBJECT        driver;
@@ -8564,6 +9089,7 @@ int main(int argc, char **argv)
 	bad += test_naming_recovery();
 	bad += test_command_block();
 	bad += test_power_and_control();
+	bad += test_hid_contract();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

@@ -113,6 +113,40 @@ typedef signed   long long s64;
 
 #define CORE_REPORT_MAX_BYTES   16
 
+/* ======================================================================
+ * THE REPORT DESCRIPTORS
+ *
+ * Three top-level collections in one descriptor - that is what makes this a
+ * COMPOSITE HID device, and it is the property the whole replacement exists
+ * to preserve: Windows creates a keyboard, a mouse and a game controller
+ * from one USB endpoint, so a remapped button is real key input to every
+ * application, not an injected event some of them ignore.
+ *
+ * ONE ARRAY, THREE VIEWS. The 185-byte composite is EXACTLY the 121-byte
+ * Mouse+Keyboard descriptor followed by the 64-byte Joystick one, verified
+ * byte for byte against the original, so the two fragments are slices of
+ * the whole rather than separate copies. The original keeps three copies at
+ * 00019b40, 00019c00 and 00019c40.
+ * ====================================================================== */
+
+/* Three top-level application collections: mouse, keyboard, joystick. */
+#define CORE_HID_COLLECTIONS    3
+
+#define CORE_HID_DESC_ALL       185     /* mouse + keyboard + joystick   */
+#define CORE_HID_DESC_MK        121     /* mouse + keyboard, at offset 0 */
+#define CORE_HID_DESC_JOY       64      /* joystick only                 */
+#define CORE_HID_DESC_JOY_AT    121     /* where the joystick part opens */
+
+/*
+ * The descriptor selected by devices_mask, and its length.
+ *
+ * The mask's low three bits index an eight-entry table of which only two
+ * entries differ from the first: 0 through 5 all give the joystick, 6 gives
+ * mouse + keyboard, 7 gives all three. That is the original's table, not a
+ * simplification of it.
+ */
+const u8 *core_hid_descriptor(u32 devices_mask, u32 *length);
+
 /*
  * THE KEYBOARD AND MOUSE STATE MACHINES.
  *
@@ -598,6 +632,15 @@ typedef struct core_state {
 	 * joystick, bit 1 keyboard, bit 2 mouse. The 2001 driver defaults this to
 	 * 7 in DriverEntry and lets a registry value override it. */
 	u32             devices_mask;
+
+	/*
+	 * WHICH TOP-LEVEL COLLECTIONS hidclass has opened. WRITE-ONLY: the
+	 * original sets these from IOCTL_HID_ACTIVATE_DEVICE and
+	 * IOCTL_HID_DEACTIVATE_DEVICE and never reads them anywhere - all
+	 * four references to the field are in that one dispatcher. hidclass
+	 * tracks collection state itself; the driver only acknowledges.
+	 */
+	u8              collection_enabled[CORE_HID_COLLECTIONS];
 
 	u32             reports_emitted;
 

@@ -34,6 +34,8 @@ Table of Contents
    5.2.  The Virtual Joystick Mode
    6.  Device Identity
    7.  Minidriver IOCTL Surface
+   7.1.  The Details That Are Easy To Get Wrong
+   7.2.  The Activate Slots Are Write-Only
    8.  The Controller Poll
    9.  Consequences For The Replacement Driver
    10.  Open Questions
@@ -72,6 +74,13 @@ Table of Contents
    | drv_HidReportDesc_MouseKbd    | 00019c40 |    121 | Mouse + Keyboard            |
    | drv_HidReportDescTable        | 00019cc0 |     64 | 8 entries of {ptr, length}  |
    +-------------------------------+----------+--------+-----------------------------+
+
+   THE COMPOSITE IS THE CONCATENATION OF THE OTHER TWO. The 185-byte
+   descriptor is byte for byte the 121-byte Mouse + Keyboard descriptor
+   followed by the 64-byte Joystick one - verified by comparing the three
+   arrays directly. The original stores three separate copies; the
+   replacement keeps ONE array and takes the two fragments as slices of
+   it, which cannot drift apart.
 
    The table entry is 8 bytes: a 4-byte pointer at +0 and a 4-byte
    length at +4. Contents as stored:
@@ -444,16 +453,60 @@ Table of Contents
    +---------+----+-----------------------+---------------------------------+
 
    A guard runs before the switch: drv_IsDeviceReady(devext) returning zero
-   completes the IRP with STATUS_DEVICE_NOT_CONNECTED (0xC0000056).
+   completes the IRP with 0xC0000056. CORRECTION: that value was recorded
+   here as STATUS_DEVICE_NOT_CONNECTED. It is STATUS_DELETE_PENDING;
+   STATUS_DEVICE_NOT_CONNECTED is 0xC000009D and a different thing. The
+   value was right and the name was not.
 
-   WRITE_REPORT returning success without doing anything is worth
-   noting. The keyboard LED output report is therefore accepted and
-   dropped rather than acted on, which matches the hardware: there are
-   no LEDs on an N64 controller.
+   THE GUARD COVERS EVERYTHING, not just the read. A device that is being
+   removed refuses even GET_REPORT_DESCRIPTOR, which is correct - the
+   descriptor is of no use to a stack that is coming down.
 
-   The three activate/deactivate slots at devext+0x328 correspond to the
-   three top-level collections. INFERENCE: the index order has not been
-   confirmed against the descriptor.
+7.1.  The Details That Are Easy To Get Wrong
+
+   bcdHID IS 0x0001. The HID specification defines 0x0100 and 0x0110; 1 is
+   neither. Windows does not check the field, so the device works, but the
+   value is observable to anything that reads the HID descriptor and a
+   replacement that "corrects" it is no longer reporting what the original
+   reported.
+
+   wReportLength TRACKS THE SELECTION. The 9-byte HID descriptor's last
+   field is the length of whichever report descriptor the mask selects, so
+   it is 185, 121 or 64 - not a constant.
+
+   GET_STRING TRUNCATES WITHOUT A TERMINATOR. The copy is bounded by
+   min(OutputBufferLength, cap), where the caps are 0x30 and 0x12 - exactly
+   the byte sizes of the two strings INCLUDING their terminators. A caller
+   offering less gets that many bytes and no NUL, and is told that many
+   were transferred. Bounded, so not a safety problem, but the string it
+   hands back has no end.
+
+   The serial number is answered as PRESENT AND EMPTY - success with zero
+   bytes - rather than refused. Refusing it would make Windows treat the
+   omission as a device failure rather than as "there isn't one".
+
+   WRITE_REPORT REPORTS THE INPUT LENGTH, not the output length, in
+   Information. The keyboard collection declares five LED bits as Output,
+   so Windows really does send Num Lock and Caps Lock changes down; they
+   are accepted and dropped, which matches the hardware, and reporting
+   success is what stops Windows deciding the keyboard is broken.
+
+7.2.  The Activate Slots Are Write-Only
+
+   The three bytes at devext+0x328 are set by ACTIVATE_DEVICE and cleared
+   by DEACTIVATE_DEVICE, and NOTHING IN THE DRIVER EVER READS THEM. All
+   four references to the field in the whole image are inside
+   drv_DispatchInternalDeviceControl - two writes and two reads of the
+   value just written. Established by searching every instruction in the
+   image for the offset.
+
+   So the driver acknowledges hidclass's notification and does nothing with
+   it; hidclass tracks collection state itself. The earlier note that the
+   index order was unconfirmed is moot - the order cannot matter to
+   behaviour when the value is never consulted.
+
+   AN OUT-OF-RANGE INDEX SUCCEEDS having done nothing. Both cases bound the
+   index to 0..2 and fall through to a success return either way.
 
 8.  The Controller Poll
 

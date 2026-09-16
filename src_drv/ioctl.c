@@ -1802,3 +1802,213 @@ u32 core_cmd_write(core_registry *reg, core_cmd_channel *ch, u8 *buf, u32 len,
 	}
 	return CORE_ST_SUCCESS;
 }
+
+/* ======================================================================
+ * THE HID MINIDRIVER CONTRACT
+ *
+ * Ported from drv_DispatchInternalDeviceControl (000128d2).
+ *
+ * These requests come from hidclass.sys, never from user mode, and they are
+ * what MAKE the driver a HID device: without an answer to
+ * CORE_HID_IOC_REPORT_DESC, hidclass never learns what the hardware is and
+ * no keyboard, mouse or game controller is ever created.
+ * ====================================================================== */
+
+/*
+ * The two string descriptors, as UTF-16LE BYTES rather than wide-character
+ * literals - this file has no wchar_t and should not acquire one.
+ *
+ * THE CAPS ARE THE STRING SIZES INCLUDING THE TERMINATOR, which is why they
+ * look arbitrary: 24 wide characters is 0x30, 9 is 0x12.
+ */
+static const u8 CORE_HID_MANUFACTURER[] = {
+	'W',0, 'i',0, 's',0, 'h',0, ' ',0,
+	'T',0, 'e',0, 'c',0, 'h',0, 'n',0, 'o',0, 'l',0, 'o',0, 'g',0,
+	'i',0, 'e',0, 's',0, ',',0, ' ',0,
+	'I',0, 'n',0, 'c',0, '.',0, 0,0
+};
+
+static const u8 CORE_HID_PRODUCT[] = {
+	'A',0, 'd',0, 'a',0, 'p',0, 't',0, 'o',0, 'i',0, 'd',0, 0,0
+};
+
+/*
+ * Copy at most cap bytes of a string into out, bounded by what the caller
+ * offered.
+ *
+ * A SHORT BUFFER GETS AN UNTERMINATED STRING. The original copies
+ * min(out_len, cap) bytes with no terminator of its own and reports that
+ * many transferred, so a caller asking for ten bytes of the manufacturer
+ * name gets ten bytes and no NUL. Bounded, so not a safety problem, and
+ * reproduced because the byte count it reports is what hidclass believes.
+ */
+static u32 hid_string(u8 *out, u32 out_len, const u8 *str, u32 cap)
+{
+	u32 n = out_len < cap ? out_len : cap;
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		out[i] = str[i];
+	}
+	return n;
+}
+
+u32 core_hid_ioctl(core_state *cs, u32 code, u8 *out, u32 out_len,
+                   u32 in_len, u32 arg, u32 *info)
+{
+	u32 scratch = 0;
+
+	if (info == 0) {
+		info = &scratch;
+	}
+	*info = 0;
+	if (cs == 0) {
+		return CORE_ST_INVALID_PARAM;
+	}
+
+	switch (code) {
+	case CORE_HID_IOC_DEVICE_DESC: {
+		/*
+		 * The 9-byte HID_DESCRIPTOR, built in place. It is a
+		 * descriptor ABOUT the report descriptor: how long it is and
+		 * what type it is.
+		 */
+		u32 len;
+
+		if (out_len < CORE_HID_DEVICE_DESC_BYTES || out == 0) {
+			return CORE_ST_BUFFER_TOO_SMALL;
+		}
+		core_hid_descriptor(cs->devices_mask, &len);
+
+		out[0] = CORE_HID_DEVICE_DESC_BYTES;   /* bLength         */
+		out[1] = 0x21;                         /* HID descriptor  */
+		/*
+		 * bcdHID = 0x0001, WHICH IS NOT A VERSION THE SPEC DEFINES -
+		 * it should be 0x0100 or 0x0110. Windows does not check it,
+		 * and it is reproduced rather than corrected because the
+		 * value is observable to anything that reads the descriptor.
+		 */
+		out[2] = 0x01;
+		out[3] = 0x00;
+		out[4] = 0x00;                         /* bCountryCode    */
+		out[5] = 0x01;                         /* bNumDescriptors */
+		out[6] = 0x22;                         /* report type     */
+		out[7] = (u8)(len & 0xFF);             /* wReportLength   */
+		out[8] = (u8)((len >> 8) & 0xFF);
+		*info = CORE_HID_DEVICE_DESC_BYTES;
+		return CORE_ST_SUCCESS;
+	}
+
+	case CORE_HID_IOC_REPORT_DESC: {
+		/*
+		 * THE ONE REQUEST THE DRIVER CANNOT DO WITHOUT. Everything
+		 * else here is detail; this is what tells Windows the device
+		 * is a keyboard AND a mouse AND a game controller.
+		 */
+		const u8 *desc;
+		u32       len;
+		u32       i;
+
+		desc = core_hid_descriptor(cs->devices_mask, &len);
+		if (out_len < len || out == 0) {
+			return CORE_ST_BUFFER_TOO_SMALL;
+		}
+		for (i = 0; i < len; i++) {
+			out[i] = desc[i];
+		}
+		*info = len;
+		return CORE_ST_SUCCESS;
+	}
+
+	case CORE_HID_IOC_WRITE_REPORT:
+		/*
+		 * ACCEPTED AND DISCARDED. The keyboard collection declares
+		 * five LED bits as Output, so Windows sends Num Lock and Caps
+		 * Lock changes down - and there is no keyboard to light up.
+		 * Reporting success is right: failing would make Windows
+		 * think the keyboard was broken.
+		 *
+		 * The byte count reported back is the INPUT length, which is
+		 * how much the caller sent.
+		 */
+		*info = in_len;
+		return CORE_ST_SUCCESS;
+
+	case CORE_HID_IOC_GET_STRING:
+		/* The index is the low half of the packed argument; the high
+		 * half is a language ID the driver ignores. */
+		switch (arg & 0xFFFFu) {
+		case CORE_HID_STRING_MANUFACTURER:
+			*info = hid_string(out, out_len, CORE_HID_MANUFACTURER,
+			                   (u32)sizeof(CORE_HID_MANUFACTURER));
+			return CORE_ST_SUCCESS;
+		case CORE_HID_STRING_PRODUCT:
+			*info = hid_string(out, out_len, CORE_HID_PRODUCT,
+			                   (u32)sizeof(CORE_HID_PRODUCT));
+			return CORE_ST_SUCCESS;
+		case CORE_HID_STRING_SERIAL:
+			/* THERE IS NO SERIAL NUMBER. Answered as present and
+			 * empty rather than refused, which is what stops
+			 * Windows treating the omission as a failure. */
+			*info = 0;
+			return CORE_ST_SUCCESS;
+		default:
+			return CORE_ST_NOT_SUPPORTED;
+		}
+
+	case CORE_HID_IOC_ACTIVATE:
+	case CORE_HID_IOC_DEACTIVATE:
+		/*
+		 * WRITE-ONLY STATE. hidclass tells the driver which of the
+		 * three top-level collections is open, and the driver records
+		 * it and NEVER READS IT BACK - the three bytes have four
+		 * references in the whole original and all four are here.
+		 * Kept because the field is observable in a crash dump and
+		 * because a later revision might want it.
+		 *
+		 * AN OUT-OF-RANGE INDEX SUCCEEDS having done nothing, which
+		 * is the original's behaviour and not an oversight worth
+		 * correcting: hidclass is the only caller and it does not
+		 * send one.
+		 */
+		if (arg < CORE_HID_COLLECTIONS) {
+			cs->collection_enabled[arg] =
+			        (u8)(code == CORE_HID_IOC_ACTIVATE);
+		}
+		return CORE_ST_SUCCESS;
+
+	case CORE_HID_IOC_ATTRIBUTES: {
+		/* HID_DEVICE_ATTRIBUTES: a size, the USB ids, a version, and
+		 * eleven reserved words that must be zero. */
+		u32 i;
+
+		if (out_len < CORE_HID_ATTRIBUTES_BYTES || out == 0) {
+			return CORE_ST_BUFFER_TOO_SMALL;
+		}
+		for (i = 0; i < CORE_HID_ATTRIBUTES_BYTES; i++) {
+			out[i] = 0;
+		}
+		wr32(out, CORE_HID_ATTRIBUTES_BYTES);
+		out[4] = (u8)(CORE_USB_VENDOR_ID & 0xFF);
+		out[5] = (u8)(CORE_USB_VENDOR_ID >> 8);
+		out[6] = (u8)(CORE_USB_PRODUCT_ID & 0xFF);
+		out[7] = (u8)(CORE_USB_PRODUCT_ID >> 8);
+		out[8] = (u8)(CORE_USB_VERSION & 0xFF);
+		out[9] = (u8)(CORE_USB_VERSION >> 8);
+		*info = CORE_HID_ATTRIBUTES_BYTES;
+		return CORE_ST_SUCCESS;
+	}
+
+	case CORE_HID_IOC_READ_REPORT:
+		/*
+		 * NOT ANSWERED HERE. A read parks an IRP on the report queue
+		 * and completes it when a packet arrives, which is entirely
+		 * the OS layer's business - AdaptoidIntDeviceControl
+		 * intercepts it before calling this.
+		 */
+		return CORE_ST_NOT_SUPPORTED;
+
+	default:
+		return CORE_ST_NOT_SUPPORTED;
+	}
+}

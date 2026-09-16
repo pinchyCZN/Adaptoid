@@ -33,6 +33,15 @@
 /* Load and unload                                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * THE CONTROL DEVICE SINGLETON. Declared here rather than beside its own
+ * code because DriverEntry has to initialise the mutex before anything can
+ * use it - see the comment there.
+ */
+static PDEVICE_OBJECT g_ControlDevice;
+static LONG           g_ControlRefCount;
+static FAST_MUTEX     g_ControlMutex;
+
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
                            PUNICODE_STRING RegistryPath)
 {
@@ -63,6 +72,24 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	mj[IRP_MJ_CLOSE]                   = AdaptoidChannelClose;
 	mj[IRP_MJ_INTERNAL_DEVICE_CONTROL] = AdaptoidIntDeviceControl;
 	mj[IRP_MJ_DEVICE_CONTROL]          = AdaptoidPassThroughDeviceControl;
+	/*
+	 * SYSTEM_CONTROL GETS THE SAME PASS-THROUGH. The original installs
+	 * drv_DispatchDeviceControl at both 0x0E and 0x17; WMI requests have
+	 * to reach the bus driver or the stack answers them itself and
+	 * confuses whoever asked.
+	 */
+	mj[IRP_MJ_SYSTEM_CONTROL]          = AdaptoidPassThroughDeviceControl;
+
+	/*
+	 * THE CONTROL DEVICE'S MUTEX MUST BE INITIALISED HERE. A zeroed
+	 * FAST_MUTEX is not an unheld one - its count reads as already taken
+	 * and its event is unsignalled - so the first adapter to arrive would
+	 * block in AdaptoidCreateControlDevice and never come back. The
+	 * original does the same thing inline at 000115fd.
+	 *
+	 * The harness cannot see this: its fast mutex is a counter.
+	 */
+	ExInitializeFastMutex(&g_ControlMutex);
 	mj[IRP_MJ_PNP]                     = AdaptoidPnp;
 	mj[IRP_MJ_POWER]                   = AdaptoidPower;
 	DriverObject->DriverUnload         = AdaptoidUnload;
@@ -112,10 +139,22 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	return STATUS_SUCCESS;
 }
 
+/*
+ * EMPTY, AND CORRECTLY SO - drv_Unload at 000117e0 is a single RET.
+ *
+ * DriverEntry allocates nothing. It fills a dispatch table, registers with
+ * hidclass, and initialises statics; there is no pool, no device object and
+ * no work item to give back. The control device is created by the first
+ * AddDevice and deleted by the last removal, and the I/O manager will not
+ * unload a driver that still owns a device object, so by the time this runs
+ * there is provably nothing left.
+ *
+ * Kept rather than left NULL because DriverUnload being non-NULL is what
+ * tells the system the driver MAY be unloaded at all.
+ */
 void NTAPI AdaptoidUnload(PDRIVER_OBJECT DriverObject)
 {
-	(void)DriverObject;
-	/* TODO: tear down anything DriverEntry created. */
+	UNREFERENCED_PARAMETER(DriverObject);
 }
 
 NTSTATUS NTAPI AdaptoidAddDevice(PDRIVER_OBJECT DriverObject,
@@ -162,13 +201,70 @@ NTSTATUS NTAPI AdaptoidAddDevice(PDRIVER_OBJECT DriverObject,
 
 
 
+/*
+ * IRP_MJ_INTERNAL_DEVICE_CONTROL - THE HID MINIDRIVER CONTRACT.
+ *
+ * Installed before HidRegisterMinidriver, so hidclass.sys is the only
+ * caller. Eight codes, specified in ../docs/hid-descriptor.txt section 7
+ * and answered by core_hid_ioctl, except for the one that cannot be.
+ *
+ * THESE USE METHOD_NEITHER, which is why the buffer is Irp->UserBuffer and
+ * not AssociatedIrp.SystemBuffer, and why the argument arrives as a value
+ * stuffed into Type3InputBuffer rather than in an input buffer. hidclass is
+ * a kernel caller, so the pointer needs no probing - but that is true only
+ * because nothing else can reach this entry point.
+ *
+ * THE ENTRY GUARD refuses everything while the device is being torn down.
+ * Note the status: STATUS_DELETE_PENDING, which is what 0xC0000056 is - an
+ * earlier note here named it STATUS_DEVICE_NOT_CONNECTED, which is
+ * 0xC000009D and a different thing.
+ */
 NTSTATUS NTAPI AdaptoidIntDeviceControl(PDEVICE_OBJECT DeviceObject,
                                         PIRP Irp)
 {
-	(void)DeviceObject; (void)Irp;
-	/* TODO: the hidclass contract, including GET_REPORT_DESCRIPTOR, which must
-	 * return the composite descriptor from ../docs/hid-descriptor.txt. */
-	return STATUS_INVALID_DEVICE_REQUEST;
+	PADAPTOID_DEVEXT   dx = AdaptoidDevExtOf(DeviceObject);
+	PIO_STACK_LOCATION sl = IoGetCurrentIrpStackLocation(Irp);
+	u32                info = 0;
+	u32                st;
+	ULONG              code;
+
+	if (!AdaptoidIsDeviceReady(dx)) {
+		AdaptoidCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+		return STATUS_DELETE_PENDING;
+	}
+	code = sl->Parameters.DeviceIoControl.IoControlCode;
+
+	/*
+	 * READ_REPORT IS THE ONE THAT KEEPS THE IRP. It parks on the report
+	 * queue and is completed when a packet arrives, so it is handled here
+	 * rather than in core_hid_ioctl - and it is bracketed by RemoveLockA,
+	 * because the device must not finish removing while a read is parked.
+	 */
+	if (code == CORE_HID_IOC_READ_REPORT) {
+		NTSTATUS status;
+
+		if (dx->Started == 0) {
+			AdaptoidCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+			return STATUS_DEVICE_NOT_READY;
+		}
+		status = AdaptoidLockAcquire(&dx->RemoveLockA);
+		if (!NT_SUCCESS(status)) {
+			AdaptoidCompleteIrp(Irp, status, 0);
+			return status;
+		}
+		status = AdaptoidReadReport(dx, Irp);
+		AdaptoidLockRelease(&dx->RemoveLockA);
+		return status;
+	}
+
+	st = core_hid_ioctl(&dx->Core, code,
+	                    (u8 *)Irp->UserBuffer,
+	                    sl->Parameters.DeviceIoControl.OutputBufferLength,
+	                    sl->Parameters.DeviceIoControl.InputBufferLength,
+	                    ADAPTOID_TYPE3_ARG(sl),
+	                    &info);
+	AdaptoidCompleteIrp(Irp, (NTSTATUS)st, info);
+	return (NTSTATUS)st;
 }
 
 
@@ -2547,10 +2643,6 @@ void AdaptoidNotifyInterfaceChange(PADAPTOID_DEVEXT DevExt, int Live)
 /* ------------------------------------------------------------------ */
 /* the control device object                                           */
 /* ------------------------------------------------------------------ */
-
-static PDEVICE_OBJECT g_ControlDevice;
-static LONG           g_ControlRefCount;
-static FAST_MUTEX     g_ControlMutex;
 
 PADAPTOID_CDO_EXT AdaptoidControlDeviceExt(void)
 {

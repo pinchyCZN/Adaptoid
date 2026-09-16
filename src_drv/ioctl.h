@@ -58,6 +58,8 @@
 #define CORE_ST_DATA_ERROR      0xC000003Eu
 #define CORE_ST_CRC_ERROR       0xC000003Fu
 #define CORE_ST_NOT_SUPPORTED   0xC00000BBu
+#define CORE_ST_BUFFER_TOO_SMALL 0xC0000023u
+#define CORE_ST_DEVICE_NOT_READY_A3 0xC00000A3u
 
 /* Counter selectors for CORE_IOC_READ_COUNTER and CORE_IOC_ZERO_COUNTER. */
 #define CORE_COUNTER_FIRMWARE   1   /* bcdDevice; read only            */
@@ -128,6 +130,58 @@ u32 core_ioctl_dispatch(core_ioctl_env *env, const core_ioctl *req, u32 *info);
  * duration has elapsed is marked stopped here.
  */
 int core_effect_slot_active(core_state *cs, s32 slot, s32 now_tick);
+
+/* ======================================================================
+ * THE HID MINIDRIVER CONTRACT
+ *
+ * IRP_MJ_INTERNAL_DEVICE_CONTROL, and the reason this driver is a HID
+ * device at all. hidclass.sys - never user mode - asks these eight
+ * questions, and the answer to CORE_HID_IOC_REPORT_DESC is what tells
+ * Windows there is a keyboard, a mouse and a game controller here.
+ *
+ * WITHOUT THIS THE DRIVER DOES NOTHING. It would load, enumerate, poll the
+ * adapter and produce reports that no device object exists to carry.
+ *
+ * Codes are CTL_CODE(FILE_DEVICE_KEYBOARD, fn, METHOD_NEITHER,
+ * FILE_ANY_ACCESS) = 0x000B0000 | (fn << 2) | 3, which is why they look
+ * like keyboard codes on a device that is not only a keyboard.
+ * ====================================================================== */
+
+#define CORE_HID_IOC_DEVICE_DESC    0x000B0003u  /* fn 0 */
+#define CORE_HID_IOC_REPORT_DESC    0x000B0007u  /* fn 1 */
+#define CORE_HID_IOC_READ_REPORT    0x000B000Bu  /* fn 2 */
+#define CORE_HID_IOC_WRITE_REPORT   0x000B000Fu  /* fn 3 */
+#define CORE_HID_IOC_GET_STRING     0x000B0013u  /* fn 4 */
+#define CORE_HID_IOC_ACTIVATE       0x000B001Fu  /* fn 7 */
+#define CORE_HID_IOC_DEACTIVATE     0x000B0023u  /* fn 8 */
+#define CORE_HID_IOC_ATTRIBUTES     0x000B0027u  /* fn 9 */
+
+/* String indices, in the low half of the packed Type3InputBuffer value. */
+#define CORE_HID_STRING_MANUFACTURER 0x0Eu
+#define CORE_HID_STRING_PRODUCT      0x0Fu
+#define CORE_HID_STRING_SERIAL       0x10u
+
+#define CORE_HID_DEVICE_DESC_BYTES  9
+#define CORE_HID_ATTRIBUTES_BYTES   0x20
+
+/* The USB identity the device reports, matching its descriptors. */
+#define CORE_USB_VENDOR_ID      0x06F7u
+#define CORE_USB_PRODUCT_ID     0x0001u
+#define CORE_USB_VERSION        0x0100u
+
+/*
+ * Answer one minidriver request.
+ *
+ * out and out_len are the caller's output buffer; in_len is its input
+ * length, which CORE_HID_IOC_WRITE_REPORT reports straight back; arg is the
+ * Type3InputBuffer value, carrying the string index or the collection
+ * number depending on the code.
+ *
+ * CORE_HID_IOC_READ_REPORT IS NOT ANSWERED HERE - it parks an IRP, which is
+ * the OS layer's business, and the caller must intercept it first.
+ */
+u32 core_hid_ioctl(core_state *cs, u32 code, u8 *out, u32 out_len,
+                   u32 in_len, u32 arg, u32 *info);
 
 /* ======================================================================
  * THE CONTROL DEVICE

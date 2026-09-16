@@ -43,6 +43,7 @@ core_effect_wave	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
 core_effect_window	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
 core_effect_window	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
 core_emit	core.c	part	wishk201.sys	00014de8	drv_SubmitHidReport
+core_hid_descriptor	core.c	part	wishk201.sys	000128d2	drv_DispatchInternalDeviceControl
 core_hid_key_event	core.c	port	wishk201.sys	00014ad0	drv_HidKeyEvent
 core_hid_key_report	core.c	part	wishk201.sys	00014ad0	drv_HidKeyEvent
 core_hid_mouse_button	core.c	port	wishk201.sys	00014c80	drv_HidMouseButtonEvent
@@ -138,6 +139,7 @@ harness_pump	harness.c	new	-	-	-
 harness_sink	harness.c	new	-	-	-
 harness_vendor	harness.c	new	-	-	-
 hid_keys_match	harness.c	new	-	-	-
+hid_parse	harness.c	new	-	-	-
 hid_sink	harness.c	new	-	-	-
 hidclass_stub	harness.c	new	-	-	-
 hlog	harness.c	new	-	-	-
@@ -183,6 +185,7 @@ test_command_block	harness.c	new	-	-	-
 test_control_device	harness.c	new	-	-	-
 test_effect_chain	harness.c	new	-	-	-
 test_effect_engine	harness.c	new	-	-	-
+test_hid_contract	harness.c	new	-	-	-
 test_hid_reports	harness.c	new	-	-	-
 test_input_bind	harness.c	new	-	-	-
 test_input_path	harness.c	new	-	-	-
@@ -224,6 +227,7 @@ core_cmd_read	ioctl.c	part	wishk201.sys	000113b0	drv_ControlDeviceReadWrite
 core_cmd_write	ioctl.c	part	wishk201.sys	000113b0	drv_ControlDeviceReadWrite
 core_ctl_dispatch	ioctl.c	port	wishk201.sys	0001061f	drv_IoctlControlDevice
 core_effect_slot_active	ioctl.c	port	wishk201.sys	00013e90	drv_EffectSlotActive
+core_hid_ioctl	ioctl.c	port	wishk201.sys	000128d2	drv_DispatchInternalDeviceControl
 core_ioctl_dispatch	ioctl.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand
 core_notify_cancel	ioctl.c	part	wishk201.sys	00015ba0	drv_CompleteNotificationIrps
 core_notify_flush	ioctl.c	part	wishk201.sys	00015ba0	drv_CompleteNotificationIrps
@@ -238,6 +242,7 @@ core_registry_set_live	ioctl.c	part	wishk201.sys	00019160	drv_DisableDeviceInter
 ctl_button_map	ioctl.c	part	wishk201.sys	0001061f	drv_IoctlControlDevice
 ctl_enum_devices	ioctl.c	part	wishk201.sys	0001061f	drv_IoctlControlDevice
 ctl_set_reports	ioctl.c	part	wishk201.sys	0001061f	drv_IoctlControlDevice
+hid_string	ioctl.c	part	wishk201.sys	000128d2	drv_DispatchInternalDeviceControl
 ioc_device_name	ioctl.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand
 ioc_effect_ctrl	ioctl.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand
 ioc_effect_prog	ioctl.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand

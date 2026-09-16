@@ -332,6 +332,18 @@ Table of Contents
    reference counts, its four dispatch entry points, and the cancel-safe
    waiter queue. Testable, and tested.
 
+   THE HID MINIDRIVER CONTRACT was found afterwards, while answering a
+   question about the two functions still carrying TODO comments. One of
+   them, AdaptoidUnload, was correct as it stood - drv_Unload is a single
+   RET and there is nothing to tear down. The other,
+   AdaptoidIntDeviceControl, was the single most load-bearing stub in the
+   tree: it is what hidclass.sys calls, and without an answer to
+   GET_REPORT_DESCRIPTOR no keyboard, mouse or game controller is ever
+   created and the driver does nothing at all. It and the three report
+   descriptors are now in core.c and ioctl.c, with nine test groups - the
+   first of which checks the assembled descriptor against the original's
+   185 bytes.
+
    THE USB LAYER is the one part that is not. Descriptor fetch, select
    configuration, the two asynchronous transfer types, abort and the port
    IOCTLs are all URB marshalling against a bus that does not exist in the
@@ -362,6 +374,7 @@ Table of Contents
    | the device enable        |   3 | wdm.c, tested                   |
    | the scheduler DPC        |   1 | wdm.c                           |
    | the USB layer            |  13 | wdm.c, COMPILED ONLY            |
+   | HID minidriver contract  |   3 | core.c + ioctl.c, 9 groups      |
    | registry and interface   |   3 | wdm.c, driver build only        |
    +--------------------------+-----+---------------------------------+
 

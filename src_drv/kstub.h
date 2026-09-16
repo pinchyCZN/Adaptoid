@@ -77,6 +77,7 @@ typedef signed   long long  LONGLONG;
 #define STATUS_DELETE_PENDING           ((NTSTATUS)0xC0000056L)
 #define STATUS_CANCELLED                ((NTSTATUS)0xC0000120L)
 #define STATUS_INVALID_DEVICE_STATE     ((NTSTATUS)0xC0000184L)
+#define STATUS_DEVICE_NOT_READY         ((NTSTATUS)0xC00000A3L)
 
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 
@@ -90,6 +91,7 @@ typedef signed   long long  LONGLONG;
 #define IRP_MJ_INTERNAL_DEVICE_CONTROL  0x0f
 #define IRP_MJ_CLEANUP                  0x12
 #define IRP_MJ_POWER                    0x16
+#define IRP_MJ_SYSTEM_CONTROL           0x17
 #define IRP_MJ_PNP                      0x1b
 #define IRP_MJ_MAXIMUM_FUNCTION         0x1b
 
@@ -105,6 +107,16 @@ typedef struct _UNICODE_STRING {
 	USHORT  MaximumLength;
 	PWSTR   Buffer;
 } UNICODE_STRING, *PUNICODE_STRING;
+
+/*
+ * Pointer-sized, so that a value smuggled through a PVOID survives the
+ * round trip on both 32- and 64-bit. The DDK spells it the same way.
+ */
+#if defined(_WIN64)
+typedef unsigned __int64 ULONG_PTR;
+#else
+typedef unsigned long    ULONG_PTR;
+#endif
 
 typedef ULONG KSPIN_LOCK, *PKSPIN_LOCK;
 typedef ULONG KIRQL;
@@ -236,6 +248,13 @@ typedef struct _IO_STACK_LOCATION {
 			ULONG OutputBufferLength;
 			ULONG InputBufferLength;
 			ULONG IoControlCode;
+			/*
+			 * METHOD_NEITHER's input pointer. The HID minidriver
+			 * codes abuse it as a VALUE - a string index or a
+			 * collection number - rather than a pointer, which is
+			 * why ADAPTOID_TYPE3_ARG casts rather than reads.
+			 */
+			PVOID Type3InputBuffer;
 		} DeviceIoControl;
 		struct {
 			PDEVICE_CAPABILITIES Capabilities;
@@ -282,6 +301,8 @@ typedef struct _IO_STATUS_BLOCK {
 typedef struct _IRP {
 	IO_STATUS_BLOCK    IoStatus;
 	PVOID              SystemBuffer;
+	/* METHOD_NEITHER hands the caller's output buffer over directly. */
+	PVOID              UserBuffer;
 	PIO_STACK_LOCATION CurrentStackLocation;
 	/* The harness pre-builds both locations; the real thing walks an
 	 * array and the macros below hide the difference. */

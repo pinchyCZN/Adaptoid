@@ -2105,3 +2105,163 @@ u8 core_pak_data_crc8(const u8 *data, u32 len)
 	}
 	return crc;
 }
+
+/* ======================================================================
+ * THE REPORT DESCRIPTORS
+ *
+ * This is the contract with Windows, and the one piece of the driver that
+ * must be BYTE IDENTICAL to the original. hidclass parses it to decide what
+ * the device is; change an item and every existing profile, every game's
+ * saved binding and the device's identity in Control Panel all change with
+ * it. Written out item by item from docs/hid-descriptor.txt section 4, and
+ * checked against the original's bytes in the harness.
+ *
+ * ONE ARRAY, THREE VIEWS. The original stores three separate copies at
+ * 00019b40, 00019c00 and 00019c40, but the 185-byte composite is EXACTLY
+ * the 121-byte Mouse+Keyboard descriptor followed by the 64-byte Joystick
+ * one - verified byte for byte. So one array serves all three, and the two
+ * fragments are slices of it. Nothing is duplicated and the composite
+ * cannot drift from its parts.
+ *
+ * THE THREE COLLECTIONS ARE INDEPENDENT top-level applications, which is
+ * what makes this a composite device: Windows creates a keyboard, a mouse
+ * and a game controller from one USB endpoint. That is the whole reason the
+ * original remaps in the driver instead of hooking user mode, and it is the
+ * property the replacement exists to preserve.
+ * ====================================================================== */
+
+static const u8 CORE_HID_DESCRIPTOR[CORE_HID_DESC_ALL] = {
+	/* ---- Mouse, report ID 3 ------------------------------ 55 bytes */
+	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
+	0x09, 0x02,             /* Usage (Mouse)                           */
+	0xA1, 0x01,             /* Collection (Application)                */
+	0x09, 0x01,             /*   Usage (Pointer)                       */
+	0xA1, 0x00,             /*   Collection (Physical)                 */
+	0x85, 0x03,             /*     Report ID (3)                       */
+	0x05, 0x09,             /*     Usage Page (Button)                 */
+	0x19, 0x01,             /*     Usage Minimum (1)                   */
+	0x29, 0x03,             /*     Usage Maximum (3)                   */
+	0x15, 0x00,             /*     Logical Minimum (0)                 */
+	0x25, 0x01,             /*     Logical Maximum (1)                 */
+	0x75, 0x01,             /*     Report Size (1)                     */
+	0x95, 0x03,             /*     Report Count (3)                    */
+	0x81, 0x02,             /*     Input (Data,Var,Abs) - 3 buttons    */
+	0x75, 0x05,             /*     Report Size (5)                     */
+	0x95, 0x01,             /*     Report Count (1)                    */
+	0x81, 0x01,             /*     Input (Const) - pad to a byte       */
+	0x05, 0x01,             /*     Usage Page (Generic Desktop)        */
+	0x09, 0x30,             /*     Usage (X)                           */
+	0x09, 0x31,             /*     Usage (Y)                           */
+	0x09, 0x38,             /*     Usage (Wheel)                       */
+	0x15, 0x81,             /*     Logical Minimum (-127)              */
+	0x25, 0x7F,             /*     Logical Maximum (127)               */
+	0x75, 0x08,             /*     Report Size (8)                     */
+	0x95, 0x03,             /*     Report Count (3)                    */
+	0x81, 0x06,             /*     Input (Data,Var,REL) - X, Y, wheel  */
+	0xC0,                   /*   End Collection                        */
+	0xC0,                   /* End Collection                          */
+
+	/* ---- Keyboard, report ID 2 --------------------------- 66 bytes */
+	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
+	0x09, 0x06,             /* Usage (Keyboard)                        */
+	0xA1, 0x01,             /* Collection (Application)                */
+	0x85, 0x02,             /*   Report ID (2)                         */
+	0x05, 0x07,             /*   Usage Page (Keyboard/Keypad)          */
+	0x19, 0xE0,             /*   Usage Minimum (0xE0, LeftControl)     */
+	0x29, 0xE7,             /*   Usage Maximum (0xE7, RightGUI)        */
+	0x15, 0x00,             /*   Logical Minimum (0)                   */
+	0x25, 0x01,             /*   Logical Maximum (1)                   */
+	0x75, 0x01,             /*   Report Size (1)                       */
+	0x95, 0x08,             /*   Report Count (8)                      */
+	0x81, 0x02,             /*   Input (Data,Var,Abs) - modifier byte  */
+	0x95, 0x01,             /*   Report Count (1)                      */
+	0x75, 0x08,             /*   Report Size (8)                       */
+	0x81, 0x01,             /*   Input (Const) - the reserved byte     */
+	0x95, 0x05,             /*   Report Count (5)                      */
+	0x75, 0x01,             /*   Report Size (1)                       */
+	0x05, 0x08,             /*   Usage Page (LED)                      */
+	0x19, 0x01,             /*   Usage Minimum (1, NumLock)            */
+	0x29, 0x05,             /*   Usage Maximum (5, Kana)              */
+	0x91, 0x02,             /*   OUTPUT (Data,Var,Abs) - the five LEDs */
+	0x95, 0x01,             /*   Report Count (1)                      */
+	0x75, 0x03,             /*   Report Size (3)                       */
+	0x91, 0x01,             /*   Output (Const) - pad the LED byte     */
+	0x95, 0x0A,             /*   Report Count (10)                     */
+	0x75, 0x08,             /*   Report Size (8)                       */
+	0x05, 0x07,             /*   Usage Page (Keyboard/Keypad)          */
+	0x19, 0x00,             /*   Usage Minimum (0)                     */
+	0x2A, 0xA5, 0x00,       /*   Usage Maximum (0xA5)                  */
+	0x15, 0x00,             /*   Logical Minimum (0)                   */
+	0x26, 0xA5, 0x00,       /*   Logical Maximum (0xA5)                */
+	0x81, 0x00,             /*   Input (Data,ARRAY) - TEN-KEY rollover */
+	0xC0,                   /* End Collection                          */
+
+	/* ---- Joystick, report ID 1 --------------------------- 64 bytes */
+	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
+	0x09, 0x04,             /* Usage (Joystick)                        */
+	0xA1, 0x01,             /* Collection (Application)                */
+	0x09, 0x01,             /*   Usage (Pointer)                       */
+	0xA1, 0x00,             /*   Collection (Physical)                 */
+	0x85, 0x01,             /*     Report ID (1)                       */
+	0x05, 0x01,             /*     Usage Page (Generic Desktop)        */
+	0x09, 0x30,             /*     Usage (X)                           */
+	0x09, 0x31,             /*     Usage (Y)                           */
+	0x16, 0x50, 0xFB,       /*     Logical Minimum (-1200)             */
+	0x26, 0xB0, 0x04,       /*     Logical Maximum (1200)              */
+	0x36, 0x00, 0x00,       /*     Physical Minimum (0)                */
+	0x46, 0x60, 0x09,       /*     Physical Maximum (2400)             */
+	0x75, 0x0C,             /*     Report Size (12) - TWELVE BITS      */
+	0x95, 0x02,             /*     Report Count (2)                    */
+	0x81, 0x02,             /*     Input (Data,Var,Abs) - X and Y      */
+	0xC0,                   /*   End Collection                        */
+	0x05, 0x09,             /*   Usage Page (Button)                   */
+	0x19, 0x01,             /*   Usage Minimum (1)                     */
+	0x29, 0x0E,             /*   Usage Maximum (14)                    */
+	0x15, 0x00,             /*   Logical Minimum (0)                   */
+	0x25, 0x01,             /*   Logical Maximum (1)                   */
+	0x35, 0x00,             /*   Physical Minimum (0)                  */
+	0x45, 0x01,             /*   Physical Maximum (1)                  */
+	0x75, 0x01,             /*   Report Size (1)                       */
+	0x95, 0x0E,             /*   Report Count (14) - FOURTEEN buttons  */
+	0x81, 0x02,             /*   Input (Data,Var,Abs)                  */
+	0x95, 0x02,             /*   Report Count (2)                      */
+	0x75, 0x01,             /*   Report Size (1)                       */
+	0x81, 0x01,             /*   Input (Const) - pad to 40 bits        */
+	0xC0                    /* End Collection                          */
+};
+
+/*
+ * THE SELECTION TABLE, from 00019cc0. Eight entries of {pointer, length}
+ * indexed by devices_mask & 7, and only two of the eight are distinct from
+ * the first - indices 0 through 5 ALL give the joystick.
+ *
+ * The three-bit mask reads like a set of per-collection enables, and almost
+ * certainly started life as one, but as built the low bits carry no
+ * independent meaning. Reproduced exactly, because a replacement that
+ * "fixed" it would answer index 3 with a different descriptor than the
+ * original and silently change the device for anyone whose registry holds
+ * that value.
+ */
+static const struct {
+	u32 offset;
+	u32 length;
+} CORE_HID_DESC_TABLE[8] = {
+	{ CORE_HID_DESC_JOY_AT, CORE_HID_DESC_JOY },   /* 0 */
+	{ CORE_HID_DESC_JOY_AT, CORE_HID_DESC_JOY },   /* 1 */
+	{ CORE_HID_DESC_JOY_AT, CORE_HID_DESC_JOY },   /* 2 */
+	{ CORE_HID_DESC_JOY_AT, CORE_HID_DESC_JOY },   /* 3 */
+	{ CORE_HID_DESC_JOY_AT, CORE_HID_DESC_JOY },   /* 4 */
+	{ CORE_HID_DESC_JOY_AT, CORE_HID_DESC_JOY },   /* 5 */
+	{ 0,                    CORE_HID_DESC_MK  },   /* 6 mouse + keyboard */
+	{ 0,                    CORE_HID_DESC_ALL }    /* 7 all three        */
+};
+
+const u8 *core_hid_descriptor(u32 devices_mask, u32 *length)
+{
+	u32 i = devices_mask & 7u;
+
+	if (length != 0) {
+		*length = CORE_HID_DESC_TABLE[i].length;
+	}
+	return CORE_HID_DESCRIPTOR + CORE_HID_DESC_TABLE[i].offset;
+}
