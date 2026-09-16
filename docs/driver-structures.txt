@@ -385,13 +385,19 @@ Table of Contents
 3.5.  ADAPTOID_SCRIPT_THREAD, 0x24 header plus stack
 
        +0x00  Link        on ReadyThreadList or FreeThreadList
-       +0x08  ThreadId    from NextThreadId
-       +0x0C  Pc
-       +0x10  Blocked     cleared by _wake
-       +0x14  ArgCount    dwords copied into the stack area
+       +0x08  ThreadId    from NextThreadId, so the first thread is 1
+       +0x0C  Pc          word index into the code array
+       +0x10  SavedAcc    the interpreter's accumulator
+       +0x14  SavedDepth  live operand-stack depth, in words
        +0x18  WakeTime    64-bit, the scheduler sort key
-       +0x20  StackSize
-       +0x24  stack
+       +0x20  StackSize   capacity in words
+       +0x24  stack       StackSize words
+
+   CORRECTED NAMES. +0x10 and +0x14 were recorded here as Blocked and
+   ArgCount. Neither is what drv_ScriptExecute does with them: it loads +0x10
+   into the accumulator and +0x14 into the stack pointer on entry, and writes
+   both back on exit. drv_ScriptThreadAlloc zeroes both, so a fresh thread
+   starts with a zero accumulator and an empty stack.
 
    Allocated as StackSize * 4 + 0x24, with StackSize CLAMPED TO A MINIMUM OF
    8 dwords. Threads are pooled: drv_ScriptThreadAlloc pops FreeThreadList

@@ -237,15 +237,16 @@ Table of Contents
    in controller state it reads handler addresses out of the script's own
    variable array and spawns a thread for each one that holds a tagged
    code address: sixteen slots for the individual buttons at offsets
-   0x00..0x3F, then further slots at +0x40, +0x44, +0x48 and +0x4C for
-   the aggregate button word, the stick and related events.
-
-   INFERENCE: the exact meaning of the four aggregate slots is taken from
-   the arguments each spawned thread receives, not from documentation.
+   0x00..0x3F, then +0x40 for the aggregate button word, +0x44 for the
+   stick, and +0x48 and +0x4C for a pair that fire on any change and
+   bracket the others. Each slot, what gates it and what arguments it
+   receives are tabulated in script-bytecode.txt section 9.7.
 
    drv_ScriptScheduler refills the interpreter's instruction budget in
    proportion to elapsed time, capped at 100000, runs every thread whose
    wake time has passed, drains the event list and re-arms the timer.
+   Exhausting that budget does not pause a thread, it kills it: see
+   script-bytecode.txt section 9.3.
 
 9.  Effect Engine
 

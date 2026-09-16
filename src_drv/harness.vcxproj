@@ -68,12 +68,14 @@
 
   <ItemGroup>
     <ClCompile Include="core.c" />
+    <ClCompile Include="sched.c" />
     <ClCompile Include="script.c" />
     <ClCompile Include="wdm.c" />
     <ClCompile Include="harness.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="core.h" />
+    <ClInclude Include="sched.h" />
     <ClInclude Include="script.h" />
     <ClInclude Include="wdm.h" />
     <ClInclude Include="kstub.h" />

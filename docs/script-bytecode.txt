@@ -39,7 +39,9 @@ Table of Contents
    6.  Opcodes
    7.  Input Events
    8.  Consequences For The Replacement Driver
-   9.  Open Questions
+   9.  The Thread Scheduler
+   9.7.  Input Binding
+   10. Open Questions
 
 1.  Evidence That It Is Flex And Bison
 
@@ -641,7 +643,213 @@ Table of Contents
    follows. Any modern port should validate the whole stream once at load
    time, which is cheap and removes the entire class.
 
-9.  Open Questions
+9.  The Thread Scheduler
+
+   drv_ScriptExecute runs one thread for one quantum. Deciding which thread,
+   when, and what happens when one stops is drv_ScriptScheduler (00017980),
+   with drv_ScriptThreadAlloc (000177c0) and drv_ScriptThreadQueue (00017860)
+   either side of it.
+
+9.1.  The Thread Node
+
+   A thread is a 0x24-byte header followed by its saved operand stack:
+
+       +0x00  Flink, Blink      ready list or free list
+       +0x08  ThreadId          from InterlockedIncrement, so the first is 1
+       +0x0C  Pc                word index into the code array
+       +0x10  SavedAcc          the accumulator
+       +0x14  SavedDepth        live stack depth, in words
+       +0x18  WakeTime          64-bit, the ready-list sort key
+       +0x20  StackSize         capacity in words
+       +0x24  the stack itself, StackSize words
+
+   The two fields at +0x10 and +0x14 were named Blocked and ArgCount in an
+   earlier revision of the Ghidra database. Both names were wrong:
+   drv_ScriptExecute loads +0x10 into the accumulator and +0x14 into the
+   stack pointer at entry, and writes both back at exit.
+
+   Allocation is max(StackSize, 8) * 4 + 0x24; the clamp to eight words is
+   written back over the caller's argument slot, so thread 0, requested with
+   StackSize 0, really gets eight. A node is taken from FreeThreadList when
+   the head is big enough, and a head that is too small is pushed straight
+   back rather than grown, so a pooled node can be LARGER than requested.
+
+   ASYMMETRY WORTH KNOWING. drv_ScriptExecute restores StackSize words into
+   the shared local region but saves only SavedDepth words out. The slots
+   between the two hold whatever the node last held, including another
+   thread's data if the node came from the pool. Nothing reads them, because
+   the interpreter only touches [0, sp), and the node is always big enough
+   that nothing is read out of bounds.
+
+9.2.  The Ready List Is Sorted
+
+   drv_ScriptThreadQueue inserts before the first thread whose WakeTime is
+   strictly greater, so equal wake times run in arrival order, and the
+   scheduler can stop its sweep at the first thread that is not yet due
+   instead of walking the whole list.
+
+   A running thread is on NO list. It is unlinked, and ThreadCount
+   decremented, before the spin lock is dropped to call drv_ScriptExecute;
+   only its exit status puts it back anywhere.
+
+9.3.  The Instruction Budget Is A Token Bucket
+
+   At the top of every pass:
+
+       elapsed = (now - SchedulerTime) / 100        clamped to [0, 100000]
+       InstructionBudget = min(InstructionBudget + elapsed, 100000)
+
+   The divisor is 100 and the clock is in 100ns units, so one token is 10us
+   of real time and the 100000 cap is exactly one second of accrual. That
+   makes it a 100000 instruction per second rate limit with a one second
+   burst. The bucket is per DEVICE, not per thread.
+
+   RUNNING OUT IS FATAL TO THE THREAD, not a pause. Status 10 is not 1, 9 or
+   0xB, so it takes the fault path in 9.5: the thread is retired and a type
+   0x42 event reports status 10. Since the bucket is shared, a greedy thread
+   can empty it and fault its neighbours in the same pass.
+
+   The budget is also the only thing that bounds the scheduler's own sweep.
+   The sweep re-reads the list head after each thread, so a thread re-queued
+   at a wake time that is still due runs again immediately; that terminates
+   only because each execution spends at least one token and an empty bucket
+   faults the thread off the list.
+
+9.4.  Exit Dispositions
+
+       +--------+------------------------+------------------------------+
+       | status | meaning                | what happens to the thread   |
+       +========+========================+==============================+
+       | 1      | terminated             | pushed on FreeThreadList     |
+       +--------+------------------------+------------------------------+
+       | 9      | sleeping               | re-queued; the native that   |
+       |        |                        | slept has set the new        |
+       |        |                        | WakeTime                     |
+       +--------+------------------------+------------------------------+
+       | 0xB    | node realloc failed    | already freed; do not touch  |
+       +--------+------------------------+------------------------------+
+       | any    | a script fault,        | retired into the post-mortem |
+       | other  | including 10           | slot, see 9.5                |
+       +--------+------------------------+------------------------------+
+
+9.5.  The Post-Mortem Slot
+
+   A faulted thread is neither freed nor rescheduled. It is parked at
+   devext+0x1684 together with a snapshot of the globals at devext+0x1688,
+   whatever was parked there before is released, and a type 0x42 event
+   carries the status out. There is ONE slot per device, so a second fault
+   discards the first thread's evidence. IOCTL 0xb98c20f4 (fn 0x83d) drains
+   it; it is a post-mortem dump, not a trace buffer.
+
+9.6.  Re-entrancy And The Timer
+
+   SchedulerRunning is latched 0 -> 1 under ScriptSpinLock. A caller
+   arriving while a pass is in flight leaves its timestamp in PendingTime
+   and returns at once, so the scheduler never recurses and never blocks the
+   input path that called it. The running pass re-reads PendingTime at the
+   bottom of its loop and goes round again with that time if it is set.
+
+   Only when PendingTime is empty does the pass clear SchedulerRunning and,
+   if threads remain, arm the timer. KeSetTimer is given a due time of
+   (now - head->WakeTime): negative, and therefore a RELATIVE delay of
+   exactly (WakeTime - now) 100ns units.
+
+   Events are drained AFTER the whole sweep, not as they are produced, so a
+   script's HID output appears in one burst per pass.
+
+   Three things drive a pass: drv_ScriptLoad runs one immediately after
+   creating thread 0, drv_ScriptDispatchInput runs one after queueing a
+   thread per bound input handler, and drv_ScriptSchedulerDpc runs one when
+   the timer fires.
+
+9.7.  Input Binding
+
+   drv_ScriptDispatchInput (00017550) is what creates threads in the first
+   place. drv_BuildJoystickReport calls it once per accepted packet, and it
+   spawns a thread for every bound handler whose input changed, then runs a
+   pass. If no script is loaded it returns 0 and does nothing.
+
+   THE PACKED REPORT. drv_BuildJoystickReport keeps two four-byte copies of
+   the controller state, the current one at devext+0x1704 and the previous at
+   devext+0x1700, and the previous is the current one from the packet before.
+   Each is built from the raw five-byte packet at 000151cc as
+
+       packed[0] = raw[0]   stick X, signed
+       packed[1] = raw[1]   stick Y, signed
+       packed[2] = raw[3]   the first button byte
+       packed[3] = raw[4]   the second
+
+   The status byte raw[2] is not carried. Read as little-endian 16-bit
+   values, packed[0..1] is the stick word and packed[2..3] is the button
+   word, and the two deltas that gate everything below are
+
+       btn_delta   = (short)cur[2..3] ^ (short)prev[2..3]
+       stick_delta = (short)cur[0..1] ^ (short)prev[0..1]
+
+   Both halves are sign-extended before the XOR, which changes only the bits
+   above 15 and affects nothing: every test is against zero or against a mask
+   no wider than 0x8000. If both deltas are zero the function returns without
+   queueing anything.
+
+9.7.1.  The Handler Slots
+
+   Handler addresses live in the script's own globals, and a slot is bound
+   when it holds a value tagged 0x10000000.
+
+   +-----------+---------------------+-------+------------------------------+
+   | Slot      | Fires when          | Stack | Arguments                    |
+   +===========+=====================+=======+==============================+
+   | 0x00-0x0F | that button changed |     1 | the button's new state, 0 or |
+   |           |                     |       | 1                            |
+   +-----------+---------------------+-------+------------------------------+
+   | 0x10      | any button changed  |     2 | cur button word, prev, both  |
+   |           |                     |       | SIGN-EXTENDED                |
+   +-----------+---------------------+-------+------------------------------+
+   | 0x11      | the stick moved     |     4 | cur X, cur Y, prev X, prev Y |
+   |           |                     |       | as signed bytes              |
+   +-----------+---------------------+-------+------------------------------+
+   | 0x12      | anything changed    |     2 | cur packed dword, prev       |
+   +-----------+---------------------+-------+------------------------------+
+   | 0x13      | anything changed    |     2 | cur packed dword, prev       |
+   +-----------+---------------------+-------+------------------------------+
+
+   SLOT n IS RAW BUTTON INDEX n. The per-button loop starts at mask 0x8000
+   and shifts right once per slot, so slot 0 is bit 15 of the button word and
+   slot 15 is bit 0. That word is bit for bit the one drv_BuildJoystickReport
+   maps through drv_ButtonMap, which is why the numbering lines up; it is
+   worth stating because neither side makes it obvious alone.
+
+   0x12 AND 0x13 HAVE THE SAME TRIGGER AND THE SAME ARGUMENTS. What
+   distinguishes them is position. 0x12 is queued before every other handler
+   and 0x13 after all of them, and since every thread in the batch gets the
+   SAME wake time and the ready list is FIFO among equal wake times, that is
+   also the order they run in. They bracket the batch.
+
+   The full queueing order is therefore 0x12, then the stick, then the
+   aggregate button word, then the changed buttons in ascending slot order,
+   then 0x13.
+
+   THE AGGREGATE WORD IS SIGNED. Slot 0x10 receives its arguments through
+   MOVSX at 000176bc, so a button word with bit 15 set arrives as a negative
+   number. A script comparing that argument against 0x8000 would never match.
+   Slot 0x11 is signed for the same reason and does mean it - the stick axes
+   are signed bytes.
+
+9.7.2.  What The Original Does Not Check
+
+   The slot index is never bounds-checked against VarCount. Vars is allocated
+   with 200 words of slack for the locals, so a script declaring fewer than
+   20 globals makes slots 0x10 to 0x13 read uninitialised locals as handler
+   addresses. That is inside the allocation, so not an overrun, but a local
+   that happens to look like a tagged code address spawns a thread at a junk
+   pc. A compiled script always reserves all 20 slots, so it cannot arise
+   from the configurator; a hand-built download through IOCTL 0xb98c20f0
+   could. The replacement checks the index.
+
+   A failed thread allocation silently drops that handler. The original has
+   no other response and neither does the replacement.
+
+10. Open Questions
    - The six opcodes the interpreter decodes but the compiler was not seen to
    emit: 0x095, 0x171, 0x181, 0x192, 0x230 and 0x294. Which grammar
    productions reach them, if any.
@@ -659,7 +867,4 @@ Table of Contents
    - How the 16 per-button script slots relate to the 32 macro slots in the
    driver, which are programmed by a different IOCTL entirely.
 
-   -  The scheduler around drv_ScriptExecute: drv_ScriptThreadAlloc allocates
-   -  thread contexts, drv_ScriptThreadQueue queues them and
-   -  drv_ScriptScheduler drives the timer at devext+0x1690.
 

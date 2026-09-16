@@ -27,7 +27,9 @@ Table of Contents
    3.  The Core Seam
    4.  Why The Driver Uses The WDK 7.1 Toolchain
    5.  Settings That Are Not Obvious
-   6.  What Is Not Here Yet
+   6.  The File Plan
+   6.1.  What Is Left
+   6.2.  Specifications For What Remains
 
 1.  Layout
 
@@ -36,10 +38,13 @@ Table of Contents
    +=================+===================================================+
    | adaptoid.sln    | Both projects, four configurations                |
    | common.props    | WdkRoot, output layout, shared C settings         |
-   | driver.vcxproj  | core.c + wdm.c            -> wishk300.sys         |
-   | harness.vcxproj | core.c + wdm.c + harness.c -> wishk300.exe        |
+   | driver.vcxproj  | the sources below         -> wishk300.sys         |
+   | harness.vcxproj | the same, plus harness.c  -> wishk300.exe         |
    | core.h core.c   | OS-free logic. No Windows types at all.           |
-   | wdm.h wdm.c     | DriverEntry, AddDevice, PnP, power, IOCTLs        |
+   | script.h .c     | The bytecode interpreter and its builtins         |
+   | sched.h .c      | Script threads, the scheduler, input binding      |
+   | ioctl.h .c      | The private IOCTL surface and control device      |
+   | wdm.h wdm.c     | DriverEntry, AddDevice, PnP, power, URBs          |
    | kstub.h         | Fake kernel ABI for user-mode builds              |
    | harness.c       | main() plus the kernel stub implementations       |
    | origin.tsv      | Where each function came from in Ghidra           |
@@ -194,23 +199,101 @@ Table of Contents
    dumping both. The resulting section is correct - discardable code - and
    4078 is in the DDK own suppression list.
 
-6.  What Is Not Here Yet
+6.  The File Plan
 
-   This is a skeleton. Every function has the signature it will be called
-   with and a body that is a stub; the shape is the deliverable, not the
-   behaviour. Still to come, each with its specification already written:
+   THE SET OF SOURCE FILES IS FIXED AT SIX. Everything still to be ported
+   has a named home in the table below, and nothing outside this list is to
+   be created without a deliberate decision to change the plan. The reason
+   for writing it down is that a port of this size drifts into a file per
+   subsystem if each one is decided on its own.
+
+   +-----------+----------+---------+---------------------------------------+
+   | File      | Now      | Planned | Holds                                 |
+   +===========+==========+=========+=======================================+
+   | core.c    |     1658 |   ~2100 | decode, effects, Pak CRCs, the N64    |
+   |           |          |         | transaction, HID report state         |
+   +-----------+----------+---------+---------------------------------------+
+   | script.c  |      382 |    ~570 | the bytecode interpreter and the      |
+   |           |          |         | native builtin library                |
+   +-----------+----------+---------+---------------------------------------+
+   | sched.c   |      568 |    ~670 | thread pool, the scheduler, and the   |
+   |           |          |         | input binding that produces threads   |
+   +-----------+----------+---------+---------------------------------------+
+   | ioctl.c   | not yet  |  ~1200  | the private IOCTL surface, the        |
+   |           |          |         | control device, the notify queue      |
+   +-----------+----------+---------+---------------------------------------+
+   | wdm.c     |      195 |   ~1700 | DriverEntry, AddDevice, PnP, power,   |
+   |           |          |         | polling, URB transport, device naming |
+   +-----------+----------+---------+---------------------------------------+
+   | harness.c |     2474 |   ~3600 | main() and every test                 |
+   +-----------+----------+---------+---------------------------------------+
+
+   WHY ioctl.c IS A FILE AND NOT PART OF wdm.c. It is not a size split. The
+   IOCTL surface owns a DIFFERENT DEVICE OBJECT: drv_CreateControlDevice
+   makes a singleton control device with its own extension, its own Create,
+   Close, Cleanup and ReadWrite handlers, its own symbolic link and its own
+   IRP queues, none of which the per-device HID minidriver path in wdm.c
+   touches. It is also the entire contract with wishd201.exe, specified in
+   one document, ../docs/ioctl-surface.txt. One surface, one document, one
+   file.
+
+6.1.  What Is Left
+
+   Measured against the Ghidra database: 44 of the 146 functions in
+   wishk201.sys are ported, 14587 of 38690 bytes, so 38 percent by code
+   size. The 2608 lines written so far cover those 14587 bytes, which is 5.6
+   bytes of original per line of replacement and is the ratio the estimates
+   below use.
+
+   +--------------------------+-----+-------+----------+-----------+
+   | Subsystem                | fns | bytes | ~C lines | Goes to   |
+   +==========================+=====+=======+==========+===========+
+   | IOCTL surface            |   9 |  7045 |     1174 | ioctl.c   |
+   | PnP, start and stop      |  14 |  2577 |      429 | wdm.c     |
+   | device naming            |   6 |  1808 |      301 | wdm.c     |
+   | HID report plumbing      |  10 |  1680 |      280 | core+wdm  |
+   | vendor transport         |   8 |  1522 |      253 | wdm.c     |
+   | control device           |  10 |  1473 |      245 | ioctl.c   |
+   | N64 transaction          |   9 |  1360 |      226 | core.c    |
+   | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
+   | power                    |   7 |  1225 |      204 | wdm.c     |
+   | script natives           |   1 |  1120 |      186 | script.c  |
+   | notification queue       |   6 |   832 |      138 | ioctl.c   |
+   | kernel glue              |   8 |   703 |      117 | wdm.c     |
+   | USB port recovery        |   6 |   639 |      106 | wdm.c     |
+   | script input binding     |   1 |   624 |      104 | sched.c   |
+   | 64-bit division helpers  |   2 |   208 |       34 | not ported|
+   +--------------------------+-----+-------+----------+-----------+
+   | TOTAL REMAINING          | 102 | 24103 |     4017 |           |
+   +--------------------------+-----+-------+----------+-----------+
+
+   Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
+   the IOCTL surface's bytes and is one very large switch; switch bodies
+   compile densely, so that row lands nearer 700 to 900 lines in practice.
+   And the two 64-bit division helpers are compiler runtime, not driver
+   code - the replacement gets them from the toolchain.
+
+   The pressure is NOT on the OS-free side. Everything left that belongs in
+   core.c, script.c and sched.c comes to about 700 lines together and fits
+   in files that already exist. wdm.c is what grows.
+
+6.2.  Specifications For What Remains
 
    +-------------------------+-------------------------------------------+
    | Piece                   | Specification                             |
    +=========================+===========================================+
    | Report descriptor       | ../docs/hid-descriptor.txt section 4      |
-   | Raw packet decode       | ../docs/usb-transport.txt                 |
-   | Script interpreter      | ../docs/script-bytecode.txt sections 6, 7 |
-   | Effect engine           | ../docs/driver-structures.txt section 2.6 |
+   | Script input binding    | ../docs/script-bytecode.txt section 7     |
+   | Native builtins         | ../docs/script-bytecode.txt section 7     |
+   | N64 transaction         | ../docs/usb-transport.txt                 |
    | PnP, power, URB plumbing| ../docs/driver-lifecycle.txt              |
    | Private IOCTL surface   | ../docs/ioctl-surface.txt                 |
-   | Controller Pak CRCs     | ../docs/usb-transport.txt                 |
    +-------------------------+-------------------------------------------+
+
+   Already ported, and specified where the table in section 1.1 points:
+   the raw packet decode, the joystick report, the accessory probe, the
+   Controller Pak CRCs, the effect engine and its ring, the bytecode
+   interpreter and the thread scheduler.
 
    Loading the driver is out of scope here. It is unsigned, and x64 Windows
    will not load an unsigned driver without test-signing mode; see

@@ -46,6 +46,13 @@
 #define CORE_SCRIPT_BAD_NATIVE  8
 #define CORE_SCRIPT_SLEEPING    9
 #define CORE_SCRIPT_BUDGET_OUT  10
+/*
+ * 11 is not produced by the interpreter. drv_ScriptExecute uses it for a
+ * failed reallocation of the thread node, where the node has already been
+ * freed, so the scheduler must not touch the thread again. It is the one
+ * status that is not a script fault.
+ */
+#define CORE_SCRIPT_NO_MEMORY   11
 
 /*
  * Pointer tags. A value that denotes an address carries one in its high

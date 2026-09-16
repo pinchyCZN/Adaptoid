@@ -17,6 +17,7 @@
 
 #include "wdm.h"
 #include "script.h"
+#include "sched.h"
 
 /* ------------------------------------------------------------------ */
 /* Output                                                              */
@@ -1824,6 +1825,808 @@ static int test_script(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the script scheduler                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Allocation accounting. Every test ends by unloading and asserting that
+ * the scheduler handed everything back, which is the whole reason the
+ * allocator is a seam rather than a direct call.
+ */
+static int      g_sched_live;
+static unsigned g_sched_total;
+static int      g_sched_fail_in;   /* fail the Nth call from now; 0 = never */
+
+static void *sched_test_alloc(void *ctx, u32 bytes)
+{
+	void *p;
+
+	(void)ctx;
+	if (g_sched_fail_in > 0 && --g_sched_fail_in == 0) {
+		return 0;
+	}
+	p = malloc(bytes != 0 ? bytes : 1);
+	if (p != 0) {
+		g_sched_live++;
+		g_sched_total++;
+	}
+	return p;
+}
+
+static void sched_test_free(void *ctx, void *block)
+{
+	(void)ctx;
+	if (block != 0) {
+		g_sched_live--;
+		free(block);
+	}
+}
+
+static u64 g_arm_time;
+static int g_arm_calls;
+static int g_cancel_calls;
+
+/* A wake time of 0 is the cancel, which is what core_sched_unload arms for.
+ * Counted apart, because every load tears down first and would otherwise
+ * show up as a spurious arm. */
+static void sched_test_arm(void *ctx, u64 wake)
+{
+	(void)ctx;
+	if (wake == 0) {
+		g_cancel_calls++;
+		return;
+	}
+	g_arm_time = wake;
+	g_arm_calls++;
+}
+
+#define SCHED_EVLOG 256
+static struct {
+	u32 type;
+	u32 a1;
+	u32 a2;
+} g_evlog[SCHED_EVLOG];
+static int g_evcount;
+
+static void sched_test_event(void *ctx, u32 type, u32 a1, u32 a2)
+{
+	(void)ctx;
+	if (g_evcount < SCHED_EVLOG) {
+		g_evlog[g_evcount].type = type;
+		g_evlog[g_evcount].a1   = a1;
+		g_evlog[g_evcount].a2   = a2;
+	}
+	g_evcount++;
+}
+
+static void sched_reset_log(void)
+{
+	g_evcount      = 0;
+	g_arm_calls    = 0;
+	g_cancel_calls = 0;
+	g_arm_time     = 0;
+}
+
+/*
+ * The test builtin library. The real one is drv_ScriptNativeCall and is not
+ * ported yet; these four exist to drive the scheduler paths that only a
+ * native can reach.
+ *
+ *   0x40000001  _sleep   - wake this thread acc units from now, yield
+ *   0x40000002  _mark    - post a debug event carrying the thread id
+ *   0x40000003  _reenter - call the scheduler from inside the scheduler
+ *   0x40000004  _spawn   - queue a second thread at acc, running at pc 0
+ */
+static u32 g_spawn_pc;
+
+static int sched_test_native(void *ctx, core_script *vm, u32 id)
+{
+	core_sched *s = (core_sched *)ctx;
+
+	switch (id) {
+	case 0x40000001u:
+		s->current->wake_time = s->sched_time + vm->acc;
+		return CORE_SCRIPT_SLEEPING;
+
+	case 0x40000002u:
+		core_sched_post_event(s, CORE_EVENT_DEBUG, s->current->thread_id,
+		                      (u32)s->thread_count);
+		return CORE_SCRIPT_RUNNING;
+
+	case 0x40000003u:
+		core_sched_run(s, vm->acc);
+		return CORE_SCRIPT_RUNNING;
+
+	case 0x40000004u: {
+		core_sched_thread *t = core_sched_thread_alloc(s, 0);
+
+		if (t != 0) {
+			t->pc        = (s32)g_spawn_pc;
+			t->wake_time = vm->acc;
+			core_sched_queue(s, t);
+		}
+		return CORE_SCRIPT_RUNNING;
+	}
+
+	case 0x40000005u:
+		/*
+		 * Report which handler is running and what its first argument
+		 * was. The argument is read out of the LIVE local region, not
+		 * the thread's saved stack: sched_execute unpacked it there.
+		 */
+		core_sched_post_event(s, CORE_EVENT_DEBUG, vm->acc,
+		                      vm->vars[vm->var_count]);
+		return CORE_SCRIPT_RUNNING;
+
+	default:
+		return CORE_SCRIPT_BAD_NATIVE;
+	}
+}
+
+static void sched_test_open(core_sched *s)
+{
+	core_sched_init(s, sched_test_alloc, sched_test_free, 0);
+	core_sched_set_arm(s, sched_test_arm, 0);
+	core_sched_set_event_sink(s, sched_test_event, 0);
+	core_sched_set_native(s, sched_test_native, s);
+	s->device_tag = 0xABCDu;
+	sched_reset_log();
+}
+
+static int sched_expect(int cond, const char *what, long got, long want,
+                        int *bad)
+{
+	if (!cond) {
+		hlog("  FAIL sched %-28s got %ld, want %ld\n", what, got, want);
+		(*bad)++;
+		return 0;
+	}
+	htrace("sched %-30s %ld\n", what, got);
+	return 1;
+}
+
+static int test_sched(void)
+{
+	int bad    = 0;
+	int groups = 0;
+
+	/* ret on an empty stack terminates, which is how an entry function ends. */
+	static const u32 PROG_RET[]   = {0x082};
+	/* _mark, then terminate. */
+	static const u32 PROG_MARK[]  = {0x181, 0x40000002u, 0x082};
+	/* acc = 2000; _sleep; _mark; terminate. */
+	static const u32 PROG_SLEEP[] = {0x110, 2000, 0x181, 0x40000001u,
+		                             0x181, 0x40000002u, 0x082};
+	/* An unconditional branch to itself: burns the whole budget. */
+	static const u32 PROG_LOOP[]  = {0x170, 0xFFFFFFFEu};
+
+	/* ---- 1. load runs thread 0 immediately ------------------------- */
+	{
+		core_sched s;
+
+		g_sched_live  = 0;
+		g_sched_total = 0;
+		sched_test_open(&s);
+
+		sched_expect(core_sched_load(&s, PROG_RET, 1, 4, 1000) == 1,
+		             "load succeeds", 1, 1, &bad);
+		sched_expect(s.thread_count == 0, "thread_count after load",
+		             s.thread_count, 0, &bad);
+		sched_expect(s.next_thread_id == 1, "thread 0 got id 1",
+		             (long)s.next_thread_id, 1, &bad);
+		/* Load credits a full bucket; thread 0 spends exactly one token. */
+		sched_expect(s.budget == CORE_SCRIPT_BUDGET - 1, "budget after one op",
+		             s.budget, CORE_SCRIPT_BUDGET - 1, &bad);
+		sched_expect(g_arm_calls == 0, "no timer armed, list empty",
+		             g_arm_calls, 0, &bad);
+		sched_expect(s.fault_thread == 0, "no fault", 0, 0, &bad);
+
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 2. the ready list runs in wake-time order ------------------ */
+	{
+		core_sched s;
+		core_sched_thread *t;
+		static const u64 WAKE[3] = {3000, 1000, 2000};
+		int i;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, PROG_MARK, 3, 4, 100);
+		sched_reset_log();
+
+		/* ids 2, 3, 4 queued at 3000, 1000, 2000 */
+		for (i = 0; i < 3; i++) {
+			t = core_sched_thread_alloc(&s, 0);
+			t->pc        = 0;
+			t->wake_time = WAKE[i];
+			core_sched_queue(&s, t);
+		}
+		core_sched_run(&s, 5000);
+
+		sched_expect(g_evcount == 3, "three threads ran", g_evcount, 3, &bad);
+		if (g_evcount == 3) {
+			sched_expect(g_evlog[0].a1 == 3, "earliest wake ran first",
+			             (long)g_evlog[0].a1, 3, &bad);
+			sched_expect(g_evlog[1].a1 == 4, "then the middle one",
+			             (long)g_evlog[1].a1, 4, &bad);
+			sched_expect(g_evlog[2].a1 == 2, "then the latest",
+			             (long)g_evlog[2].a1, 2, &bad);
+		}
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 3. equal wake times keep their arrival order --------------- */
+	{
+		core_sched s;
+		core_sched_thread *a, *b, *c;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, PROG_MARK, 3, 4, 100);
+		sched_reset_log();
+
+		a = core_sched_thread_alloc(&s, 0); a->wake_time = 500;
+		b = core_sched_thread_alloc(&s, 0); b->wake_time = 500;
+		c = core_sched_thread_alloc(&s, 0); c->wake_time = 500;
+		core_sched_queue(&s, a);
+		core_sched_queue(&s, b);
+		core_sched_queue(&s, c);
+		core_sched_run(&s, 600);
+
+		if (sched_expect(g_evcount == 3, "three equal-time threads ran",
+		                 g_evcount, 3, &bad)) {
+			sched_expect(g_evlog[0].a1 == a->thread_id &&
+			             g_evlog[1].a1 == b->thread_id &&
+			             g_evlog[2].a1 == c->thread_id,
+			             "FIFO among equal wake times",
+			             (long)g_evlog[0].a1, (long)a->thread_id, &bad);
+		}
+		core_sched_unload(&s);
+		groups++;
+	}
+
+	/* ---- 4. a thread that is not due is left alone, and armed ------- */
+	{
+		core_sched s;
+		core_sched_thread *t;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, PROG_MARK, 3, 4, 100);
+		sched_reset_log();
+
+		t = core_sched_thread_alloc(&s, 0);
+		t->wake_time = 9000;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 5000);
+
+		sched_expect(g_evcount == 0, "future thread did not run",
+		             g_evcount, 0, &bad);
+		sched_expect(s.thread_count == 1, "it is still queued",
+		             s.thread_count, 1, &bad);
+		sched_expect(g_arm_calls == 1, "the timer was armed once",
+		             g_arm_calls, 1, &bad);
+		sched_expect(g_arm_time == 9000, "armed for its wake time",
+		             (long)g_arm_time, 9000, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 5. sleep yields, requeues, and resumes where it stopped ---- */
+	{
+		core_sched s;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		/* Thread 0 IS the sleeper: load runs a pass, and that pass reaches
+		 * _sleep(2000) and yields. */
+		core_sched_load(&s, PROG_SLEEP, 7, 4, 1000);
+
+		sched_expect(g_evcount == 0, "nothing posted before the sleep ends",
+		             g_evcount, 0, &bad);
+		sched_expect(s.thread_count == 1, "the sleeper is back on the list",
+		             s.thread_count, 1, &bad);
+		sched_expect(g_arm_time == 3000, "armed for now + 2000",
+		             (long)g_arm_time, 3000, &bad);
+
+		core_sched_run(&s, 3000);
+		sched_expect(g_evcount == 1, "it resumed and posted",
+		             g_evcount, 1, &bad);
+		sched_expect(s.thread_count == 0, "and then terminated",
+		             s.thread_count, 0, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 6. budget exhaustion is a fault, not a pause --------------- */
+	{
+		core_sched s;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		sched_reset_log();
+		core_sched_load(&s, PROG_LOOP, 2, 4, 0);
+
+		sched_expect(g_evcount == 1, "one event posted", g_evcount, 1, &bad);
+		if (g_evcount >= 1) {
+			sched_expect(g_evlog[0].type == CORE_EVENT_FAULT,
+			             "it is a fault event", (long)g_evlog[0].type,
+			             CORE_EVENT_FAULT, &bad);
+			sched_expect(g_evlog[0].a1 == CORE_SCRIPT_BUDGET_OUT,
+			             "carrying status 10", (long)g_evlog[0].a1,
+			             CORE_SCRIPT_BUDGET_OUT, &bad);
+			sched_expect(g_evlog[0].a2 == 0xABCDu, "and the device tag",
+			             (long)g_evlog[0].a2, 0xABCD, &bad);
+		}
+		sched_expect(s.thread_count == 0, "the thread was NOT requeued",
+		             s.thread_count, 0, &bad);
+		sched_expect(s.fault_thread != 0, "it is in the post-mortem slot",
+		             s.fault_thread != 0, 1, &bad);
+		sched_expect(s.fault_status == CORE_SCRIPT_BUDGET_OUT,
+		             "post-mortem status", s.fault_status,
+		             CORE_SCRIPT_BUDGET_OUT, &bad);
+		sched_expect(s.fault_vars != 0, "globals were snapshotted",
+		             s.fault_vars != 0, 1, &bad);
+		sched_expect(g_arm_calls == 0, "nothing left to arm for",
+		             g_arm_calls, 0, &bad);
+
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 7. a re-entrant call defers instead of recursing ----------- */
+	{
+		core_sched s;
+		core_sched_thread *t;
+		/* The spawner at word 0, and at word 9 the body the spawned
+		 * thread runs: _mark then terminate. */
+		static const u32 PROG_BOTH[] = {0x110, 4000, 0x181, 0x40000004u,
+			                            0x110, 4000, 0x181, 0x40000003u,
+			                            0x082,
+			                            0x181, 0x40000002u, 0x082};
+
+		g_sched_live = 0;
+		{
+			sched_test_open(&s);
+			g_spawn_pc = 9;
+			core_sched_load(&s, PROG_BOTH, 12, 4, 100);
+			sched_reset_log();
+
+			t = core_sched_thread_alloc(&s, 0);
+			t->pc        = 0;
+			t->wake_time = 1000;
+			core_sched_queue(&s, t);
+			core_sched_run(&s, 1000);
+
+			sched_expect(g_evcount == 1,
+			             "the deferred pass ran the spawned thread",
+			             g_evcount, 1, &bad);
+			sched_expect(s.sched_time == 4000,
+			             "the pass picked up the pending time",
+			             (long)s.sched_time, 4000, &bad);
+			sched_expect(s.running == 0, "the latch was released",
+			             s.running, 0, &bad);
+			sched_expect(s.thread_count == 0, "both threads are done",
+			             s.thread_count, 0, &bad);
+			core_sched_unload(&s);
+			sched_expect(g_sched_live == 0, "all memory returned",
+			             g_sched_live, 0, &bad);
+		}
+		groups++;
+	}
+
+	/* ---- 8. a full event ring drops its oldest ---------------------- */
+	{
+		core_sched s;
+		int i;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, PROG_RET, 1, 4, 100);
+		sched_reset_log();
+
+		for (i = 0; i < 150; i++) {
+			core_sched_post_event(&s, CORE_EVENT_DEBUG, (u32)i, 0);
+		}
+		sched_expect(s.event_count == CORE_SCHED_EVENTS, "ring is full",
+		             s.event_count, CORE_SCHED_EVENTS, &bad);
+		sched_expect(s.events_dropped == 50, "fifty were dropped",
+		             (long)s.events_dropped, 50, &bad);
+
+		core_sched_run(&s, 200);
+		sched_expect(g_evcount == CORE_SCHED_EVENTS, "a hundred delivered",
+		             g_evcount, CORE_SCHED_EVENTS, &bad);
+		if (g_evcount == CORE_SCHED_EVENTS) {
+			sched_expect(g_evlog[0].a1 == 50, "the oldest survivor is 50",
+			             (long)g_evlog[0].a1, 50, &bad);
+			sched_expect(g_evlog[99].a1 == 149, "the newest is 149",
+			             (long)g_evlog[99].a1, 149, &bad);
+		}
+		core_sched_unload(&s);
+		groups++;
+	}
+
+	/* ---- 9. the free pool is reused, but only when it fits ---------- */
+	{
+		core_sched s;
+		core_sched_thread *t;
+		unsigned before;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, PROG_RET, 1, 4, 100);   /* thread 0 terminated */
+
+		before = g_sched_total;
+		t = core_sched_thread_alloc(&s, 0);
+		sched_expect(g_sched_total == before,
+		             "a retired node was reused",
+		             (long)(g_sched_total - before), 0, &bad);
+		sched_expect(t->stack_size == CORE_SCHED_MIN_STACK,
+		             "with its original capacity", t->stack_size,
+		             CORE_SCHED_MIN_STACK, &bad);
+		t->wake_time = 100;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 100);                    /* retires it again */
+
+		before = g_sched_total;
+		t = core_sched_thread_alloc(&s, 64);
+		sched_expect(g_sched_total == before + 1,
+		             "a node too small was not reused",
+		             (long)(g_sched_total - before), 1, &bad);
+		sched_expect(t->stack_size == 64, "the new one is the size asked for",
+		             t->stack_size, 64, &bad);
+		t->wake_time = 100;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 100);
+
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 10. a failed allocation during load fails cleanly ---------- */
+	{
+		core_sched s;
+		int i;
+
+		for (i = 1; i <= 3; i++) {
+			g_sched_live    = 0;
+			sched_test_open(&s);
+			g_sched_fail_in = i;        /* fail the i'th allocation */
+			sched_expect(core_sched_load(&s, PROG_RET, 1, 4, 100) == 0,
+			             "load reports failure", 0, 0, &bad);
+			g_sched_fail_in = 0;
+			sched_expect(g_sched_live == 0, "and leaks nothing",
+			             g_sched_live, 0, &bad);
+			core_sched_unload(&s);
+		}
+		groups++;
+	}
+
+	hlog("Script scheduler       : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
+/* script input binding                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Every handler slot gets its own five-word body in one generated program:
+ *
+ *     word 0            0x082          ret, so thread 0 from the load ends
+ *     1 + slot*5        0x110, slot    acc = the slot number
+ *     1 + slot*5 + 2    0x181, _report post an event (acc, arg0)
+ *     1 + slot*5 + 4    0x082          ret
+ *
+ * so a single debug event says both which slot fired and what its first
+ * argument was.
+ */
+#define BIND_SLOTS  20
+#define BIND_WORDS  (1 + BIND_SLOTS * 5)
+
+static u32 g_bind_code[BIND_WORDS];
+
+static void bind_build_code(void)
+{
+	int k;
+
+	g_bind_code[0] = 0x082;
+	for (k = 0; k < BIND_SLOTS; k++) {
+		u32 *p = &g_bind_code[1 + k * 5];
+
+		p[0] = 0x110;
+		p[1] = (u32)k;
+		p[2] = 0x181;
+		p[3] = 0x40000005u;
+		p[4] = 0x082;
+	}
+}
+
+/* Bind every slot, or unbind one by passing it as except. */
+static void bind_all(core_sched *s, int except)
+{
+	int k;
+
+	for (k = 0; k < BIND_SLOTS; k++) {
+		s->vm.vars[k] = (k == except)
+		              ? 0u
+		              : (CORE_TAG_CODE | (u32)(1 + k * 5));
+	}
+}
+
+static void bind_raw(u8 *raw, int x, int y, u32 btn_word)
+{
+	raw[CORE_RAW_X]          = (u8)x;
+	raw[CORE_RAW_Y]          = (u8)y;
+	raw[CORE_RAW_STATUS]     = CORE_STATUS_VALID;
+	raw[CORE_RAW_BUTTONS_HI] = (u8)(btn_word & 0xFFu);
+	raw[CORE_RAW_BUTTONS_LO] = (u8)((btn_word >> 8) & 0xFFu);
+}
+
+static int test_input_bind(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_sched s;
+	u8 raw[CORE_RAW_PACKET_BYTES];
+
+	bind_build_code();
+
+	/* ---- 1. nothing changed queues nothing ------------------------- */
+	{
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, g_bind_code, BIND_WORDS, BIND_SLOTS, 100);
+		bind_all(&s, -1);
+
+		bind_raw(raw, 0, 0, 0);
+		core_sched_on_input(&s, raw, 200);     /* first packet: a change */
+		sched_reset_log();
+		core_sched_on_input(&s, raw, 300);     /* identical */
+
+		sched_expect(g_evcount == 0, "identical packet queues nothing",
+		             g_evcount, 0, &bad);
+		sched_expect(s.thread_count == 0, "and leaves no threads",
+		             s.thread_count, 0, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 2. one button press, and the order handlers run in -------- */
+	{
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, g_bind_code, BIND_WORDS, BIND_SLOTS, 100);
+		bind_all(&s, -1);
+
+		bind_raw(raw, 0, 0, 0);
+		core_sched_on_input(&s, raw, 200);
+		sched_reset_log();
+
+		bind_raw(raw, 0, 0, 0x8000u);          /* slot 0 is bit 15 */
+		core_sched_on_input(&s, raw, 300);
+
+		if (sched_expect(g_evcount == 4, "pre, aggregate, button, post",
+		                 g_evcount, 4, &bad)) {
+			sched_expect(g_evlog[0].a1 == CORE_SCHED_SLOT_PRE,
+			             "pre handler ran first", (long)g_evlog[0].a1,
+			             CORE_SCHED_SLOT_PRE, &bad);
+			sched_expect(g_evlog[1].a1 == CORE_SCHED_SLOT_BUTTONS,
+			             "then the aggregate", (long)g_evlog[1].a1,
+			             CORE_SCHED_SLOT_BUTTONS, &bad);
+			sched_expect(g_evlog[2].a1 == 0, "then button slot 0",
+			             (long)g_evlog[2].a1, 0, &bad);
+			sched_expect(g_evlog[2].a2 == 1, "with state pressed",
+			             (long)g_evlog[2].a2, 1, &bad);
+			sched_expect(g_evlog[3].a1 == CORE_SCHED_SLOT_POST,
+			             "post handler ran last", (long)g_evlog[3].a1,
+			             CORE_SCHED_SLOT_POST, &bad);
+			/*
+			 * SIGNED. The original reads the button word with MOVSX,
+			 * so bit 15 makes the argument negative and a script
+			 * comparing it against 0x8000 would never match.
+			 */
+			sched_expect((s32)g_evlog[1].a2 == -32768,
+			             "aggregate word is sign-extended",
+			             (long)(s32)g_evlog[1].a2, -32768, &bad);
+		}
+
+		/* releasing it fires the same slot with state 0 */
+		sched_reset_log();
+		bind_raw(raw, 0, 0, 0);
+		core_sched_on_input(&s, raw, 400);
+		if (sched_expect(g_evcount == 4, "release fires the same four",
+		                 g_evcount, 4, &bad)) {
+			sched_expect(g_evlog[2].a1 == 0 && g_evlog[2].a2 == 0,
+			             "button slot 0 released", (long)g_evlog[2].a2,
+			             0, &bad);
+		}
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 3. the stick alone does not wake the button handlers ------ */
+	{
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, g_bind_code, BIND_WORDS, BIND_SLOTS, 100);
+		bind_all(&s, -1);
+
+		bind_raw(raw, 0, 0, 0);
+		core_sched_on_input(&s, raw, 200);
+		sched_reset_log();
+
+		bind_raw(raw, -40, 25, 0);
+		core_sched_on_input(&s, raw, 300);
+
+		if (sched_expect(g_evcount == 3, "pre, stick, post", g_evcount, 3,
+		                 &bad)) {
+			sched_expect(g_evlog[0].a1 == CORE_SCHED_SLOT_PRE, "pre first",
+			             (long)g_evlog[0].a1, CORE_SCHED_SLOT_PRE, &bad);
+			sched_expect(g_evlog[1].a1 == CORE_SCHED_SLOT_STICK, "then stick",
+			             (long)g_evlog[1].a1, CORE_SCHED_SLOT_STICK, &bad);
+			sched_expect((s32)g_evlog[1].a2 == -40,
+			             "stick handler got signed X",
+			             (long)(s32)g_evlog[1].a2, -40, &bad);
+			sched_expect(g_evlog[2].a1 == CORE_SCHED_SLOT_POST, "then post",
+			             (long)g_evlog[2].a1, CORE_SCHED_SLOT_POST, &bad);
+		}
+		core_sched_unload(&s);
+		groups++;
+	}
+
+	/* ---- 4. an unbound slot is simply skipped ---------------------- */
+	{
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, g_bind_code, BIND_WORDS, BIND_SLOTS, 100);
+		bind_all(&s, CORE_SCHED_SLOT_PRE);        /* unbind the pre handler */
+
+		bind_raw(raw, 0, 0, 0);
+		core_sched_on_input(&s, raw, 200);
+		sched_reset_log();
+
+		bind_raw(raw, 0, 0, 0x8000u);
+		core_sched_on_input(&s, raw, 300);
+
+		if (sched_expect(g_evcount == 3, "the unbound slot did not fire",
+		                 g_evcount, 3, &bad)) {
+			sched_expect(g_evlog[0].a1 == CORE_SCHED_SLOT_BUTTONS,
+			             "aggregate is now first", (long)g_evlog[0].a1,
+			             CORE_SCHED_SLOT_BUTTONS, &bad);
+		}
+		core_sched_unload(&s);
+		groups++;
+	}
+
+	/* ---- 5. slot n IS raw button index n --------------------------- */
+	/*
+	 * Cross-checked against core_decode, which is already verified against
+	 * drv_BuildJoystickReport by 26 vectors: pressing the bit that the
+	 * dispatcher reports as slot n must make core light HID button
+	 * button_map[n]. That ties the two readings of the same word together
+	 * rather than asserting the mapping twice from the same assumption.
+	 */
+	{
+		core_state cs;
+		int n;
+		int checked = 0;
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, g_bind_code, BIND_WORDS, BIND_SLOTS, 100);
+		bind_all(&s, -1);
+		core_init(&cs, 0, 0);
+
+		for (n = 0; n < CORE_RAW_BUTTON_BITS; n++) {
+			u32 word = 1u << (15 - n);
+			u8  dest = cs.button_map[n];
+
+			bind_raw(raw, 0, 0, 0);
+			core_sched_on_input(&s, raw, 1000 + (u64)n * 10);
+			sched_reset_log();
+
+			bind_raw(raw, 0, 0, word);
+			core_sched_on_input(&s, raw, 1005 + (u64)n * 10);
+
+			/* pre, aggregate, the button, post */
+			if (g_evcount != 4 || g_evlog[2].a1 != (u32)n) {
+				hlog("  FAIL bind raw bit %2d -> slot %ld, want %d "
+				     "(%d events)\n", n,
+				     g_evcount >= 3 ? (long)g_evlog[2].a1 : -1L, n,
+				     g_evcount);
+				bad++;
+				continue;
+			}
+			if (dest == CORE_BUTTON_NONE) {
+				checked++;
+				continue;       /* filler bit, no HID button */
+			}
+			core_decode(&cs, raw);
+			if ((cs.buttons & (u16)(1u << dest)) == 0) {
+				hlog("  FAIL bind slot %d fired but core did not light "
+				     "HID button %d (buttons=%04x)\n", n, dest,
+				     cs.buttons);
+				bad++;
+				continue;
+			}
+			checked++;
+		}
+		sched_expect(checked == CORE_RAW_BUTTON_BITS,
+		             "all 16 bits agree with core_decode", checked,
+		             CORE_RAW_BUTTON_BITS, &bad);
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 6. several buttons at once, in slot order ----------------- */
+	{
+		g_sched_live = 0;
+		sched_test_open(&s);
+		core_sched_load(&s, g_bind_code, BIND_WORDS, BIND_SLOTS, 100);
+		bind_all(&s, -1);
+
+		bind_raw(raw, 0, 0, 0);
+		core_sched_on_input(&s, raw, 200);
+		sched_reset_log();
+
+		/* bits 15, 12 and 0 -> slots 0, 3 and 15 */
+		bind_raw(raw, 7, -7, 0x9001u);
+		core_sched_on_input(&s, raw, 300);
+
+		/* pre, stick, aggregate, three buttons, post */
+		if (sched_expect(g_evcount == 7, "seven handlers ran", g_evcount,
+		                 7, &bad)) {
+			sched_expect(g_evlog[0].a1 == CORE_SCHED_SLOT_PRE, "pre",
+			             (long)g_evlog[0].a1, CORE_SCHED_SLOT_PRE, &bad);
+			sched_expect(g_evlog[1].a1 == CORE_SCHED_SLOT_STICK, "stick",
+			             (long)g_evlog[1].a1, CORE_SCHED_SLOT_STICK, &bad);
+			sched_expect(g_evlog[2].a1 == CORE_SCHED_SLOT_BUTTONS, "aggregate",
+			             (long)g_evlog[2].a1, CORE_SCHED_SLOT_BUTTONS, &bad);
+			sched_expect(g_evlog[3].a1 == 0, "slot 0", (long)g_evlog[3].a1,
+			             0, &bad);
+			sched_expect(g_evlog[4].a1 == 3, "slot 3", (long)g_evlog[4].a1,
+			             3, &bad);
+			sched_expect(g_evlog[5].a1 == 15, "slot 15",
+			             (long)g_evlog[5].a1, 15, &bad);
+			sched_expect(g_evlog[6].a1 == CORE_SCHED_SLOT_POST, "post",
+			             (long)g_evlog[6].a1, CORE_SCHED_SLOT_POST, &bad);
+		}
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	hlog("Script input binding   : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1897,6 +2700,8 @@ int main(int argc, char **argv)
 	bad += test_pak_change();
 	bad += test_tune_mode();
 	bad += test_script();
+	bad += test_sched();
+	bad += test_input_bind();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);
