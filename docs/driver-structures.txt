@@ -309,11 +309,29 @@ Table of Contents
        +2  Phase       scaled /36000 +4  Period   in ticks
 
    FOR EFFECT TYPE 0x40 THE SAME EIGHT BYTES ARE REINTERPRETED as a
-   DirectInput CONDITION block - centre, positive and negative coefficients,
-   saturation, dead band and a computed output at +6 - driven by the live
-   stick position rather than by time. The pre-pass at the top of
-   drv_EffectEvaluate computes +6 from CurStickX / CurStickY and the main
-   switch reads it back.
+   DirectInput CONDITION block, driven by the live stick position rather than
+   by time. The byte positions are now established, read out of the pre-pass
+   at the top of drv_EffectEvaluate:
+
+       +0  centre           +1  positive coefficient
+       +2  negative coeff   +3  positive saturation
+       +4  negative sat     +5  dead band
+       +6  OUTPUT, written by the pre-pass and read back by the evaluator
+       +7  unused
+
+   The parameters are in +/-127 and the stick is in +/-1200, so centre and
+   dead band are scaled by 1200/127 on the way in; the dead band is used as a
+   MAGNITUDE, so a negative one behaves exactly like its positive twin. A
+   saturation of zero means no limit and 0x7F is used instead, and a negative
+   saturation is also taken as a magnitude. The evaluator then scales the
+   output byte by TuneStrength/100.
+
+   THE PRE-PASS RUNS ONCE PER WINDOW, not once per tick, and only when
+   TuneStrength is non-zero. Two consequences: the condition is FROZEN for the
+   half second a window covers, so it tracks the stick at window granularity;
+   and with strength zero the pre-pass does not run at all, leaving whatever
+   was in the output byte, which costs nothing because the evaluator
+   multiplies by strength anyway.
 
 3.4.  ADAPTOID_EFFECT_TICK, 0x1C bytes, 96 of them at 0xB58
 
@@ -330,6 +348,39 @@ Table of Contents
    consecutive Pulse bits into the four payload bytes of vendor command 0x36.
    Magnitude becomes pulse DENSITY through the accumulator, which is how a
    proportional effect drives an on/off motor.
+
+   THE RING IS NOT AN OUTPUT QUEUE. It is how the driver AVOIDS SENDING. On
+   each timer tick drv_EffectEvaluate re-evaluates the ticks it already stored
+   and compares each recomputed Pulse against the stored one. If they all
+   still agree, the bitmap already sitting on the controller is still correct
+   and NO USB TRANSFER HAPPENS AT ALL - the function returns 1 and leaves the
+   payload buffer untouched. The first disagreement abandons verification,
+   truncates RingCount at that tick, widens the window back to 32 and carries
+   on computing, so a change part way through a window costs one transfer
+   rather than a stall.
+
+   Three modes, selected by the Lookahead argument:
+
+   +--------------------------+------------------------------------------+
+   | Lookahead and ring state | What happens                             |
+   +==========================+==========================================+
+   | non-zero, ring populated | VERIFY the stored ticks; return 1 and    |
+   |                          | send nothing if they all still agree     |
+   | non-zero, ring empty     | COMPUTE a fresh 32-tick window, return 0 |
+   | zero                     | EXTEND from the end of the ring out to   |
+   |                          | 32 and always return 0. This is the      |
+   |                          | drv_EffectSendUpdate path.               |
+   +--------------------------+------------------------------------------+
+
+   The five carried values - FilteredX, FilteredY, Accumulator, DitherBurst
+   and TuneCounter - are seeded from the entry BEFORE the first tick being
+   evaluated. That is what lets a partial re-evaluation produce the same
+   numbers a full one would, and it is why they live in the ring rather than
+   in plain fields.
+
+   RingCount is cleared outright on the idle path: drv_EffectSendUpdate drops
+   every precomputed tick once EffectIdleTicks passes 4, at the same moment it
+   sends the motor-stop command 0x32.
 
 3.5.  ADAPTOID_SCRIPT_THREAD, 0x24 header plus stack
 

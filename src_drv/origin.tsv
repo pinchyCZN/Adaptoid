@@ -16,8 +16,11 @@ core_decode	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
 core_decode_buttons	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
 core_decode_stick	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
 core_effect_axis_value	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_effect_condition_update	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_effect_evaluate	core.c	port	wishk201.sys	00013f10	drv_EffectEvaluate
 core_effect_intensity	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
 core_effect_pulse	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_effect_ring_reset	core.c	part	wishk201.sys	00013d90	drv_EffectSendUpdate
 core_effect_wave	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
 core_effect_window	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
 core_effect_window	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
@@ -34,6 +37,7 @@ core_probe_identified	core.c	part	wishk201.sys	00018f40	drv_AccessoryProbeClassi
 core_probe_issue	core.c	part	wishk201.sys	00018da0	drv_AccessoryProbeStep1
 core_probe_start	core.c	port	wishk201.sys	00018d30	drv_AccessoryProbeStart
 core_reset	core.c	new	-	-	-
+core_ring_index	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
 core_set_vendor	core.c	new	-	-	-
 core_sine_lerp	core.c	port	wishk201.sys	000149a0	drv_SineLerp
 core_tick	core.c	part	wishk201.sys	00013ac0	drv_EffectTick

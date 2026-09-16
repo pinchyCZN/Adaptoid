@@ -785,8 +785,8 @@ static void effect_arm_constant(core_state *cs, s8 magnitude)
 	cs->effect[0].running    = 1;
 	cs->effect[0].start_tick = 0;
 	cs->effect[0].duration   = CORE_FX_INFINITE;
-	cs->effect[0].axis[0].magnitude = magnitude;
-	cs->effect[0].axis[1].magnitude = magnitude;
+	cs->effect[0].axis[0].periodic.magnitude = magnitude;
+	cs->effect[0].axis[1].periodic.magnitude = magnitude;
 }
 
 static int test_effect_engine(void)
@@ -837,8 +837,8 @@ static int test_effect_engine(void)
 		core_init(&cs, 0, 0);
 		s.running  = 1;
 		s.duration = CORE_FX_INFINITE;
-		s.axis[0].magnitude = 100;
-		s.axis[0].period    = 100;
+		s.axis[0].periodic.magnitude = 100;
+		s.axis[0].periodic.period    = 100;
 
 		/* Square is UNIPOLAR - full for the first half, nothing after. */
 		s.type = CORE_FX_SQUARE;
@@ -869,7 +869,7 @@ static int test_effect_engine(void)
 		}
 		/* Everything is clamped to +/-0x7F however large the magnitude. */
 		s.type = CORE_FX_CONSTANT;
-		s.axis[0].magnitude = 127;
+		s.axis[0].periodic.magnitude = 127;
 		if (core_effect_axis_value(&cs, &s, 0, 0) != CORE_FX_CLAMP) {
 			hlog("  FAIL clamp: %d, want %d\n",
 			     core_effect_axis_value(&cs, &s, 0, 0), CORE_FX_CLAMP);
@@ -952,8 +952,8 @@ static int test_effect_engine(void)
 	cs.effect[0].running    = 1;
 	cs.effect[0].start_tick = 0;
 	cs.effect[0].duration   = 4;
-	cs.effect[0].axis[0].magnitude = 127;
-	cs.effect[0].axis[1].magnitude = 127;
+	cs.effect[0].axis[0].periodic.magnitude = 127;
+	cs.effect[0].axis[1].periodic.magnitude = 127;
 	core_effect_window(&cs, 100, pay);      /* long after it ended */
 	if (popcount32(pay) != 0) {
 		hlog("  FAIL expiry: %d pulses after the duration\n",
@@ -961,7 +961,203 @@ static int test_effect_engine(void)
 		bad++;
 	}
 
-	/* 7. A trace of one window, for diffing against the original. */
+	/*
+	 * 7. The type 0x40 condition, against the ORIGINAL.
+	 *
+	 * Emulated out of the pre-pass at the top of drv_EffectEvaluate with one
+	 * running tuning slot, both axes carrying the same parameters, and the
+	 * stick placed by hand. Both the computed output byte and the payload it
+	 * leads to are checked, so a correct condition feeding a wrong evaluator
+	 * would still be caught.
+	 */
+	{
+		static const struct {
+			s8  center, pos_coeff, neg_coeff, pos_sat, neg_sat, dead;
+			s16 stick_x, stick_y;
+			s8  out_x, out_y;
+			u8  expect[CORE_EFFECT_PAYLOAD];
+		} COND[] = {
+		  {  0, 100, 100,   0,   0,  0,     0,    0,    0,   0,
+			 { 0x00, 0x00, 0x00, 0x00 } },
+		  {  0, 100, 100,   0,   0,  0,   600,    0,   50,   0,
+			 { 0xBD, 0x56, 0xAD, 0xAA } },
+		  {  0, 100, 100,   0,   0,  0,  -600,    0,  -50,   0,
+			 { 0xBD, 0x56, 0xAD, 0xAA } },
+		  {  0, 100, 100,   0,   0, 50,   600,    0,   10,   0,
+			 { 0x10, 0x82, 0x10, 0x84 } },
+		  {  0, 100, 100,  20,   0,  0,   600,    0,   20,   0,
+			 { 0x24, 0x22, 0x22, 0x22 } },
+		  {  0, 100, 100,   0, -20,  0,  -600,    0,  -20,   0,
+			 { 0x24, 0x22, 0x22, 0x22 } },
+		  { 40, 100, 100,   0,   0,  0,   600,    0,   18, -31,
+			 { 0xDE, 0xAA, 0x56, 0xAA } },
+		  {  0,  64, 127,   0,   0, 10,  1200, -900,   58, -85,
+			 { 0x3F, 0xFE, 0xFD, 0xFB } },
+		  {  0, 127, 127,   0,   0,  0,  1200, 1200,  127, 127,
+			 { 0x07, 0x1E, 0x7C, 0xF8 } },
+		  /*
+		   * A NEGATIVE dead band behaves exactly like its positive twin,
+		   * because the original takes the magnitude before comparing.
+		   * Without these three the abs step was unreachable by the
+		   * suite - a deliberate break went undetected until they were
+		   * added.
+		   */
+		  {  0, 100, 100,   0,   0, -50,   600,    0,   10,   0,
+			 { 0x10, 0x82, 0x10, 0x84 } },
+		  {  0, 100, 100,   0,   0, -50,  -600,    0,  -10,   0,
+			 { 0x10, 0x82, 0x10, 0x84 } },
+		  /* A negative centre mirrors the whole response. */
+		  {-40, 100, 100,   0,   0,   0,  -600,    0,  -18,  31,
+			 { 0xDE, 0xAA, 0x56, 0xAA } }
+		};
+		int k, a;
+
+		for (k = 0; k < (int)(sizeof(COND) / sizeof(COND[0])); k++) {
+			core_init(&cs, 0, 0);
+			cs.effect[0].type       = CORE_FX_TUNING;
+			cs.effect[0].running    = 1;
+			cs.effect[0].start_tick = 0;
+			cs.effect[0].duration   = CORE_FX_INFINITE;
+			for (a = 0; a < CORE_EFFECT_AXES; a++) {
+				core_effect_condition *cd = &cs.effect[0].axis[a].condition;
+				cd->center         = COND[k].center;
+				cd->positive_coeff = COND[k].pos_coeff;
+				cd->negative_coeff = COND[k].neg_coeff;
+				cd->positive_sat   = COND[k].pos_sat;
+				cd->negative_sat   = COND[k].neg_sat;
+				cd->dead_band      = COND[k].dead;
+				cd->output         = 0;
+			}
+			cs.stick_x = COND[k].stick_x;
+			cs.stick_y = COND[k].stick_y;
+
+			core_effect_window(&cs, 0, pay);
+
+			if (cs.effect[0].axis[0].condition.output != COND[k].out_x ||
+			    cs.effect[0].axis[1].condition.output != COND[k].out_y) {
+				hlog("  FAIL condition %d: out %d,%d want %d,%d\n", k,
+				     cs.effect[0].axis[0].condition.output,
+				     cs.effect[0].axis[1].condition.output,
+				     COND[k].out_x, COND[k].out_y);
+				bad++;
+			}
+			if (memcmp(pay, COND[k].expect, CORE_EFFECT_PAYLOAD) != 0) {
+				hlog("  FAIL condition %d payload: got %02X %02X %02X %02X, "
+				     "want %02X %02X %02X %02X\n", k,
+				     pay[0], pay[1], pay[2], pay[3],
+				     COND[k].expect[0], COND[k].expect[1],
+				     COND[k].expect[2], COND[k].expect[3]);
+				bad++;
+			}
+			htrace("condition %d -> out %4d %4d  %02X %02X %02X %02X\n", k,
+			       cs.effect[0].axis[0].condition.output,
+			       cs.effect[0].axis[1].condition.output,
+			       pay[0], pay[1], pay[2], pay[3]);
+		}
+
+		/*
+		 * With strength 0 the pre-pass does not run at all, so a stale
+		 * output byte is left untouched. The evaluator multiplies by
+		 * strength, so it still contributes nothing.
+		 */
+		core_init(&cs, 0, 0);
+		cs.effect[0].type    = CORE_FX_TUNING;
+		cs.effect[0].running = 1;
+		cs.effect[0].duration = CORE_FX_INFINITE;
+		cs.effect[0].axis[0].condition.positive_coeff = 127;
+		cs.effect[0].axis[0].condition.output = 99;
+		cs.stick_x = 1200;
+		cs.tune_strength = 0;
+		core_effect_window(&cs, 0, pay);
+		if (cs.effect[0].axis[0].condition.output != 99) {
+			hlog("  FAIL condition strength 0: output was rewritten to %d\n",
+			     cs.effect[0].axis[0].condition.output);
+			bad++;
+		}
+		if (popcount32(pay) != 0) {
+			hlog("  FAIL condition strength 0: %d pulses, want 0\n",
+			     popcount32(pay));
+			bad++;
+		}
+	}
+
+	/*
+	 * 8. THE RING, against the ORIGINAL.
+	 *
+	 * A realistic call sequence emulated out of drv_EffectEvaluate against a
+	 * single persistent device, so the ring and the dither state carry over
+	 * between calls exactly as they would in the driver.
+	 *
+	 * The point of the ring is the two ret=1 rows: nothing about the effect
+	 * changed, the re-evaluated pulses still agree with what was stored, so
+	 * the controller already holds a correct bitmap and NO TRANSFER HAPPENS.
+	 * The payload is left untouched on those calls, which is why they expect
+	 * the buffer to still hold the marker written before the call.
+	 */
+	{
+		static const struct {
+			int look;
+			s32 tick;
+			int set_mag;        /* -1 to leave the effect alone */
+			int ret;
+			s32 count;
+			u8  expect[CORE_EFFECT_PAYLOAD];
+		} RING[] = {
+		  { 1,  0, 40, 0, 32, { 0xFF, 0xBF, 0x77, 0xB7 } },
+		  { 1,  1, -1, 1, 32, { 0, 0, 0, 0 } },   /* unchanged: no send */
+		  { 1,  2, -1, 1, 32, { 0, 0, 0, 0 } },   /* still unchanged    */
+		  { 1,  3, 90, 0, 35, { 0xC7, 0x7F, 0xFF, 0xCF } },
+		  { 1,  4, -1, 0, 36, { 0xE5, 0xEF, 0x7F, 0xFF } },
+		  { 0, 32, -1, 0, 64, { 0xDF, 0xFF, 0xF7, 0x7F } }
+		};
+		int k, got;
+
+		core_init(&cs, 0, 0);
+		cs.effect[0].type       = CORE_FX_CONSTANT;
+		cs.effect[0].running    = 1;
+		cs.effect[0].start_tick = 0;
+		cs.effect[0].duration   = CORE_FX_INFINITE;
+
+		for (k = 0; k < (int)(sizeof(RING) / sizeof(RING[0])); k++) {
+			if (RING[k].set_mag >= 0) {
+				cs.effect[0].axis[0].periodic.magnitude = (s8)RING[k].set_mag;
+				cs.effect[0].axis[1].periodic.magnitude = (s8)RING[k].set_mag;
+			}
+			memset(pay, 0, sizeof(pay));
+			got = core_effect_evaluate(&cs, RING[k].look, RING[k].tick, pay);
+
+			if (got != RING[k].ret) {
+				hlog("  FAIL ring %d: returned %d, want %d\n",
+				     k, got, RING[k].ret);
+				bad++;
+			}
+			if (cs.ring_count != RING[k].count) {
+				hlog("  FAIL ring %d: count %d, want %d\n",
+				     k, (int)cs.ring_count, (int)RING[k].count);
+				bad++;
+			}
+			if (memcmp(pay, RING[k].expect, CORE_EFFECT_PAYLOAD) != 0) {
+				hlog("  FAIL ring %d payload: got %02X %02X %02X %02X, "
+				     "want %02X %02X %02X %02X\n", k,
+				     pay[0], pay[1], pay[2], pay[3],
+				     RING[k].expect[0], RING[k].expect[1],
+				     RING[k].expect[2], RING[k].expect[3]);
+				bad++;
+			}
+			htrace("ring %d: look %d tick %2d -> ret %d count %2d "
+			       "%02X %02X %02X %02X\n", k, RING[k].look, RING[k].tick,
+			       got, (int)cs.ring_count, pay[0], pay[1], pay[2], pay[3]);
+		}
+
+		/* The idle motor-stop path drops every precomputed tick. */
+		core_effect_ring_reset(&cs);
+		if (cs.ring_count != 0) {
+			hlog("  FAIL ring reset: count %d, want 0\n", (int)cs.ring_count);
+			bad++;
+		}
+	}
+
+	/* 9. A trace of one window, for diffing against the original. */
 	effect_arm_constant(&cs, 64);
 	for (i = 0; i < CORE_EFFECT_WINDOW; i++) {
 		s32 intensity = core_effect_intensity(&cs, i);
@@ -970,7 +1166,7 @@ static int test_effect_engine(void)
 		       i, intensity, cs.accumulator, pulse);
 	}
 
-	hlog("Effect engine          : %s (7 groups)\n", bad ? "FAIL" : "ok");
+	hlog("Effect engine          : %s (9 groups)\n", bad ? "FAIL" : "ok");
 	return bad;
 }
 

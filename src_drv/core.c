@@ -425,15 +425,15 @@ s32 core_effect_axis_value(const core_state *cs,
 
 	switch (slot->type) {
 	case CORE_FX_CONSTANT:
-		v = ax->magnitude;
+		v = ax->periodic.magnitude;
 		break;
 
 	case CORE_FX_RAMP:
 		if (slot->duration == 0 || slot->duration == CORE_FX_INFINITE) {
-			v = ax->magnitude;               /* nothing to ramp over */
+			v = ax->periodic.magnitude;               /* nothing to ramp over */
 		} else {
-			v = ((slot->duration - elapsed) * (s32)ax->magnitude
-			     + (s32)ax->offset * elapsed) / slot->duration;
+			v = ((slot->duration - elapsed) * (s32)ax->periodic.magnitude
+			     + (s32)ax->periodic.offset * elapsed) / slot->duration;
 		}
 		break;
 
@@ -442,24 +442,22 @@ s32 core_effect_axis_value(const core_state *cs,
 	case CORE_FX_TRIANGLE:
 	case CORE_FX_SAWTOOTH_UP:
 	case CORE_FX_SAWTOOTH_DOWN:
-		if (ax->period != 0) {
-			pos = (((s32)ax->phase * ax->period) / 36000 + elapsed)
-			      % ax->period;
-			v = core_effect_wave(slot->type, pos, ax->period);
+		if (ax->periodic.period != 0) {
+			pos = (((s32)ax->periodic.phase * ax->periodic.period)
+			       / 36000 + elapsed) % ax->periodic.period;
+			v = core_effect_wave(slot->type, pos, ax->periodic.period);
 		}
 		/* Only the periodic types add the offset as a bias. */
-		bias = ax->offset;
-		v = (v * (s32)ax->magnitude) / CORE_FX_SCALE;
+		bias = ax->periodic.offset;
+		v = (v * (s32)ax->periodic.magnitude) / CORE_FX_SCALE;
 		break;
 
 	case CORE_FX_TUNING:
 		/*
-		 * TODO: the condition block. For this type the axis bytes are a
-		 * DirectInput condition driven by the live stick, computed by a
-		 * pre-pass in drv_EffectEvaluate and read back here. Not
-		 * implemented, so the type contributes nothing.
+		 * The condition output was computed by the pre-pass from the live
+		 * stick; here it is only scaled by the D-pad strength preset.
 		 */
-		v = 0;
+		v = (cs->tune_strength * (s32)ax->condition.output) / 100;
 		break;
 
 	default:
@@ -485,6 +483,83 @@ s32 core_effect_axis_value(const core_state *cs,
 	if (v >  CORE_FX_CLAMP) { v =  CORE_FX_CLAMP; }
 	if (v < -CORE_FX_CLAMP) { v = -CORE_FX_CLAMP; }
 	return v;
+}
+
+/*
+ * THE CONDITION PRE-PASS.
+ *
+ * Runs once per window, before any tick is evaluated, and writes the output
+ * byte of every running CORE_FX_TUNING axis from the live stick position.
+ * Two consequences follow from it being a pre-pass rather than per-tick, and
+ * both are the original's behaviour rather than a simplification:
+ *
+ *   - the condition is FROZEN for the half second the window covers, so it
+ *     responds to the stick at window granularity, not tick granularity;
+ *   - it MUTATES the slot, because the output lives in the slot's own bytes.
+ *
+ * The original also gates the whole pre-pass on TuneStrength being non-zero,
+ * which matters: with strength 0 the stale output byte is left in place, but
+ * the evaluator multiplies by strength and so contributes nothing anyway.
+ *
+ * Parameters are in +/-127 and the stick is in +/-1200, so each parameter is
+ * scaled by CORE_STICK_LIMIT / CORE_FX_CLAMP on the way in.
+ */
+void core_effect_condition_update(core_state *cs)
+{
+	int i, a;
+
+	if (cs == 0 || cs->tune_strength == 0) {
+		return;
+	}
+
+	for (i = 0; i < CORE_EFFECT_SLOTS; i++) {
+		core_effect_slot *slot = &cs->effect[i];
+
+		if (slot->type != CORE_FX_TUNING || !slot->running) {
+			continue;
+		}
+		for (a = 0; a < CORE_EFFECT_AXES; a++) {
+			core_effect_condition *cond = &slot->axis[a].condition;
+			s32 dead, delta, coeff, sat, limit, out;
+
+			dead = ((s32)cond->dead_band * CORE_STICK_LIMIT)
+			       / CORE_FX_CLAMP;
+			if (dead < 0) {
+				dead = -dead;
+			}
+
+			delta = ((a == 0) ? cs->stick_x : cs->stick_y)
+			        - ((s32)cond->center * CORE_STICK_LIMIT)
+			          / CORE_FX_CLAMP;
+
+			coeff = 0;
+			sat   = 0;
+			if (delta < 1) {
+				if (delta < -dead) {
+					coeff = cond->negative_coeff;
+					sat   = cond->negative_sat;
+					delta += dead;
+				}
+			} else if (delta > dead) {
+				coeff = cond->positive_coeff;
+				sat   = cond->positive_sat;
+				delta -= dead;
+			}
+
+			out = (coeff * delta) / CORE_STICK_LIMIT;
+
+			/* A saturation of zero means "no limit", so use full scale;
+			 * otherwise the limit is its magnitude, either sign. */
+			limit = (sat == 0) ? CORE_FX_CLAMP : sat;
+			if (limit < 0) {
+				limit = -limit;
+			}
+			if (out >  limit) { out =  limit; }
+			if (out < -limit) { out = -limit; }
+
+			cond->output = (s8)out;
+		}
+	}
 }
 
 /*
@@ -628,36 +703,157 @@ int core_effect_pulse(core_state *cs, s32 intensity, s32 base_tick)
 	return pulse;
 }
 
-/*
- * Run one window and pack it. Bit i of the payload is the motor sample for
- * tick start_tick + i, so the four bytes cover half a second.
- *
- * SIMPLIFICATION, deliberate and worth knowing. The original keeps a 96-entry
- * ring of precomputed ticks so it can re-evaluate, notice that nothing
- * changed, and skip sending. That is an optimisation on USB traffic, not on
- * the bitmap: for a given state the bits are the same either way. This
- * computes the window directly and carries the filter, accumulator and dither
- * state forward. Restoring the ring is a TODO if the traffic matters.
- */
-void core_effect_window(core_state *cs, s32 start_tick, u8 *payload)
+/* Ring slots are addressed relative to the head and wrap both ways. */
+static int core_ring_index(const core_state *cs, s32 offset)
 {
-	int i;
+	s32 i = cs->ring_head + offset;
+
+	while (i >= CORE_RING_SIZE) { i -= CORE_RING_SIZE; }
+	while (i < 0)               { i += CORE_RING_SIZE; }
+	return (int)i;
+}
+
+void core_effect_ring_reset(core_state *cs)
+{
+	if (cs != 0) {
+		cs->ring_count = 0;
+	}
+}
+
+/*
+ * Evaluate a window against the ring. See core.h for what the return value
+ * and the lookahead argument mean.
+ *
+ * The verify pass is the whole point of the ring: re-run the ticks that are
+ * already stored and compare each pulse with what was stored for it. If they
+ * all agree, the controller already holds a correct bitmap and the driver
+ * sends nothing. The first disagreement abandons verification, truncates the
+ * ring at that tick, widens the window back out to 32 and carries on
+ * computing - so a change part way through a window costs one transfer, not
+ * a stall.
+ *
+ * Note the carry - filter, accumulator, dither burst - is seeded from the
+ * entry BEFORE the first tick evaluated, which is what makes a partial
+ * re-evaluation produce the same numbers as a full one.
+ */
+int core_effect_evaluate(core_state *cs, int lookahead, s32 tick, u8 *payload)
+{
+	s32 skip, idx, end;
+	int verify, i, r;
 
 	if (cs == 0 || payload == 0) {
-		return;
+		return 0;
 	}
+
+	/*
+	 * Where the requested time sits in the ring. Before the base, or past
+	 * the end of what is stored, means the ring cannot help: start over.
+	 */
+	skip = tick - cs->ring_base_tick;
+	if (skip < 1 || skip > cs->ring_count) {
+		cs->ring_base_tick = tick;
+		cs->ring_count     = 0;
+		skip               = 0;
+	}
+
+	if (lookahead == 0) {
+		idx    = cs->ring_count - skip;      /* EXTEND from the end */
+		end    = CORE_EFFECT_WINDOW;
+		verify = 0;
+	} else {
+		idx    = 0;
+		end    = cs->ring_count - skip;
+		verify = 1;
+		if (end == 0) {
+			end    = CORE_EFFECT_WINDOW;     /* nothing to verify   */
+			verify = 0;
+		}
+	}
+
+	/* Seed the carry from the tick immediately before this window. */
+	if (idx + skip > 0 && idx + skip <= cs->ring_count) {
+		i = core_ring_index(cs, idx + skip - 1);
+		cs->filtered_x   = cs->ring[i].filtered_x;
+		cs->filtered_y   = cs->ring[i].filtered_y;
+		cs->accumulator  = cs->ring[i].accumulator;
+		cs->dither_burst = cs->ring[i].dither_burst;
+		cs->tune_counter = cs->ring[i].tune_counter;
+	}
+
+	/* Sample the stick into every condition once, before any tick. */
+	core_effect_condition_update(cs);
+
+	while (idx < end) {
+		s32 intensity;
+		int pulse;
+
+		/* Verification cannot continue past what the ring holds. */
+		if (verify && cs->ring_count <= idx + skip) {
+			verify = 0;
+			end    = CORE_EFFECT_WINDOW;
+		}
+
+		/* Make room for this tick: grow, or roll the oldest out. */
+		if (cs->ring_count <= idx + skip) {
+			if (cs->ring_count == CORE_RING_SIZE) {
+				cs->ring_head = core_ring_index(cs, 1);
+				cs->ring_base_tick++;
+				skip--;
+			} else {
+				cs->ring_count++;
+			}
+		}
+
+		intensity = core_effect_intensity(cs, tick + idx);
+		pulse     = core_effect_pulse(cs, intensity, tick);
+
+		r = core_ring_index(cs, idx + skip);
+
+		if (verify && cs->ring[r].pulse != pulse) {
+			verify         = 0;
+			end            = CORE_EFFECT_WINDOW;
+			cs->ring_count = idx + 1 + skip;
+		}
+
+		cs->ring[r].pulse        = pulse;
+		cs->ring[r].intensity    = intensity;
+		cs->ring[r].filtered_x   = cs->filtered_x;
+		cs->ring[r].filtered_y   = cs->filtered_y;
+		cs->ring[r].accumulator  = cs->accumulator;
+		cs->ring[r].dither_burst = cs->dither_burst;
+		cs->ring[r].tune_counter = cs->tune_counter;
+		idx++;
+	}
+
+	if (verify) {
+		return 1;                       /* nothing changed, send nothing */
+	}
+
 	for (i = 0; i < CORE_EFFECT_PAYLOAD; i++) {
 		payload[i] = 0;
 	}
-
 	for (i = 0; i < CORE_EFFECT_WINDOW; i++) {
-		s32 tick = start_tick + i;
-		s32 intensity = core_effect_intensity(cs, tick);
-
-		if (core_effect_pulse(cs, intensity, start_tick)) {
+		r = core_ring_index(cs, i + skip);
+		if (cs->ring[r].pulse) {
 			payload[i >> 3] = (u8)(payload[i >> 3] | (1u << (i & 7)));
 		}
 	}
+	return 0;
+}
+
+/*
+ * One fresh window with no history. Equivalent to evaluating with the ring
+ * empty, which is the COMPUTE path.
+ */
+void core_effect_window(core_state *cs, s32 start_tick, u8 *payload)
+{
+	if (cs == 0 || payload == 0) {
+		return;
+	}
+	cs->ring_count     = 0;
+	cs->ring_head      = 0;
+	cs->ring_base_tick = start_tick;
+	core_effect_evaluate(cs, 1, start_tick, payload);
 }
 
 /* ------------------------------------------------------------------ */

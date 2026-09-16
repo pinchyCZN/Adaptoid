@@ -170,15 +170,54 @@ typedef int (*core_vendor_fn)(void *ctx, const core_vendor_req *req);
 #define CORE_FX_SCALE           10000   /* waveform full scale         */
 
 /*
- * One axis parameter block. For type CORE_FX_TUNING the same eight bytes are
- * reinterpreted as a DirectInput CONDITION driven by the live stick; that
- * reinterpretation is not implemented yet.
+ * The periodic reading of an axis parameter block: what every type except
+ * CORE_FX_TUNING means by those eight bytes.
  */
-typedef struct core_effect_axis {
+typedef struct core_effect_periodic {
 	s8  magnitude;
 	s8  offset;
 	s16 phase;              /* scaled against 36000 */
 	s32 period;             /* in ticks             */
+} core_effect_periodic;
+
+/*
+ * THE SAME EIGHT BYTES, read as a DirectInput CONDITION. This is what
+ * CORE_FX_TUNING means by them, and the byte positions were read out of the
+ * pre-pass at the top of drv_EffectEvaluate rather than assumed:
+ *
+ *     +0  centre            was magnitude
+ *     +1  positive coeff    was offset
+ *     +2  negative coeff    was the low byte of phase
+ *     +3  positive sat      was the high byte of phase
+ *     +4  negative sat      was byte 0 of period
+ *     +5  dead band         was byte 1 of period
+ *     +6  OUTPUT            was byte 2 of period - written by the pre-pass
+ *                           and read back by the evaluator
+ *     +7  unused
+ *
+ * A condition is a spring: output rises with how far the stick sits from
+ * centre, once it leaves the dead band, with independent coefficients and
+ * saturations on each side.
+ */
+typedef struct core_effect_condition {
+	s8 center;
+	s8 positive_coeff;
+	s8 negative_coeff;
+	s8 positive_sat;
+	s8 negative_sat;
+	s8 dead_band;
+	s8 output;
+	s8 unused;
+} core_effect_condition;
+
+/*
+ * One axis parameter block, both readings over the same storage. The layout
+ * has to stay compatible because IOCTL fn 0x852 writes these eight bytes raw
+ * and the type alone decides how they are read.
+ */
+typedef union core_effect_axis {
+	core_effect_periodic  periodic;
+	core_effect_condition condition;
 } core_effect_axis;
 
 /* One effect slot; the original has 32, written by IOCTL fn 0x852. */
@@ -193,6 +232,30 @@ typedef struct core_effect_slot {
 	s32              fade_time;
 	core_effect_axis axis[CORE_EFFECT_AXES];
 } core_effect_slot;
+
+/*
+ * THE EFFECT RING.
+ *
+ * 96 precomputed ticks, so the engine can run ahead of real time. It is not
+ * a buffer of pending output - it is how the driver AVOIDS SENDING. On each
+ * timer tick the engine re-evaluates the ticks it already computed and
+ * compares them against what it stored; if every pulse still agrees, the
+ * bitmap already on the controller is still correct and no USB transfer is
+ * needed at all.
+ *
+ * 96 entries against a 32-tick window gives three windows of slack.
+ */
+#define CORE_RING_SIZE          96
+
+typedef struct core_effect_tick {
+	s32 pulse;              /* the bit that ships          */
+	s32 intensity;
+	s32 filtered_x;
+	s32 filtered_y;
+	s32 accumulator;
+	s32 dither_burst;
+	s32 tune_counter;
+} core_effect_tick;
 
 /*
  * Core state. Mirrors the parts of the 0x1800-byte device extension that hold
@@ -235,8 +298,19 @@ typedef struct core_state {
 	s32             filtered_y;
 	s32             accumulator;    /* delta-sigma, emits a pulse past 100 */
 	s32             dither_burst;
+	s32             tune_counter;
 	u32             dither_state;
 	s32             effect_idle_ticks;
+
+	/*
+	 * The ring. The five carry fields above are the LIVE values while a
+	 * window is being evaluated; they are seeded from the entry before the
+	 * window starts and written back into each entry as it is computed.
+	 */
+	core_effect_tick ring[CORE_RING_SIZE];
+	s32             ring_head;      /* index of the oldest valid entry     */
+	s32             ring_count;     /* 0..CORE_RING_SIZE                   */
+	s32             ring_base_tick; /* the tick ring_head stands for       */
 
 	/*
 	 * Motor drive calibration. These are NOT tuning-mode-only values: the
@@ -321,9 +395,41 @@ s32  core_sine_lerp(s32 angle_hundredths);
 s32  core_effect_axis_value(const core_state *cs,
                             const core_effect_slot *slot,
                             int axis, s32 elapsed);
+/*
+ * The condition pre-pass. Samples the LIVE stick position into the output
+ * byte of every running CORE_FX_TUNING axis, once per window rather than per
+ * tick, so the condition is frozen for the half second that window covers.
+ * core_effect_window calls it; it is exposed for testing.
+ */
+void core_effect_condition_update(core_state *cs);
+
 s32  core_effect_intensity(core_state *cs, s32 tick);
 int  core_effect_pulse(core_state *cs, s32 intensity, s32 tick);
+
+/*
+ * THE REAL ENTRY POINT. Evaluates a window against the ring and says whether
+ * anything needs to be sent:
+ *
+ *     0   payload is filled and should go out as vendor command 0x36
+ *     1   the ring still agrees with what the controller already has, so
+ *         there is nothing to send and the payload is untouched
+ *
+ * lookahead selects the mode, matching the original:
+ *
+ *     non-zero, ring populated   VERIFY  re-evaluate what is already there,
+ *                                        stopping at the first disagreement
+ *     non-zero, ring empty       COMPUTE a fresh 32-tick window
+ *     zero                       EXTEND  fill from the end of the ring out
+ *                                        to 32, and always send
+ */
+int  core_effect_evaluate(core_state *cs, int lookahead, s32 tick,
+                          u8 *payload);
+
+/* Compute one fresh window, discarding the ring. Convenience for tests. */
 void core_effect_window(core_state *cs, s32 start_tick, u8 *payload);
+
+/* Drop every precomputed tick, as the idle motor-stop path does. */
+void core_effect_ring_reset(core_state *cs);
 
 void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx);
 int  core_probe_start(core_state *cs);
