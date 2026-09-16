@@ -3798,6 +3798,7 @@ static u32 rd32_test(const u8 *p)
 	       ((u32)p[3] << 24);
 }
 
+static int g_wait_would_block;
 static int g_ioc_enable_calls;
 static int g_ioc_enable_last;
 static u32 g_ioc_vendor_ret;
@@ -5005,6 +5006,349 @@ static int test_control_device(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the fake USB bus and the two kernel calls the transport reaches      */
+/* ------------------------------------------------------------------ */
+
+/* What the last submitted transfer looked like, and what to answer with. */
+static ADAPTOID_SETUP g_urb_setup;
+static ULONG          g_urb_len;
+static int            g_urb_count;
+static NTSTATUS       g_urb_ret = STATUS_PENDING;
+
+/* Completed IRPs, so a test can see what a failure path answered. */
+static PIRP     g_irp_last;
+static NTSTATUS g_irp_status;
+static int      g_irp_count;
+
+void IoCompleteRequest(PIRP Irp, CHAR PriorityBoost)
+{
+	(void)PriorityBoost;
+	g_irp_last   = Irp;
+	g_irp_status = Irp->IoStatus.Status;
+	g_irp_count++;
+}
+
+NTSTATUS KeWaitForSingleObject(PVOID Object, ULONG WaitReason,
+                               ULONG WaitMode, BOOLEAN Alertable,
+                               PVOID Timeout)
+{
+	PKEVENT e = (PKEVENT)Object;
+
+	(void)WaitReason; (void)WaitMode; (void)Alertable; (void)Timeout;
+	/*
+	 * There is no other thread here to signal it. An unsignalled event
+	 * means the driver would have blocked forever, so say so loudly rather
+	 * than returning and letting the test pass.
+	 */
+	if (!e->Signalled) {
+		hlog("  FAIL kernel KeWaitForSingleObject would block forever\n");
+		g_wait_would_block++;
+	}
+	return STATUS_SUCCESS;
+}
+
+/* The OS edge of the vendor transport, replacing the URB build. */
+NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
+                                 const ADAPTOID_SETUP *Setup,
+                                 ULONG TransferLength, PVOID TransferBuffer)
+{
+	(void)DevExt;
+	(void)TransferBuffer;
+	g_urb_setup = *Setup;
+	g_urb_len   = TransferLength;
+	g_urb_count++;
+	return g_urb_ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* the remove lock and the vendor transport                            */
+/* ------------------------------------------------------------------ */
+
+static int g_cb_calls;
+static int g_cb_return;
+
+static int wdm_test_callback(PADAPTOID_DEVEXT DevExt)
+{
+	(void)DevExt;
+	g_cb_calls++;
+	return g_cb_return;
+}
+
+static void wdm_reset(PADAPTOID_DEVEXT dx)
+{
+	int i;
+	u8 *p = (u8 *)dx;
+
+	for (i = 0; i < (int)sizeof(*dx); i++) {
+		p[i] = 0;
+	}
+	core_init(&dx->Core, 0, 0);
+	AdaptoidLockInit(&dx->RemoveLockA);
+	AdaptoidLockInit(&dx->RemoveLockB);
+	KeInitializeSpinLock(&dx->Vendor.Lock);
+	g_urb_count        = 0;
+	g_urb_len          = 0;
+	g_urb_ret          = STATUS_PENDING;
+	g_irp_count        = 0;
+	g_irp_status       = 0;
+	g_cb_calls         = 0;
+	g_cb_return        = 0;
+	g_wait_would_block = 0;
+}
+
+static int test_wdm_transport(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	static ADAPTOID_DEVEXT dx;
+	ADAPTOID_SETUP setup;
+	IRP irp;
+	NTSTATUS st;
+
+	/* ---- 1. the remove lock counts, and the gate ------------------- */
+	{
+		wdm_reset(&dx);
+
+		sched_expect(dx.RemoveLockA.IoCount == 1,
+		             "a fresh lock starts at one",
+		             dx.RemoveLockA.IoCount, 1, &bad);
+		sched_expect(AdaptoidLockAcquire(&dx.RemoveLockA) == STATUS_SUCCESS,
+		             "acquire succeeds", 1, 1, &bad);
+		sched_expect(dx.RemoveLockA.IoCount == 2, "and counts up",
+		             dx.RemoveLockA.IoCount, 2, &bad);
+		AdaptoidLockRelease(&dx.RemoveLockA);
+		sched_expect(dx.RemoveLockA.IoCount == 1, "release counts down",
+		             dx.RemoveLockA.IoCount, 1, &bad);
+		sched_expect(dx.RemoveLockA.RemoveEvent.Signalled == 0,
+		             "without signalling, because of the initial one",
+		             dx.RemoveLockA.RemoveEvent.Signalled, 0, &bad);
+
+		/* once Removed, every further acquire is refused and leaves the
+		 * count where it found it */
+		dx.RemoveLockA.Removed = 1;
+		sched_expect(AdaptoidLockAcquire(&dx.RemoveLockA) ==
+		             STATUS_DELETE_PENDING,
+		             "a removing device refuses new references", 1, 1,
+		             &bad);
+		sched_expect(dx.RemoveLockA.IoCount == 1,
+		             "and the refusal does not leak a count",
+		             dx.RemoveLockA.IoCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 2. release-and-wait drains to zero ------------------------ */
+	{
+		wdm_reset(&dx);
+
+		/*
+		 * The caller of ReleaseAndWait must still HOLD its own reference:
+		 * the call drops that one and the initial one from Init, so the
+		 * count goes 2 -> 1 -> 0. That is how the remove IRP's own
+		 * acquire is accounted for.
+		 */
+		AdaptoidLockAcquire(&dx.RemoveLockA);
+		sched_expect(dx.RemoveLockA.IoCount == 2, "two references held",
+		             dx.RemoveLockA.IoCount, 2, &bad);
+		AdaptoidLockReleaseAndWait(&dx.RemoveLockA);
+
+		sched_expect(dx.RemoveLockA.IoCount == 0, "the count reached zero",
+		             dx.RemoveLockA.IoCount, 0, &bad);
+		sched_expect(dx.RemoveLockA.RemoveEvent.Signalled != 0,
+		             "and the event was signalled",
+		             dx.RemoveLockA.RemoveEvent.Signalled != 0, 1, &bad);
+		sched_expect(g_wait_would_block == 0, "so the wait did not block",
+		             g_wait_would_block, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 3. the slot admits one claimant at a time ----------------- */
+	{
+		wdm_reset(&dx);
+
+		sched_expect(AdaptoidVendorTryClaim(&dx) == 1, "the slot is free",
+		             1, 1, &bad);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_CLAIMED, "and claimed",
+		             dx.Vendor.State, ADAPTOID_SLOT_CLAIMED, &bad);
+		sched_expect(AdaptoidVendorTryClaim(&dx) == 0,
+		             "a second claimant is refused", 0, 0, &bad);
+		sched_expect(AdaptoidVendorClaimForIrp(&dx, &irp) == 0,
+		             "including one bringing an IRP", 0, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 4. a transfer goes out, and the lock is held across it ---- */
+	{
+		wdm_reset(&dx);
+		AdaptoidVendorTryClaim(&dx);
+
+		setup.bmRequestType = ADAPTOID_VENDOR_IN;
+		setup.bRequest      = 0x21;
+		setup.wValue        = 0x1234;
+		setup.wIndex        = 0x5678;
+		st = AdaptoidVendorSend(&dx, &setup, 4, 0, wdm_test_callback);
+
+		sched_expect(st == STATUS_PENDING, "the transfer was submitted",
+		             (long)st, STATUS_PENDING, &bad);
+		sched_expect(g_urb_count == 1, "once", g_urb_count, 1, &bad);
+		sched_expect(g_urb_setup.bRequest == 0x21, "carrying the request",
+		             g_urb_setup.bRequest, 0x21, &bad);
+		sched_expect(g_urb_len == 4, "and the length", (long)g_urb_len, 4,
+		             &bad);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_IN_FLIGHT,
+		             "the slot is in flight", dx.Vendor.State,
+		             ADAPTOID_SLOT_IN_FLIGHT, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 2,
+		             "and the remove lock is held across it",
+		             dx.RemoveLockB.IoCount, 2, &bad);
+
+		/* completing it hands the slot back and drops the lock */
+		AdaptoidVendorComplete(&dx, STATUS_SUCCESS, 4);
+		sched_expect(g_cb_calls == 1, "the callback ran", g_cb_calls, 1,
+		             &bad);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_FREE,
+		             "the slot went back to free", dx.Vendor.State,
+		             ADAPTOID_SLOT_FREE, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "and the lock came back", dx.RemoveLockB.IoCount, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 5. a callback that takes the slot again keeps it ---------- */
+	{
+		wdm_reset(&dx);
+		AdaptoidVendorTryClaim(&dx);
+		setup.bmRequestType = ADAPTOID_VENDOR_OUT;
+		AdaptoidVendorSend(&dx, &setup, 0, 0, wdm_test_callback);
+
+		g_cb_return = 1;            /* "I resubmitted" */
+		AdaptoidVendorComplete(&dx, STATUS_SUCCESS, 0);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_CLAIMED,
+		             "the slot stays claimed for the chain",
+		             dx.Vendor.State, ADAPTOID_SLOT_CLAIMED, &bad);
+		groups++;
+	}
+
+	/* ---- 6. a failed transfer suppresses the callback -------------- */
+	{
+		wdm_reset(&dx);
+		AdaptoidVendorTryClaim(&dx);
+		setup.bmRequestType = ADAPTOID_VENDOR_IN;
+		AdaptoidVendorSend(&dx, &setup, 4, 0, wdm_test_callback);
+
+		AdaptoidVendorComplete(&dx, STATUS_UNSUCCESSFUL, 0);
+		sched_expect(g_cb_calls == 0,
+		             "a failed transfer does not run the callback",
+		             g_cb_calls, 0, &bad);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_FREE,
+		             "but the slot is still released", dx.Vendor.State,
+		             ADAPTOID_SLOT_FREE, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1, "and the lock too",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 7. a waiting IRP inherits the transfer's result ----------- */
+	{
+		wdm_reset(&dx);
+		irp.IoStatus.Status = 0;
+		irp.IoStatus.Information = 0;
+		sched_expect(AdaptoidVendorClaimForIrp(&dx, &irp) == 1,
+		             "claimed on behalf of a request", 1, 1, &bad);
+		setup.bmRequestType = ADAPTOID_VENDOR_IN;
+		AdaptoidVendorSend(&dx, &setup, 8, 0, 0);
+
+		AdaptoidVendorComplete(&dx, STATUS_SUCCESS, 8);
+		sched_expect(g_irp_count == 1, "the request was completed",
+		             g_irp_count, 1, &bad);
+		sched_expect(irp.IoStatus.Information == 8, "with the transfer length",
+		             (long)irp.IoStatus.Information, 8, &bad);
+		sched_expect(irp.IoStatus.Status == STATUS_SUCCESS, "and its status",
+		             (long)irp.IoStatus.Status, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 8. DEFECT 15: a rejected request must not leak ------------ */
+	{
+		/*
+		 * bmRequestType comes from the caller on the raw passthrough
+		 * IOCTL, so anything other than 0x40 or 0xC0 is untrusted input
+		 * that has to be refused - without leaking the reference taken
+		 * on entry, which is what the original does.
+		 */
+		static const u8 BAD[] = {0x00, 0x21, 0x80, 0xC1, 0x41, 0xFF};
+		int k;
+		LONG before;
+
+		wdm_reset(&dx);
+		before = dx.RemoveLockB.IoCount;
+
+		for (k = 0; k < (int)(sizeof(BAD) / sizeof(BAD[0])); k++) {
+			irp.IoStatus.Status = 0;
+			AdaptoidVendorClaimForIrp(&dx, &irp);
+			setup.bmRequestType = BAD[k];
+			st = AdaptoidVendorSend(&dx, &setup, 0, 0, 0);
+			if (st != STATUS_INVALID_PARAMETER) {
+				hlog("  FAIL wdm bmRequestType %02x gave %08lx, want "
+				     "INVALID_PARAMETER\n", BAD[k], (unsigned long)st);
+				bad++;
+			}
+		}
+		sched_expect(dx.RemoveLockB.IoCount == before,
+		             "six rejections leaked nothing",
+		             dx.RemoveLockB.IoCount, before, &bad);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_FREE,
+		             "and the slot was given back", dx.Vendor.State,
+		             ADAPTOID_SLOT_FREE, &bad);
+		sched_expect(g_irp_count == 6, "each request was completed",
+		             g_irp_count, 6, &bad);
+		sched_expect(g_urb_count == 0, "and none reached the wire",
+		             g_urb_count, 0, &bad);
+
+		/* the two legal values still work */
+		setup.bmRequestType = ADAPTOID_VENDOR_OUT;
+		AdaptoidVendorTryClaim(&dx);
+		sched_expect(AdaptoidVendorSend(&dx, &setup, 0, 0, 0) ==
+		             STATUS_PENDING, "0x40 is accepted", 1, 1, &bad);
+		AdaptoidVendorComplete(&dx, STATUS_SUCCESS, 0);
+		setup.bmRequestType = ADAPTOID_VENDOR_IN;
+		AdaptoidVendorTryClaim(&dx);
+		sched_expect(AdaptoidVendorSend(&dx, &setup, 4, 0, 0) ==
+		             STATUS_PENDING, "and so is 0xC0", 1, 1, &bad);
+		AdaptoidVendorComplete(&dx, STATUS_SUCCESS, 4);
+		sched_expect(dx.RemoveLockB.IoCount == before,
+		             "with the lock still balanced",
+		             dx.RemoveLockB.IoCount, before, &bad);
+		groups++;
+	}
+
+	/* ---- 9. submitting without claiming is refused ----------------- */
+	{
+		wdm_reset(&dx);
+		setup.bmRequestType = ADAPTOID_VENDOR_IN;
+		st = AdaptoidVendorSend(&dx, &setup, 4, 0, 0);
+		sched_expect(st == STATUS_DEVICE_BUSY,
+		             "an unclaimed slot refuses the transfer", (long)st,
+		             STATUS_DEVICE_BUSY, &bad);
+		sched_expect(g_urb_count == 0, "nothing went out", g_urb_count, 0,
+		             &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1, "and nothing leaked",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+
+		/* a completion for a transfer we never made is dropped */
+		AdaptoidVendorComplete(&dx, STATUS_SUCCESS, 0);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_FREE,
+		             "a spurious completion does not corrupt the slot",
+		             dx.Vendor.State, ADAPTOID_SLOT_FREE, &bad);
+		groups++;
+	}
+
+	hlog("WDM lock and transport : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -5085,6 +5429,7 @@ int main(int argc, char **argv)
 	bad += test_hid_reports();
 	bad += test_ioctl();
 	bad += test_control_device();
+	bad += test_wdm_transport();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

@@ -42,6 +42,11 @@ typedef signed   long long  LONGLONG;
 #define NULL ((void *)0)
 #endif
 
+#ifndef TRUE
+#define TRUE  1
+#define FALSE 0
+#endif
+
 #define IN
 #define OUT
 #define OPTIONAL
@@ -69,6 +74,8 @@ typedef signed   long long  LONGLONG;
 #define STATUS_BUFFER_TOO_SMALL         ((NTSTATUS)0xC0000023L)
 #define STATUS_INSUFFICIENT_RESOURCES   ((NTSTATUS)0xC000009AL)
 #define STATUS_NOT_SUPPORTED            ((NTSTATUS)0xC00000BBL)
+#define STATUS_DELETE_PENDING           ((NTSTATUS)0xC0000056L)
+#define STATUS_CANCELLED                ((NTSTATUS)0xC0000120L)
 
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 
@@ -116,10 +123,15 @@ typedef struct _DEVICE_OBJECT {
 	ULONG                   Flags;
 } DEVICE_OBJECT, *PDEVICE_OBJECT;
 
-typedef struct _IRP {
+/* Shaped like the DDK's, so wdm.c reaches IoStatus.Status in both builds. */
+typedef struct _IO_STATUS_BLOCK {
 	NTSTATUS    Status;
-	PVOID       SystemBuffer;
 	ULONG       Information;
+} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+
+typedef struct _IRP {
+	IO_STATUS_BLOCK IoStatus;
+	PVOID           SystemBuffer;
 } IRP, *PIRP;
 
 struct _DRIVER_OBJECT;
@@ -175,8 +187,39 @@ void     KeInitializeSpinLock(PKSPIN_LOCK SpinLock);
 KIRQL    KfAcquireSpinLock(PKSPIN_LOCK SpinLock);
 void     KfReleaseSpinLock(PKSPIN_LOCK SpinLock, KIRQL NewIrql);
 
+/*
+ * THE PORTABLE SPELLING, and the only one new code should use.
+ *
+ * KfAcquireSpinLock is an x86-only fastcall export; on x64 the symbol does
+ * not exist at all and the link fails. The DDK's two-argument
+ * KeAcquireSpinLock is a macro over Kf on x86 and a real function on x64,
+ * so it is what compiles on both. These definitions match the x86 DDK ones
+ * exactly; the real headers supply their own.
+ */
+typedef KIRQL *PKIRQL;
+#define KeAcquireSpinLock(l, p)     (*(p) = KfAcquireSpinLock(l))
+#define KeReleaseSpinLock(l, i)     KfReleaseSpinLock((l), (i))
+
+/* The two enumerations the event and wait calls take. Values match the DDK
+ * so the same source compiles against the real headers. */
+#define NotificationEvent       0
+#define SynchronizationEvent    1
+#define Executive               0
+#define KernelMode              0
+
 void     KeInitializeEvent(PKEVENT Event, ULONG Type, BOOLEAN State);
 LONG     KeSetEvent(PKEVENT Event, LONG Increment, BOOLEAN Wait);
+
+/*
+ * Waiting is where a user-mode harness and a kernel part company: there is no
+ * other thread to signal the event. The stub asserts the event is ALREADY
+ * signalled and returns, which turns "this code would have blocked forever"
+ * into a test failure instead of a hang.
+ */
+NTSTATUS KeWaitForSingleObject(PVOID Object, ULONG WaitReason,
+                               ULONG WaitMode, BOOLEAN Alertable,
+                               PVOID Timeout);
+
 
 /*
  * The single most valuable stub. Backed by a variable the harness advances by
@@ -184,5 +227,10 @@ LONG     KeSetEvent(PKEVENT Event, LONG Increment, BOOLEAN Wait);
  * deterministic and steppable - something no VM can offer.
  */
 ULONGLONG KeQueryInterruptTime(void);
+
+/* Completing a request is the one kernel call the transport cannot avoid. */
+#define IO_NO_INCREMENT 0
+
+void     IoCompleteRequest(PIRP Irp, CHAR PriorityBoost);
 
 #endif /* ADAPTOID_KSTUB_H */

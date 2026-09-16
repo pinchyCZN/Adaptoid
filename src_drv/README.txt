@@ -156,6 +156,18 @@ Table of Contents
 
    Each of these was found the hard way and is commented at its site.
 
+   KeAcquireSpinLock, NOT KfAcquireSpinLock. The Kf forms are x86-only
+   fastcall exports: on x64 the symbol does not exist and the link fails
+   with an unresolved external, having compiled without complaint. The DDK's
+   two-argument KeAcquireSpinLock(Lock, &OldIrql) is a macro over Kf on x86
+   and a real function on x64, so it is the only spelling that works in both.
+   The 2001 driver uses the Kf forms throughout, because it only ever had to
+   be a 32-bit driver.
+
+   THIS IS WHY ALL FOUR CONFIGURATIONS GET BUILT rather than just the one
+   being worked on. The harness is Win32 and would never have shown it; the
+   x64 driver link is what caught it.
+
    /Z7 RATHER THAN /Zi. mspdbsrv.exe is absent from the DDK bin tree, so the
    PDB server cannot be spawned and /Zi fails. /Z7 keeps debug information in
    the object file, and is the DDK default anyway.
@@ -222,7 +234,7 @@ Table of Contents
    | ioctl.c   |     1303 |    1303 | both IOCTL surfaces, the registry and |
    |           |          |         | the notify queue; finished            |
    +-----------+----------+---------+---------------------------------------+
-   | wdm.c     |      195 |   ~1700 | DriverEntry, AddDevice, PnP, power,   |
+   | wdm.c     |      488 |   ~1900 | DriverEntry, AddDevice, PnP, power,   |
    |           |          |         | polling, URB transport, device naming |
    +-----------+----------+---------+---------------------------------------+
    | harness.c |     5171 |   ~5600 | main() and every test                 |
@@ -261,11 +273,22 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 64 of the 146 functions in
-   wishk201.sys are ported, 23532 of 38690 bytes, so 61 percent by code
-   size. The 3109 lines written so far cover those 16331 bytes, which is 5.3
-   bytes of original per line of replacement and is the ratio the estimates
-   below use.
+   Measured against the Ghidra database: 72 of the 146 functions in
+   wishk201.sys are ported, 24733 of 38690 bytes, so 64 percent by code
+   size.
+
+   wdm.c IS BEING PORTED IN STAGES, because it is the OS-facing half and
+   most of it cannot be exercised the way the rest was. Stage one is the
+   remove lock and the vendor transport - the foundation the other
+   subsystems sit on, and the piece that turns core.c's transport seams into
+   something real. What is left is PnP and start/stop, power, interrupt
+   polling, device naming, USB port recovery, the HID read-IRP plumbing and
+   the control device object.
+
+   The 5332 lines of replacement written so far cover 24733 bytes of
+   original, which is 4.6 bytes per line and is the ratio the estimates
+   below use. It has drifted down as the work moved from dense arithmetic to
+   OS plumbing, which is spread thinner.
 
    THE WHOLE SCRIPT ENGINE IS NOW DONE: the interpreter, the thread
    scheduler, the input binding and the native builtin library. What is left
@@ -279,14 +302,13 @@ Table of Contents
    | PnP, start and stop      |  14 |  2577 |      429 | wdm.c     |
    | device naming            |   6 |  1808 |      301 | wdm.c     |
    | HID report IRP plumbing  |   6 |   768 |      128 | wdm.c     |
-   | vendor transport         |   8 |  1522 |      253 | wdm.c     |
    | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
    | power                    |   7 |  1225 |      204 | wdm.c     |
-   | kernel glue              |   8 |   703 |      117 | wdm.c     |
+   | kernel glue              |   4 |   401 |       66 | wdm.c     |
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  82 | 15158 |     2526 |           |
+   | TOTAL REMAINING          |  74 | 13957 |     2326 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of

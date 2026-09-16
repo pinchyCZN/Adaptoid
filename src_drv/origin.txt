@@ -87,6 +87,14 @@ Table of Contents
    drv_CompleteReadReport AT 00014ec0 is the other half of that delivery and
    is therefore a second row for AdaptoidReportSink.
 
+   AdaptoidVendorSubmitUrb HAS TWO DEFINITIONS AND ONE ROW. It is the OS
+   edge of the vendor transport: wdm.c defines it for the driver build and
+   harness.c defines it for the harness, selected by ADAPTOID_USERMODE. Only
+   one is compiled at a time, and both stand for the same original,
+   drv_SubmitVendorUrb at 00019527, so the single row naming wdm.c covers
+   both. The checker sees one definition per build and is satisfied either
+   way.
+
    drv_BuildJoystickReport AT 00015150 IS ONE ORIGINAL AND SEVERAL ROWS. It
    decodes the stick, maps the buttons, packs the report, starts the
    accessory probe and implements the on-controller tuning mode, all in one

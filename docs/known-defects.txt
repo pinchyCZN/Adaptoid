@@ -7,12 +7,18 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Thirteen defects have been found during reverse engineering: two
+   Fourteen defects have been found during reverse engineering: two
    arithmetic ones in wishk201.sys, a pair of unbounded string copies also
    in the driver, a race in wishh201.dll, a bounds check in the script
    interpreter that tests the wrong value, four in the script engine's
-   native builtin library, three on the private IOCTL surface, and a remove
-   lock that one error path never releases. This
+   native builtin library, three on the private IOCTL surface, and two
+   remove-lock references that error paths never give back.
+
+   THE TWO REMOVE-LOCK DEFECTS, SECTIONS 16 AND 17, ARE THE SAME MISTAKE
+   TWICE and are worth reading together. Both are a reference taken and not
+   returned on a path that fails, and in both the consequence is the same: a
+   count that never reaches zero, so the device can never finish removing.
+   Section 17 is the reachable one. This
    note records each one, the exact condition that triggers it, what it
    would actually do, and whether a user would be likely to notice. It also
    records claims that were made here and later RETRACTED, in sections 3
@@ -38,7 +44,7 @@ Abstract
    simple remapping profile would hit, which is why the software's
    reputation for robustness survives them.
 
-   None of the thirteen is in the HID report descriptor or the keyboard and
+   None of the fourteen is in the HID report descriptor or the keyboard and
    mouse report builders.
 
 Table of Contents
@@ -59,7 +65,8 @@ Table of Contents
    14. Defect 12: The Effect Slot Index Is Signed And Only Bounded Above
    15. Defect 13: The Script Fault Snapshot Can Leak
    16. Defect 14: A Remove Lock Is Not Released On One Path
-   17. What Is Not Affected
+   17. Defect 15: A Rejected Vendor Request Acquires Instead Of Releasing
+   18. What Is Not Affected
 
 1.  Severity Summary
 
@@ -96,6 +103,9 @@ Table of Contents
        remove lock leaked when   control device   no, a narrow
        the control device is                       teardown race
        already gone
+       rejected vendor request   vendor           yes, reachable
+       acquires the remove lock  transport        from user mode
+       instead of releasing it
        (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
@@ -780,7 +790,58 @@ Table of Contents
    releases on its own path. A helper that sometimes acquires and sometimes
    does not, distinguished only by its return value, is the defect.
 
-17. What Is Not Affected
+17. Defect 15: A Rejected Vendor Request Acquires Instead Of Releasing
+
+   Location:  drv_SendVendorRequest, the failure path, the call at 00019509
+
+   The function takes RemoveLockB on entry and, on success, holds it across
+   the transfer for drv_VendorUrbComplete to drop. On failure it has to give
+   it back. It does not:
+
+       00019503  PUSH 0x193d8
+       00019508  PUSH EDX
+       00019509  CALL 0x00015930          <-- drv_LockAcquire
+
+   drv_LockAcquire is at 00015930. drv_LockRelease is at 00015970. The call
+   targets the wrong one, so the failure path takes a SECOND reference
+   instead of returning the first.
+
+   The neighbouring function gets it right: drv_SubmitVendorUrb's own
+   failure path at 0001951d calls 00015970, which is what makes this read as
+   a slip rather than a misunderstanding.
+
+   Trigger:  any call whose setup packet has a bmRequestType other than 0x40
+   or 0xC0. AND THAT BYTE IS CALLER-SUPPLIED: the raw vendor passthrough,
+   private IOCTL function 0x832, hands the first six bytes of the caller's
+   input straight to this function as the setup packet. So one device-control
+   request with a single wrong byte is the whole trigger.
+
+   Effect:  two leaked references per rejected request - the one taken on
+   entry and the one the bogus call adds. Neither is ever returned, so
+   RemoveLockB's count climbs monotonically and never reaches zero. The
+   device can then never complete removal: drv_LockReleaseAndWait waits on an
+   event that will not be signalled, and the removal IRP blocks
+   indefinitely.
+
+   The function also RETURNS THE ACQUIRE'S STATUS rather than the
+   STATUS_INVALID_PARAMETER it computed, so a rejected request reports
+   success to its caller. The pending IRP is still completed with the right
+   error, so user mode sees the failure; only the internal return value is
+   wrong.
+
+   Would a user notice:  not at first. The adapter keeps working - nothing
+   is corrupted and no transfer is affected. The symptom appears later, as a
+   device that will not unplug cleanly, with no apparent connection to the
+   request that caused it.
+
+   In the replacement:  NOT reproduced. AdaptoidVendorSend in src_drv/wdm.c
+   validates bmRequestType, gives the slot back, releases the reference and
+   returns STATUS_INVALID_PARAMETER. The harness rejects six different bad
+   values in a row and asserts the count is exactly where it started;
+   restoring the original's call makes that count reach thirteen instead of
+   one, which is the two-per-rejection arithmetic showing through.
+
+18. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
