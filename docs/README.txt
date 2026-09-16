@@ -46,42 +46,64 @@ Table of Contents
 
 2.  Planned Documents
 
-   Written so far: hid-descriptor.txt, ioctl-surface.txt, script-
-   bytecode.txt, script-language.txt, known-defects.txt, usb-transport.txt,
-   driver-lifecycle.txt, driver-structures.txt, function-map.txt,
-   config-format.txt, configurator-architecture.txt and
-   replacement-architecture.txt. The rest are listed so findings land in a
-   predictable place rather than accumulating in one file.
+   Every document below marked DONE is written. The one marked PLANNED is
+   listed so findings land in a predictable place rather than accumulating in
+   one file. The replacement source tree lives in ../src_drv and carries its
+   own build note, src_drv/README.txt.
 
    +-----------------------+---------------------------------------------+
    | File                  | Contents                                    |
    +=======================+=============================================+
-   | hid-descriptor.txt    | The composite HID report descriptor: the    |
-   |                       | keyboard, mouse, and gamepad collections    |
-   |                       | and the report layout for each.             |
+   | hid-descriptor.txt    | DONE. The composite HID report descriptor:  |
+   |                       | the keyboard, mouse and gamepad             |
+   |                       | collections, and the report layout for      |
+   |                       | each.                                       |
    +-----------------------+---------------------------------------------+
-   | ioctl-surface.txt     | Every IOCTL code shared between             |
+   | ioctl-surface.txt     | DONE. Every IOCTL code shared between       |
    |                       | wishd201.exe and wishk201.sys, with its     |
    |                       | input and output buffer layout.             |
-   +-----------------------+---------------------------------------------+
-   | configurator-         | DONE. How wishd201.exe is built: the        |
-   | architecture.txt      | edit-as-script-text model, device           |
-   |                       | discovery, driver installation, and the     |
-   |                       | user-mode half of the event queue.          |
-   +-----------------------+---------------------------------------------+
-   | usb-protocol.txt      | Device endpoints, the N64 serial protocol,  |
-   |                       | polling cadence, and pak handling.          |
    +-----------------------+---------------------------------------------+
    | script-bytecode.txt   | DONE. The flex/bison compiler and the       |
    |                       | 32-bit opcode format it emits.              |
    +-----------------------+---------------------------------------------+
-   | driver-structures.txt | DONE. The 0x1800-byte device extension,     |
-   |                       | the structures embedded in it, the Windows  |
-   |                       | and USB layouts the driver indexes, and     |
-   |                       | what changes on 64-bit.                     |
+   | script-language.txt   | DONE. The scripting language itself: the    |
+   |                       | token set, the grammar, and the native      |
+   |                       | builtin library.                            |
    +-----------------------+---------------------------------------------+
-   | port-notes.txt        | What must change for 64-bit: pointer width, |
-   |                       | packing, WDM to KMDF or UMDF2.              |
+   | known-defects.txt     | DONE. Defects found in the originals, what  |
+   |                       | triggers each, and whether a user would     |
+   |                       | notice.                                     |
+   +-----------------------+---------------------------------------------+
+   | usb-transport.txt     | DONE. Device endpoints, the N64 serial      |
+   |                       | protocol, polling cadence, and pak          |
+   |                       | handling.                                   |
+   +-----------------------+---------------------------------------------+
+   | driver-lifecycle.txt  | DONE. DriverEntry, AddDevice, PnP and       |
+   |                       | power, including the teardown ordering.     |
+   +-----------------------+---------------------------------------------+
+   | driver-structures.txt | DONE. The 0x1800-byte device extension, the |
+   |                       | structures embedded in it, the Windows and  |
+   |                       | USB layouts the driver indexes, and what    |
+   |                       | changes on 64-bit.                          |
+   +-----------------------+---------------------------------------------+
+   | function-map.txt      | DONE. Every named function across the three |
+   |                       | binaries, and how coverage was established. |
+   +-----------------------+---------------------------------------------+
+   | config-format.txt     | DONE. The on-disk configuration and profile |
+   |                       | format.                                     |
+   +-----------------------+---------------------------------------------+
+   | configurator-         | DONE. How wishd201.exe is built: the edit-  |
+   | architecture.txt      | as-script-text model, device discovery,     |
+   |                       | driver installation, and the user-mode half |
+   |                       | of the event queue.                         |
+   +-----------------------+---------------------------------------------+
+   | replacement-          | DONE. Design note: the candidate            |
+   | architecture.txt      | architectures, which one was chosen, and    |
+   |                       | what that costs.                            |
+   +-----------------------+---------------------------------------------+
+   | port-notes.txt        | PLANNED. What must change for 64-bit beyond |
+   |                       | the structure layouts: calling convention,  |
+   |                       | and WDM to KMDF or UMDF2.                   |
    +-----------------------+---------------------------------------------+
 
 3.  Conventions

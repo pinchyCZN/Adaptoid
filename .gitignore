@@ -21,3 +21,14 @@ __pycache__/
 *.swp
 Thumbs.db
 desktop.ini
+
+# Visual Studio build output and per-user state (src_drv/)
+build/
+.vs/
+*.vcxproj.user
+*.suo
+*.sdf
+*.VC.db
+*.opendb
+*.ilk
+*.pdb

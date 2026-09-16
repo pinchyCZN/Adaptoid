@@ -65,6 +65,12 @@ Table of Contents
    instruction anywhere in the image references an offset at or beyond
    0x1800.
 
+   IT IS ALSO DECLARED, not merely implied. drv_DriverEntry builds a
+   HID_MINIDRIVER_REGISTRATION on its stack and sets DeviceExtensionSize to
+   0x1800 before calling HidRegisterMinidriver. The size is therefore
+   confirmed from both ends: the declaration hidclass acts on, and the zero-
+   fill the driver performs on what it gets back.
+
 2.  The Device Extension
 
    _ADAPTOID_DEVEXT, 0x1800 bytes. 124 fields are named, covering 98 per cent
@@ -86,6 +92,7 @@ Table of Contents
    | 0x28C  | DeviceDescriptor         | void *                       | 18 bytes; bcdDevice at +0x0C             |
    | 0x290  | InterfaceInfo            | USBD_INTERFACE_INFORMATION * | heap copy; Pipes[0] drives the poll      |
    | 0x294  | Capabilities             | DEVICE_CAPABILITIES          | 0x40 bytes, IRP_MN_QUERY_CAPABILITIES    |
+   | 0x328  | CollectionEnabled        | byte[3]                      | per HID collection; minidriver fn 7/8    |
    | 0x334  | DeviceName               | char[10]                     | display name; see known-defects.txt      |
    | 0x33E  | FirmwareRevision         | ushort                       | vendor request 0x75                      |
    | 0x344  | GlobalDeviceLink         | LIST_ENTRY                   | driver-wide device list                  |
@@ -421,6 +428,7 @@ Table of Contents
    | DRIVER_OBJECT                          | 0xA8   | MajorFunction 0x38                             |
    | DEVICE_CAPABILITIES                    | 0x40   | SurpriseRemovalOK bit 9, DeviceState 0x10      |
    | HID_DEVICE_EXTENSION                   | 0x0C   | all three members                              |
+   | HID_MINIDRIVER_REGISTRATION            | 0x14   | DeviceExtensionSize 0x0C                       |
    | URB_HEADER                             | 0x10   | Length, Function, Status                       |
    | URB_BULK_OR_INTERRUPT_TRANSFER         | 0x48   | the controller poll                            |
    | URB_CONTROL_VENDOR_OR_CLASS_REQUEST    | 0x50   | Request 0x49, Value 0x4A, Index 0x4C           |
@@ -512,6 +520,33 @@ Table of Contents
    consistent with deliberate padding against false sharing and equally
    consistent with members deleted during development. INFERENCE either way;
    nothing in the binary distinguishes them.
+
+7.1.  Residual Decompiler Artefacts
+
+   After typing, 14 of the 144 driver functions still show synthetic
+   variables. They are recorded here so nobody spends time trying to type
+   them away: in each case the database is correct and the decompiler's
+   rendering is the limitation.
+
+   -  extraout_EAX / extraout_EDX, in seven functions. KeQueryInterruptTime
+   -  returns a 64-bit value in the EDX:EAX pair, which is declared
+   -  correctly. Where the result is consumed after a branch, the decompiler
+   -  splits the pair into two synthetic halves instead of carrying one
+   -  64-bit value.
+
+   -  unaff_EDI, in drv_ScriptScheduler. The KeSetTimer call passes a Timer,
+   -  an 8-byte DueTime and a PKDPC, which both the push sequence and the RET
+   -  0x10 confirm. The decompiler mis-groups the 8-byte argument and renders
+   -  the Dpc as CONCAT44 material.
+
+   -  in_stack_NNNNNNNN, in eight functions. The compiler reuses incoming
+   -  parameter slots as scratch, and drv_ScriptThreadAlloc actually writes a
+   -  clamped value back over its own argument. The decompiler then treats
+   -  the slot as a phantom parameter beyond the declared arity.
+
+   None of these indicates a wrong signature. Every function in the driver
+   has been checked against the RET immediate of its own epilogue, and all
+   146 agree.
 
 8.  What Changes On 64-bit
 

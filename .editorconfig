@@ -1,0 +1,58 @@
+; Adaptoid reverse engineering - editor settings.
+;
+; The rule is TABS FOR INDENTATION, SPACES FOR ALIGNMENT, one tab per
+; indent level, displayed as four columns. tools/retab.py enforces it
+; and can convert a file that has drifted:
+;
+;     python tools/retab.py --check      report, exit 1 if anything drifted
+;     python tools/retab.py --fix        convert in place
+;
+; Alignment - a continuation line under an open paren, the ' * ' of a
+; block comment, an ASCII diagram, a run of aligned assignments - stays
+; spaces, so the source renders correctly whatever tab width the reader
+; has set. See CLAUDE.md.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+; The replacement driver in src_drv/. C only.
+[*.{c,h,cpp,hpp,inc}]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+max_line_length = 80
+
+; The tools stay on spaces - PEP 8, and asciify.py has to keep passing
+; its own check.
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 80
+
+; The RFC documents in docs/ and src_drv/README.txt are SPECIFIED in
+; spaces: three-space bodies wrapped at 80, four-or-more-space
+; preformatted blocks, tables drawn to a column and allowed 120. Tabs
+; would break the layout and the column count asciify.py performs.
+[*.txt]
+indent_style = space
+indent_size = 4
+max_line_length = 80
+
+; MSBuild project files. Visual Studio writes these itself.
+[*.{vcxproj,props,filters}]
+indent_style = space
+indent_size = 2
+
+; A .sln is tab-indented by Visual Studio; do not fight it.
+[*.sln]
+indent_style = tab
+indent_size = 4
+
+[*.md]
+indent_style = space
+indent_size = 2

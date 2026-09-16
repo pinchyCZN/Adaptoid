@@ -1,0 +1,188 @@
+Adaptoid Reverse Engineering                                 Origin Map
+src_drv                                                      wishk300
+
+
+                           ORIGIN MAP
+
+
+Abstract
+
+   Where every function in the replacement driver came from. One row per
+   correspondence: the replacement function, and the address and name of the
+   original it derives from.
+
+   This exists so that when the reconstruction misbehaves you can get back to
+   the evidence in Ghidra without guessing. Function names have already
+   diverged - core_pak_addr_crc5 was drv_N64PakAddrCrc5 - and no naming rule
+   recovers that.
+
+   It is a file rather than a tag in a source comment so it stays out of the
+   code, and so it can be diffed, grepped and mechanically checked. The check
+   is tools/originmap.py; see section 4.
+
+   THE ADDRESS IS THE DURABLE KEY, not the name. The binaries in decomp/ are
+   immutable primary evidence and are never rebuilt, so an address cannot rot.
+   A Ghidra function name can still be changed by later analysis.
+
+Table of Contents
+
+   1.  The Map
+   2.  Kinds
+   3.  Entries That Are Not One To One
+   4.  Keeping It Honest
+
+1.  The Map
+
+   Every origin currently lives in wishk201.sys. The Binary column exists
+   because there are three original binaries and a name can plausibly appear
+   in more than one.
+
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | Replacement              | File      | Kind | Binary       | Addr     | Original                          |
+   +==========================+===========+======+==============+==========+===================================+
+   | core_zero                | core.c    | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_init                | core.c    | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_reset               | core.c    | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_emit                | core.c    | part | wishk201.sys | 00014de8 | drv_SubmitHidReport               |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_on_raw_packet       | core.c    | part | wishk201.sys | 00015150 | drv_BuildJoystickReport           |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_tick                | core.c    | part | wishk201.sys | 00017980 | drv_ScriptScheduler               |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_tick                | core.c    | part | wishk201.sys | 00013ac0 | drv_EffectTick                    |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_pak_addr_crc5       | core.c    | port | wishk201.sys | 000136f0 | drv_N64PakAddrCrc5                |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | core_pak_data_crc8       | core.c    | port | wishk201.sys | 00013730 | drv_N64PakDataCrc8                |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | DriverEntry              | wdm.c     | port | wishk201.sys | 000115f0 | drv_DriverEntry                   |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidUnload           | wdm.c     | port | wishk201.sys | 000117e0 | drv_Unload                        |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidAddDevice        | wdm.c     | port | wishk201.sys | 0001236e | drv_AddDevice                     |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidCreate           | wdm.c     | port | wishk201.sys | 000117f0 | drv_CreateTriage                  |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidClose            | wdm.c     | port | wishk201.sys | 00011910 | drv_CloseTriage                   |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidCleanup          | wdm.c     | port | wishk201.sys | 00011880 | drv_CleanupTriage                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidRead             | wdm.c     | port | wishk201.sys | 000119a0 | drv_ReadTriage                    |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidWrite            | wdm.c     | port | wishk201.sys | 00011a10 | drv_WriteTriage                   |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidDeviceControl    | wdm.c     | port | wishk201.sys | 00011a80 | drv_DeviceControlTriage           |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidIntDeviceControl | wdm.c     | port | wishk201.sys | 000128d2 | drv_DispatchInternalDeviceControl |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidPnp              | wdm.c     | port | wishk201.sys | 00011b10 | drv_PnpTriage                     |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidPower            | wdm.c     | port | wishk201.sys | 00011b70 | drv_PowerTriage                   |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidReportSink       | wdm.c     | part | wishk201.sys | 00014de8 | drv_SubmitHidReport               |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | AdaptoidReportSink       | wdm.c     | part | wishk201.sys | 00014ec0 | drv_CompleteReadReport            |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | KeQueryInterruptTime     | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | clock_advance_ms         | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | ExAllocatePoolWithTag    | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | ExFreePool               | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | InterlockedIncrement     | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | InterlockedDecrement     | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | InterlockedExchange      | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | KeInitializeSpinLock     | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | KfAcquireSpinLock        | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | KfReleaseSpinLock        | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | KeInitializeEvent        | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | KeSetEvent               | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | HidRegisterMinidriver    | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | report_name              | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | harness_sink             | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | simulate_add_device      | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+   | main                     | harness.c | new  | -            | -        | -                                 |
+   +--------------------------+-----------+------+--------------+----------+-----------------------------------+
+
+2.  Kinds
+
+   +------+------------------------------------------------------------+
+   | Kind | Meaning                                                    |
+   +======+============================================================+
+   | port | This function is the replacement for that original, one to |
+   |      | one. Going to the address answers the question.            |
+   | part | It covers part of that original, or one of several. There  |
+   |      | may be more than one row for the same function.            |
+   | new  | No original. Scaffolding, or a harness stub standing in    |
+   |      | for something Windows provides. Nothing to go back to.     |
+   +------+------------------------------------------------------------+
+
+   Everything in harness.c is new by construction: it stands in for the
+   operating system, which is not in any of the three binaries. The kernel
+   routines there carry their real Windows names, so a row like
+   ExAllocatePoolWithTag means the HARNESS STUB of that name, not an original.
+
+   A kind of port does NOT mean the body is finished. Most of the tree is
+   still a stub; the row records where the behaviour is specified, which is
+   exactly what is wanted while writing it.
+
+3.  Entries That Are Not One To One
+
+   Two cases so far, both worth understanding because they are the shape most
+   future entries will take.
+
+   drv_SubmitHidReport AT 00014de8 SPLITS ACROSS THE CORE SEAM. That single
+   original does two things: it gates the report on drv_VirtualDevicesMask,
+   tested as 1 << (reportID - 1), and then it delivers - either handing the
+   report to a waiting read IRP or queueing it. The gate is OS-free and lives
+   in core_emit; the delivery touches IRPs and lives in AdaptoidReportSink.
+   So one original, two rows, in two different files. Splitting it is the
+   whole point of the seam, not an accident of translation.
+
+   drv_CompleteReadReport AT 00014ec0 is the other half of that delivery and
+   is therefore a second row for AdaptoidReportSink.
+
+   core_tick HAS TWO ORIGINS because the original runs two independent engines
+   off the same clock: the script scheduler at 00017980 and the effect ring at
+   00013ac0. Whether the replacement keeps them in one entry point is not
+   decided; if it splits them, this becomes two rows against two functions.
+
+4.  Keeping It Honest
+
+       python tools/originmap.py --check    report drift, exit 1 if any
+       python tools/originmap.py --fix      rewrite the table aligned
+
+   --check verifies that every function defined in src_drv/*.c has a row,
+   that every row names a function that still exists and sits in the file the
+   row claims, that the kind and binary are known values, and that a row is
+   internally consistent - new carries no address, port and part must carry
+   one.
+
+   --fix re-aligns the table from its own contents, so a row can be added by
+   typing it loosely between the borders without counting columns.
+
+   WHAT NEITHER CAN VERIFY is that an address still names the function the row
+   claims. The Ghidra database is not reachable from a script here and decomp/
+   is not in git. Addresses are read out of the database by hand when a row is
+   written, so the risk is a typo at entry rather than decay. Confirm a row in
+   Ghidra when you are about to rely on it.
+
+   asciify.py covers the rest: it checks that every row is exactly as wide as
+   its border, which catches a --fix that did not run.

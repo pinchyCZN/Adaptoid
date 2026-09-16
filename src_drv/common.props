@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  common.props - settings shared by driver.vcxproj and harness.vcxproj.
+
+  WdkRoot is the single place the legacy WDK 7.1.0 location is named. Override
+  it with msbuild /p:WdkRoot=... or the WDK71_ROOT environment variable, or
+  replace the default here when a modern WDK is installed. Nothing else in the
+  tree hard-codes that path.
+
+  Note what is deliberately NOT here: include paths, library paths, tool paths
+  and compiler flags. The driver and the harness share almost nothing at the
+  tool level - one builds kernel code with the DDK toolchain, the other builds
+  an ordinary console program with v141 - and pretending otherwise would put
+  DDK headers in front of the harness.
+-->
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserMacros">
+    <AdaptoidRoot>$(MSBuildThisFileDirectory)</AdaptoidRoot>
+    <WdkRoot Condition="'$(WdkRoot)' == '' and '$(WDK71_ROOT)' != ''">$(WDK71_ROOT)</WdkRoot>
+    <WdkRoot Condition="'$(WdkRoot)' == ''">E:\DEV\WinDDK</WdkRoot>
+
+    <!-- Platform to DDK directory names, mapped in one place. -->
+    <DdkBinArch Condition="'$(Platform)' == 'Win32'">x86</DdkBinArch>
+    <DdkBinArch Condition="'$(Platform)' == 'x64'">amd64</DdkBinArch>
+    <DdkLibArch Condition="'$(Platform)' == 'Win32'">i386</DdkLibArch>
+    <DdkLibArch Condition="'$(Platform)' == 'x64'">amd64</DdkLibArch>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Layout">
+    <!-- Every artefact lands under build/. Intermediates are per-project: two
+         projects sharing an IntDir is an MSB8027 error, and both of them
+         compile core.c and wdm.c with different toolchains and defines. -->
+    <OutDir>$(AdaptoidRoot)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(AdaptoidRoot)build\obj\$(MSBuildProjectName)\$(Platform)\$(Configuration)\</IntDir>
+
+    <!-- Both projects emit wishk300.*; the extension is what separates them.
+         Byproducts that are NOT extension-qualified would collide, so the
+         linker PDB name is overridden per project and incremental linking is
+         off for both - otherwise each would want the same wishk300.ilk. -->
+    <TargetName>wishk300</TargetName>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- C only. No C++, no precompiled headers, no stdafx. -->
+      <CompileAs>CompileAsC</CompileAs>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!--
+    A wrong WdkRoot otherwise shows up as a thousand "cannot open include file
+    wdm.h" lines. Fail once, with the reason.
+  -->
+  <Target Name="VerifyWdkRoot" BeforeTargets="PrepareForBuild"
+          Condition="'$(UsesDdkToolchain)' == 'true'">
+    <Error Condition="!Exists('$(WdkRoot)\bin\x86\$(DdkBinArch)\cl.exe')"
+           Text="WDK 7.1 compiler not found at $(WdkRoot)\bin\x86\$(DdkBinArch)\cl.exe - set /p:WdkRoot=... or WDK71_ROOT." />
+    <Error Condition="!Exists('$(WdkRoot)\lib\win7\$(DdkLibArch)\ntoskrnl.lib')"
+           Text="WDK 7.1 libraries not found at $(WdkRoot)\lib\win7\$(DdkLibArch)." />
+  </Target>
+</Project>

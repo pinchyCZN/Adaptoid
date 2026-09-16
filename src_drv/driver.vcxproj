@@ -1,0 +1,207 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  driver.vcxproj -> wishk300.sys
+
+  No WDK is installed on this machine, so this does NOT use the Visual Studio
+  Driver project system. It keeps the v141 project system for build plumbing
+  but points the CL and Link tasks at the compiler and linker that ship inside
+  WDK 7.1 - cl 15.00 / link 9.00, the VS2008 SP1 toolchain those headers were
+  written against. See README.txt.
+
+  Flags follow the DDK build system rather than being invented here:
+  E:\DEV\WinDDK\bin\makefile.new, i386mk.inc and amd64mk.inc are the reference.
+-->
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration><Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration><Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration><Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration><Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1D0F300-0001-4000-9000-000000000001}</ProjectGuid>
+    <RootNamespace>driver</RootNamespace>
+    <ProjectName>driver</ProjectName>
+    <WindowsTargetPlatformVersion>10.0.17134.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v141</PlatformToolset>
+    <CharacterSet>NotSet</CharacterSet>
+
+    <!--
+      Without this, Microsoft.Cpp.CoreWin.props prepends kernel32.lib,
+      user32.lib, gdi32.lib and nine others to Link.AdditionalDependencies.
+      None of those belong in a kernel image.
+    -->
+    <NonCoreWin>true</NonCoreWin>
+
+    <!--
+      FALSE IN EVERY CONFIGURATION, Debug included. Four separate v141 defaults
+      key off this one property: /MDd, /RTC1, /Od and /DEBUG:FASTLINK. link 9.00
+      rejects /DEBUG:FASTLINK outright, and the /RTC switches emit _RTC_InitBase
+      and friends, which do not exist in the 2009 kernel libraries. Debug-ness
+      is expressed explicitly below instead.
+    -->
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="common.props" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <TargetExt>.sys</TargetExt>
+    <EmbedManifest>false</EmbedManifest>
+    <UsesDdkToolchain>true</UsesDdkToolchain>
+
+    <!-- Use the DDK toolchain rather than v141. These property names are what
+         the CL and Link tasks read; see Microsoft.CppCommon.targets. -->
+    <CLToolPath>$(WdkRoot)\bin\x86\$(DdkBinArch)</CLToolPath>
+    <CLToolExe>cl.exe</CLToolExe>
+    <LinkToolPath>$(WdkRoot)\bin\x86\$(DdkBinArch)</LinkToolPath>
+    <LinkToolExe>link.exe</LinkToolExe>
+
+    <!-- FULLY overridden, not inherited. Mixing the UCRT and MSVC headers with
+         DDK headers is the classic failure: the DDK ships its own SAL 1 sal.h
+         in inc\api and it must be the one that wins. The DDK bin directory
+         comes first so link finds the matching cvtres.exe. -->
+    <IncludePath>$(WdkRoot)\inc\ddk;$(WdkRoot)\inc\api;$(WdkRoot)\inc\crt</IncludePath>
+    <LibraryPath>$(WdkRoot)\lib\win7\$(DdkLibArch)</LibraryPath>
+    <ExecutablePath>$(WdkRoot)\bin\x86\$(DdkBinArch);$(WdkRoot)\bin\x86;$(SystemRoot)\System32</ExecutablePath>
+    <ReferencePath></ReferencePath>
+    <LibraryWPath></LibraryWPath>
+    <ExcludePath></ExcludePath>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- The DDK headers do not infer the architecture; they must be told.
+           STD_CALL pairs with /Gz and must not be defined without it. -->
+      <PreprocessorDefinitions Condition="'$(Platform)' == 'Win32'">_X86_=1;i386=1;STD_CALL;FPO=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Platform)' == 'x64'">_WIN64;_AMD64_;AMD64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NTDDI_VERSION=0x06010000;_WIN32_WINNT=0x0601;WINVER=0x0601;_WIN32_IE=0x0800;WIN32=100;_NT1X_=100;WINNT=1;CONDITION_HANDLING=1;NT_INST=0;WIN32_LEAN_AND_MEAN=1;DEVL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)' == 'Debug'">DBG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+
+      <!-- /Z7, NOT /Zi. mspdbsrv.exe is absent from the DDK bin tree, so the
+           PDB server cannot be spawned. /Z7 keeps debug info in the .obj and is
+           the DDK default in any case. -->
+      <DebugInformationFormat>OldStyle</DebugInformationFormat>
+
+      <!-- No CRT. RuntimeLibrary must stay EMPTY so no /MT or /MD is emitted. -->
+      <RuntimeLibrary></RuntimeLibrary>
+      <OmitDefaultLibName>true</OmitDefaultLibName>
+
+      <Optimization Condition="'$(Configuration)' == 'Debug'">Disabled</Optimization>
+      <Optimization Condition="'$(Configuration)' == 'Release'">MaxSpeed</Optimization>
+
+      <!-- /GS pairs with BufferOverflowK.lib and the GsDriverEntry entry point
+           below; that library supplies __security_cookie and friends. -->
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <MinimalRebuild>false</MinimalRebuild>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <StringPooling>true</StringPooling>
+      <WarningLevel>Level3</WarningLevel>
+      <DisableSpecificWarnings>4603;4627</DisableSpecificWarnings>
+
+      <!-- x86 kernel code defaults to __stdcall: the DDK declares its exports
+           with no explicit convention and hidclass.lib exports
+           _HidRegisterMinidriver@4. x64 has a single convention. -->
+      <CallingConvention Condition="'$(Platform)' == 'Win32'">StdCall</CallingConvention>
+      <CallingConvention Condition="'$(Platform)' == 'x64'">Cdecl</CallingConvention>
+      <!-- Frame pointers are required for x86 kernel stack walking. -->
+      <OmitFramePointers Condition="'$(Platform)' == 'Win32'">false</OmitFramePointers>
+
+      <!-- Switches the v141 targets emit by default that cl 15.00 rejects.
+           SDLCheck is deliberately NOT set: false would emit /sdl-. -->
+      <ConformanceMode>false</ConformanceMode>
+      <DiagnosticsFormat></DiagnosticsFormat>
+      <SupportJustMyCodeDebugging>false</SupportJustMyCodeDebugging>
+      <RemoveUnreferencedCodeData>false</RemoveUnreferencedCodeData>
+      <MultiProcessorCompilation>false</MultiProcessorCompilation>
+
+      <!-- ExceptionHandling=false emits nothing, so /EHs-c- is passed by hand.
+           -cbstring is what the DDK sets for TARGETTYPE=DRIVER. -->
+      <AdditionalOptions>/EHs-c- -cbstring %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+
+    <Link>
+      <SubSystem>Native</SubSystem>
+      <!-- 1.10 is what the DDK stamps on a WDM driver. -->
+      <MinimumRequiredVersion>1.10</MinimumRequiredVersion>
+      <Driver>WDM</Driver>
+
+      <!--
+        NOT DriverEntry. /GS makes BufferOverflowK.lib::GsDriverEntry the real
+        entry point; it initialises the stack cookie and then calls our
+        DriverEntry. x86 decorates the stdcall name, x64 does not.
+      -->
+      <EntryPointSymbol Condition="'$(Platform)' == 'Win32'">GsDriverEntry@8</EntryPointSymbol>
+      <EntryPointSymbol Condition="'$(Platform)' == 'x64'">GsDriverEntry</EntryPointSymbol>
+
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <AdditionalDependencies>ntoskrnl.lib;hal.lib;BufferOverflowK.lib;hidclass.lib;usbd.lib</AdditionalDependencies>
+
+      <!-- Explicitly true, not DebugFull: link 9.00 ignores /DEBUG:FULL with
+           LNK4224 and would silently produce no PDB at all. -->
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ProgramDatabaseFile>$(OutDir)$(TargetName)$(TargetExt).pdb</ProgramDatabaseFile>
+
+      <!-- The loader validates the PE checksum for drivers. -->
+      <SetChecksum>true</SetChecksum>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <!-- The DDK default, and what the 2001 driver was built with. -->
+      <BaseAddress>0x10000</BaseAddress>
+
+      <!-- link 9.00 rejects /DYNAMICBASE in EITHER direction alongside /DRIVER:
+           driver ASLR arrived with the Win8 WDK. Both stay empty so no switch
+           is emitted. -->
+      <RandomizedBaseAddress></RandomizedBaseAddress>
+      <DataExecutionPrevention></DataExecutionPrevention>
+      <GenerateManifest>false</GenerateManifest>
+      <EnableUAC>false</EnableUAC>
+
+      <!--
+        /MERGE collapses the compiler section names onto the ones the kernel
+        expects. /SECTION:INIT,d makes DriverEntry discardable after load.
+        The /IGNORE list is the DDK list from makefile.new; 4078 is in it
+        because link adds the WRITE attribute to any section named in
+        /SECTION, which then differs from the one cl emitted. Verified by
+        dumping both.
+      -->
+      <AdditionalOptions>/MERGE:_PAGE=PAGE /MERGE:_TEXT=.text /SECTION:INIT,d /IGNORE:4010,4037,4039,4065,4070,4078,4087,4089,4221 %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="core.c" />
+    <ClCompile Include="wdm.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="core.h" />
+    <ClInclude Include="wdm.h" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

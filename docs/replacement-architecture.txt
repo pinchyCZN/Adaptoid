@@ -191,6 +191,12 @@ Table of Contents
 
 6.  Recommended Design
 
+   NOTE BEFORE READING: this section recommends architecture 3 for the
+   GENERAL case of supporting arbitrary controllers, and that reasoning
+   stands. THIS PROJECT went the other way and chose architecture 1,
+   because it targets one known adapter; see section 8.5 for the
+   comparison and section 11 for the decision.
+
    Architecture 3, built on the Virtual HID Framework.
 
    VHF is the supported Windows mechanism for a driver to create a HID
@@ -511,6 +517,20 @@ Table of Contents
    them as an optional add-on to the generic design, not as part of it.
 
 11. Open Decisions
+   -  RESOLVED: ARCHITECTURE 1. The replacement is a per-device HID
+      minidriver that owns the adapter, not the virtual-HID design of
+      section 6. The deciding question was the one section 8.5 poses -
+      how many devices are actually intended to be supported - and the
+      answer is one, the Adaptoid itself. For a single known adapter,
+      owning the device avoids every cost in section 7, above all the
+      double-visibility problem, and needs one kernel component rather
+      than two. Section 6 remains the right recommendation for the
+      general case and should be read that way.
+
+      The source tree is ../src_drv; see src_drv/README.txt. It builds
+      wishk300.sys and a user-mode harness, wishk300.exe, from the same
+      C source.
+
    -  Whether to support the original compiled bytecode at all, or to
       keep only the source language and recompile. Supporting the
       bytecode preserves existing profiles; dropping it removes the need
@@ -519,15 +539,15 @@ Table of Contents
    -  RESOLVED, and it was never a defect. The stick cross-coupling is
       the vendor's documented octagonal-to-square corner stretch; see
       known-defects.txt section 3. A replacement should implement it and
-      expose both it and the range clipping as tunables.
-
-   -  Whether to expose the stick corner stretch as an option, make it an
-      option, or fix it silently.
+      expose both it and the range clipping as tunables. Whether to make
+      it a user-visible option or apply it silently is still open.
 
    -  Whether the Adaptoid-specific add-on is worth building at all, or
       whether Controller Pak access and rumble are better left to the
       original hardware on an original machine.
 
-   -  Whether to hide the source controller from applications by default.
-      Hiding avoids doubled input but surprises users who expect the pad
-      to still work normally in other software.
+   -  ARCHITECTURE 3 ONLY, and therefore moot under the decision above:
+      whether to hide the source controller from applications by
+      default. Hiding avoids doubled input but surprises users who
+      expect the pad to still work normally in other software.
+      Architecture 1 replaces the device, so nothing is doubled.

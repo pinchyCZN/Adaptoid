@@ -55,6 +55,13 @@ Table of Contents
    The triage wrappers do almost nothing; the real work is in the pair
    hidclass owns.
 
+   The eight handlers hidclass installs are saved into named globals -
+   drv_g_HidCreate, drv_g_HidCleanup, drv_g_HidClose, drv_g_HidRead,
+   drv_g_HidWrite, drv_g_HidDeviceControl, drv_g_HidPnp and drv_g_HidPower -
+   and the drv_*Triage wrappers chain to them. The registration block itself
+   is a HID_MINIDRIVER_REGISTRATION built on DriverEntry's stack, and its
+   DeviceExtensionSize field is where the 0x1800 extension size is declared.
+
 2.  AddDevice
 
    The device extension this section describes is documented field by field

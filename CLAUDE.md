@@ -209,6 +209,70 @@ Record facts, not the journey. One fact has one home; everything else points at
 it rather than restating it. Correct a document in place instead of appending a
 correction.
 
+## Source code: tabs for indentation, spaces for alignment
+
+**In `src_drv/` only.** One indent level is one TAB, displayed as four columns.
+Everything that is not structural indentation stays SPACES:
+
+- a continuation line lined up under an open paren;
+- the `* ` of a block comment;
+- an ASCII diagram or an address listing inside a comment;
+- columns in an initialiser or a run of aligned assignments.
+
+That split is the whole point - it makes the source render correctly at any tab
+width instead of only at four.
+
+```
+python tools/retab.py --check    report, exit 1 if anything drifted
+python tools/retab.py --fix      convert in place
+```
+
+`retab.py` decides the split as `tabs = min(brace_depth, spaces // 4)`, so a
+line indented past its own depth keeps the excess as alignment. It verifies
+every file by expanding its own output back and comparing, and refuses to write
+one that does not round-trip - so a scanner bug is caught rather than committed.
+
+**`docs/`, `src_drv/README.txt` and `tools/` do NOT change.** The RFC documents
+are specified in spaces and `asciify.py` counts their columns; the Python is PEP
+8. `.editorconfig` encodes every case, including that a `.sln` is tab-indented
+by Visual Studio.
+
+Two traps, both already hit on the MotoRacer project this convention comes from:
+
+- **`asciify.py` measures DISPLAY columns**, expanding tabs to four. Counting
+  characters instead would let a deeply nested line run well past 80 real
+  columns and still pass. The copy in `tools/` already does this correctly.
+- **A generator that emits spaces silently undoes this.** Check any new script
+  that writes into `src_drv/` the same way.
+
+## Origin map: every function records where it came from
+
+`src_drv/origin.txt` maps each function in the replacement to the address and
+name of the original it derives from. Add a row in the same change that adds
+the function - not afterwards.
+
+```
+python tools/originmap.py --check    report drift, exit 1 if any
+python tools/originmap.py --fix      re-align the table
+```
+
+Deliberately a **file, not an `[origin]` tag in a comment**: it stays out of the
+source, and it can be diffed, grepped and mechanically checked. `--check`
+verifies both directions - a function with no row, and a row naming a function
+that no longer exists - and `--fix` re-aligns, so a row can be typed loosely
+between the borders without counting columns.
+
+Three kinds: `port` (one to one), `part` (covers some of an original, or one of
+several - there may be several rows for one function), `new` (no original;
+scaffolding, or a harness stub standing in for Windows).
+
+**The address is the durable key, not the name.** The binaries are immutable
+primary evidence and are never rebuilt, so an address cannot rot; a Ghidra
+function name can still be changed by later analysis. Nothing can verify a row
+against Ghidra automatically - the MCP is not reachable from a script and
+`decomp/` is not in git - so read the address out of the database when writing
+the row, and confirm it when you rely on it.
+
 ## Working rules
 
 - **Clean-room discipline.** Findings get written as behavioral specs -
