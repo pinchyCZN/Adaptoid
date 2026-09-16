@@ -199,6 +199,109 @@ static PADAPTOID_DEVEXT simulate_add_device(DEVICE_OBJECT *fdo,
 }
 
 /* ------------------------------------------------------------------ */
+/* Tests                                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * THE EXPECTED VALUES WERE READ OUT OF wishk201.sys ITSELF, by emulating
+ * drv_N64PakAddrCrc5 at 000136f0 and drv_N64PakDataCrc8 at 00013730 in
+ * Ghidra and capturing what they returned. They are not copied from the
+ * decompiler output and not taken on trust from a reference elsewhere,
+ * so they are an independent check on the reimplementation rather than a
+ * restatement of it.
+ *
+ * The address CRC was additionally verified EXHAUSTIVELY over all 2048
+ * block addresses against the same emulation; the eight kept here are a
+ * spread worth having in the file. The data CRC was checked over 64
+ * pseudo-random blocks as well as these five.
+ */
+
+static const struct {
+	u16 address;
+	u16 expect;
+} PAK_ADDR_VECTORS[] = {
+	{ 0x0000, 0x0000 },
+	{ 0x0020, 0x0035 },
+	{ 0x0040, 0x005F },
+	{ 0x0060, 0x006A },
+	{ 0x0100, 0x0116 },
+	{ 0x1234, 0x1230 },   /* low 5 bits of the input are discarded */
+	{ 0x7FE0, 0x7FEC },
+	{ 0xFFE0, 0xFFED }
+};
+
+static int test_pak_crcs(void)
+{
+	u8  block[CORE_PAK_BLOCK_BYTES];
+	int bad = 0;
+	int i;
+	u16 got16;
+	u8  got8;
+
+	for (i = 0; i < (int)(sizeof(PAK_ADDR_VECTORS)
+		                  / sizeof(PAK_ADDR_VECTORS[0])); i++) {
+		got16 = core_pak_addr_encode(PAK_ADDR_VECTORS[i].address);
+		if (got16 != PAK_ADDR_VECTORS[i].expect) {
+			printf("  FAIL addr_encode(0x%04X) = 0x%04X, want 0x%04X\n",
+			       (unsigned)PAK_ADDR_VECTORS[i].address,
+			       (unsigned)got16,
+			       (unsigned)PAK_ADDR_VECTORS[i].expect);
+			bad++;
+		}
+	}
+
+	/* all zero */
+	memset(block, 0x00, sizeof(block));
+	got8 = core_pak_data_crc8(block, CORE_PAK_BLOCK_BYTES);
+	if (got8 != 0x00) {
+		printf("  FAIL data_crc8(zeros) = 0x%02X, want 0x00\n", got8);
+		bad++;
+	}
+
+	/* all ones */
+	memset(block, 0xFF, sizeof(block));
+	got8 = core_pak_data_crc8(block, CORE_PAK_BLOCK_BYTES);
+	if (got8 != 0x0A) {
+		printf("  FAIL data_crc8(ones) = 0x%02X, want 0x0A\n", got8);
+		bad++;
+	}
+
+	/* 00..1F ascending */
+	for (i = 0; i < CORE_PAK_BLOCK_BYTES; i++) {
+		block[i] = (u8)i;
+	}
+	got8 = core_pak_data_crc8(block, CORE_PAK_BLOCK_BYTES);
+	if (got8 != 0x33) {
+		printf("  FAIL data_crc8(ascending) = 0x%02X, want 0x33\n", got8);
+		bad++;
+	}
+
+	/* descending from 0x80 */
+	for (i = 0; i < CORE_PAK_BLOCK_BYTES; i++) {
+		block[i] = (u8)(0x80 - i);
+	}
+	got8 = core_pak_data_crc8(block, CORE_PAK_BLOCK_BYTES);
+	if (got8 != 0x91) {
+		printf("  FAIL data_crc8(descending) = 0x%02X, want 0x91\n", got8);
+		bad++;
+	}
+
+	/* a single set bit in the first byte - catches a wrong bit order */
+	memset(block, 0x00, sizeof(block));
+	block[0] = 0x01;
+	got8 = core_pak_data_crc8(block, CORE_PAK_BLOCK_BYTES);
+	if (got8 != 0x04) {
+		printf("  FAIL data_crc8(one bit) = 0x%02X, want 0x04\n", got8);
+		bad++;
+	}
+
+	printf("Controller Pak CRCs    : %s (%d vectors)\n",
+	       bad ? "FAIL" : "ok",
+	       (int)(sizeof(PAK_ADDR_VECTORS) / sizeof(PAK_ADDR_VECTORS[0])) + 5);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -212,6 +315,7 @@ int main(void)
 	NTSTATUS             status;
 	int                  i;
 	int                  count;
+	int                  bad = 0;
 
 	static const u8 packets[][CORE_RAW_PACKET_BYTES] = {
 		{ 0x00, 0x00, 0x00, 0x00, 0x00 },   /* neutral         */
@@ -231,6 +335,9 @@ int main(void)
 	memset(&pdo,     0, sizeof(pdo));
 	memset(&lower,   0, sizeof(lower));
 	memset(&hidext,  0, sizeof(hidext));
+
+	/* 0. Pure functions first - they need no device. */
+	bad += test_pak_crcs();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);
@@ -277,13 +384,16 @@ int main(void)
 
 	if (g_reports_seen != devext->Core.reports_emitted) {
 		printf("\nFAIL: sink count does not match emitted count\n");
-		free(hidext.MiniDeviceExtension);
-		return 1;
+		bad++;
 	}
 
 	AdaptoidUnload(&driver);
 	free(hidext.MiniDeviceExtension);
 
+	if (bad) {
+		printf("\n%d failure(s)\n", bad);
+		return 1;
+	}
 	printf("\nok\n");
 	return 0;
 }

@@ -185,6 +185,73 @@ Table of Contents
    bit per 1/64-second tick. Four bytes fit exactly in wValue and wIndex,
    which is presumably why the design needs no data stage.
 
+   3.3.  The Two Accessory CRCs
+
+   Accessory reads and writes carry two checksums, computed by
+   drv_N64PakAddrCrc5 at 000136f0 and drv_N64PakDataCrc8 at 00013730. Both
+   are plain MSB-first CRCs and share the same shape: no reflection of input
+   or output, a zero initial value, and no final XOR.
+
+   +------------------+------------------+----------------------------------+
+   | Parameter        | Address CRC      | Data CRC                         |
+   +==================+==================+==================================+
+   | Width            | 5 bits           | 8 bits                           |
+   | Polynomial       | 0x15             | 0x85                             |
+   | As a polynomial  | x^5+x^4+x^2+1    | x^8+x^7+x^2+1                    |
+   | Initial value    | 0                | 0                                |
+   | Message          | 11-bit block     | 32 data bytes                    |
+   |                  | address          |                                  |
+   | Reflected        | no               | no                               |
+   | Final XOR        | none             | none                             |
+   +------------------+------------------+----------------------------------+
+
+   THE ADDRESS CRC DOES NOT COVER THE WHOLE ADDRESS. Its message is the
+   11-bit BLOCK address, which is the byte address divided by the 32-byte
+   block size; the low five bits of a byte address are not part of the
+   message. drv_N64PakAddrCrc5 takes a byte address, discards those five
+   bits, and returns the complete 16-bit word that goes on the wire:
+
+       bit  15                    5   4        0
+            +---------------------+   +--------+
+            | block address, 11   |   | CRC5   |
+            +---------------------+   +--------+
+
+   So the checksum occupies exactly the bits the block address does not need.
+   A caller that already has a block number must shift it left by five before
+   passing it in.
+
+   The data CRC covers one whole 32-byte block and nothing else - no address,
+   no command byte, no length.
+
+   HOW THIS WAS ESTABLISHED. The parameters were read out of the two
+   functions, then checked by EMULATING THE ORIGINAL CODE in Ghidra and
+   comparing its return values against an independent implementation written
+   from the table above. The address CRC was verified EXHAUSTIVELY, over all
+   2048 possible block addresses; the data CRC over 64 pseudo-random blocks
+   as well as the fixed vectors below. That is stronger evidence than reading
+   the decompiler output, because it tests behaviour rather than a reading of
+   it.
+
+   Vectors, all produced by emulating the original functions. The address
+   column is a BYTE address, and the result is the full 16-bit wire word:
+
+       addr_encode(0x0000) = 0x0000      data_crc8(32 x 0x00) = 0x00
+       addr_encode(0x0020) = 0x0035      data_crc8(32 x 0xFF) = 0x0A
+       addr_encode(0x0040) = 0x005F      data_crc8(0x00..0x1F) = 0x33
+       addr_encode(0x0060) = 0x006A      data_crc8(0x80 down)  = 0x91
+       addr_encode(0x0100) = 0x0116      data_crc8(0x01 then 0) = 0x04
+       addr_encode(0x1234) = 0x1230
+       addr_encode(0x7FE0) = 0x7FEC
+       addr_encode(0xFFE0) = 0xFFED
+
+   The 0x1234 entry is worth keeping because it demonstrates the discard: the
+   input is not block-aligned, and the low five bits play no part.
+
+   These are the genuine N64 accessory-bus algorithms rather than anything
+   the adapter invented, which is consistent with the adapter being a
+   transparent bridge onto the controller bus. The replacement implements
+   them in src_drv/core.c and asserts the vectors above in its harness.
+
 4.  The Accessory Probe
 
    Entered from drv_BuildJoystickReport whenever devext+0x3E4 is 0, which

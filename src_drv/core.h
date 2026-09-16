@@ -102,10 +102,29 @@ void core_on_raw_packet(core_state *cs, const u8 *raw);
 void core_tick(core_state *cs, u64 now_100ns);
 
 /*
- * Controller Pak CRCs. Pure functions, no state - the natural first real unit
- * test for the harness. Named after drv_N64PakAddrCrc5 / drv_N64PakDataCrc8.
+ * Controller Pak CRCs. Pure functions, no state.
+ *
+ * The genuine N64 accessory-bus algorithms; see ../docs/usb-transport.txt
+ * section 3.3 for the specification and how it was established.
  */
+
+/* An accessory read or write moves one 32-byte block. */
+#define CORE_PAK_BLOCK_BYTES    32
+
+/* The block address is 11 bits: the byte address divided by the block size. */
+#define CORE_PAK_ADDR_BITS      11
+#define CORE_PAK_ADDR_MASK      0x7ffu
+
+/* CRC5 of the block address, polynomial 0x15. Takes a BYTE address; the
+ * low five bits are not part of the message and are discarded. */
 u8 core_pak_addr_crc5(u16 address);
+
+/* The 16-bit address word that goes on the wire: block address in the top
+ * 11 bits, its CRC5 in the low 5. */
+u16 core_pak_addr_encode(u16 address);
+
+/* CRC8 of a data block, polynomial 0x85. The protocol always passes
+ * CORE_PAK_BLOCK_BYTES; len exists so the function can be tested. */
 u8 core_pak_data_crc8(const u8 *data, u32 len);
 
 #endif /* ADAPTOID_CORE_H */
