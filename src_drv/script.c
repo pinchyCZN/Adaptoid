@@ -356,7 +356,9 @@ int core_script_run(core_script *vm)
 
 			switch (op) {
 			case CORE_OP_LSHFT: vm->acc = lhs << (vm->acc & 0x1f);        break;
-			case CORE_OP_RSHFT: vm->acc = (u32)((s32)lhs >> (vm->acc & 0x1f)); break;
+			case CORE_OP_RSHFT:
+				vm->acc = (u32)((s32)lhs >> (vm->acc & 0x1f));
+				break;
 			case CORE_OP_ADD:   vm->acc = lhs + vm->acc;                  break;
 			case CORE_OP_SUB:   vm->acc = lhs - vm->acc;                  break;
 			case CORE_OP_MUL:   vm->acc = lhs * vm->acc;                  break;

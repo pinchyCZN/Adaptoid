@@ -1688,13 +1688,17 @@ static const u32 P02[] = {PROLOGUE, 0x110,10,0x093,0x110,3,0x252, EPILOGUE};
 static const u32 P03[] = {PROLOGUE, 0x110,10,0x093,0x110,3,0x254, EPILOGUE};
 static const u32 P04[] = {PROLOGUE, 0x110,17,0x093,0x110,5,0x255, EPILOGUE};
 static const u32 P05[] = {PROLOGUE, 0x110,17,0x093,0x110,5,0x256, EPILOGUE};
-static const u32 P06[] = {PROLOGUE, 0x110,0xFFFFFFF7u,0x093,0x110,2,0x255, EPILOGUE};
-static const u32 P07[] = {PROLOGUE, 0x110,0xFFFFFFF7u,0x093,0x110,2,0x256, EPILOGUE};
+static const u32 P06[] = {PROLOGUE, 0x110,0xFFFFFFF7u,0x093,0x110,2,0x255,
+	                      EPILOGUE};
+static const u32 P07[] = {PROLOGUE, 0x110,0xFFFFFFF7u,0x093,0x110,2,0x256,
+	                      EPILOGUE};
 static const u32 P08[] = {PROLOGUE, 0x110,1,0x093,0x110,4,0x250, EPILOGUE};
-static const u32 P09[] = {PROLOGUE, 0x110,0xFFFFFF00u,0x093,0x110,4,0x251, EPILOGUE};
+static const u32 P09[] = {PROLOGUE, 0x110,0xFFFFFF00u,0x093,0x110,4,0x251,
+	                      EPILOGUE};
 static const u32 P10[] = {PROLOGUE, 0x110,5,0x093,0x110,3,0x262, EPILOGUE};
 static const u32 P11[] = {PROLOGUE, 0x110,3,0x093,0x110,5,0x262, EPILOGUE};
-static const u32 P12[] = {PROLOGUE, 0x110,0xFFFFFFFBu,0x093,0x110,3,0x263, EPILOGUE};
+static const u32 P12[] = {PROLOGUE, 0x110,0xFFFFFFFBu,0x093,0x110,3,0x263,
+	                      EPILOGUE};
 static const u32 P13[] = {PROLOGUE, 0x110,5,0x093,0x110,5,0x264, EPILOGUE};
 static const u32 P14[] = {PROLOGUE, 0x110,0,0x093,0x110,7,0x266, EPILOGUE};
 static const u32 P15[] = {PROLOGUE, 0x110,0,0x093,0x110,7,0x267, EPILOGUE};
@@ -1702,7 +1706,8 @@ static const u32 P16[] = {PROLOGUE, 0x110,5,0x040, EPILOGUE};
 static const u32 P17[] = {PROLOGUE, 0x110,5,0x041, EPILOGUE};
 static const u32 P18[] = {PROLOGUE, 0x110,5,0x042, EPILOGUE};
 static const u32 P19[] = {PROLOGUE, 0x110,1,0x172,2,0x110,111, EPILOGUE};
-static const u32 P20[] = {PROLOGUE, 0x110,0,0x172,2,0x110,111,0x110,222, EPILOGUE};
+static const u32 P20[] = {PROLOGUE, 0x110,0,0x172,2,0x110,111,0x110,222,
+	                      EPILOGUE};
 static const u32 P21[] = {PROLOGUE, 0x110,9,0x093,0x110,4,0x095, EPILOGUE};
 
 static int test_script(void)
@@ -5014,6 +5019,7 @@ static ADAPTOID_SETUP g_urb_setup;
 static ULONG          g_urb_len;
 static int            g_urb_count;
 static NTSTATUS       g_urb_ret = STATUS_PENDING;
+static int            g_urb_autocomplete;
 
 /* Completed IRPs, so a test can see what a failure path answered. */
 static PIRP     g_irp_last;
@@ -5052,11 +5058,23 @@ NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
                                  const ADAPTOID_SETUP *Setup,
                                  ULONG TransferLength, PVOID TransferBuffer)
 {
-	(void)DevExt;
 	(void)TransferBuffer;
 	g_urb_setup = *Setup;
 	g_urb_len   = TransferLength;
 	g_urb_count++;
+	/*
+	 * AUTO-COMPLETION IS OPT-IN. The transport tests drive
+	 * AdaptoidVendorComplete by hand so they can watch the slot change
+	 * state; the PnP tests cannot, because AdaptoidStartDevice WAITS for
+	 * a reply inside the dispatcher. Without this the harness reports
+	 * "KeWaitForSingleObject would block forever", which is exactly what
+	 * it should say and exactly how this was found.
+	 */
+	if (g_urb_autocomplete) {
+		AdaptoidVendorComplete(DevExt, STATUS_SUCCESS, TransferLength);
+		return STATUS_SUCCESS;
+	}
+	(void)DevExt;
 	return g_urb_ret;
 }
 
@@ -5089,6 +5107,7 @@ static void wdm_reset(PADAPTOID_DEVEXT dx)
 	g_urb_count        = 0;
 	g_urb_len          = 0;
 	g_urb_ret          = STATUS_PENDING;
+	g_urb_autocomplete = 0;
 	g_irp_count        = 0;
 	g_irp_status       = 0;
 	g_cb_calls         = 0;
@@ -5451,7 +5470,287 @@ void AdaptoidSetCompletionRoutine(PIRP Irp, PVOID Event)
 	((PKEVENT)Event)->Signalled = 1;
 }
 
-void AdaptoidStartNextPowerIrp(PIRP Irp) { (void)Irp; pnp_note("nextpower"); }
+/* ------------------------------------------------------------------ */
+/* the kernel edges stage five reaches                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Power. The three calls are recorded rather than made, because what matters
+ * about this layer is the ORDER: PoStartNextPowerIrp must precede
+ * PoCallDriver on every path, and the device IRP a system IRP asks for must
+ * complete before the system IRP does.
+ */
+static char  g_power_log[512];
+static ULONG g_power_log_len;
+
+static void power_note(const char *what)
+{
+	ULONG n = 0;
+
+	while (what[n] != 0) {
+		n++;
+	}
+	if (g_power_log_len + n + 2 >= sizeof(g_power_log)) {
+		return;
+	}
+	if (g_power_log_len != 0) {
+		g_power_log[g_power_log_len++] = ' ';
+	}
+	memcpy(g_power_log + g_power_log_len, what, n);
+	g_power_log_len += n;
+	g_power_log[g_power_log_len] = 0;
+}
+
+static void power_reset(void)
+{
+	g_power_log[0]  = 0;
+	g_power_log_len = 0;
+}
+
+/* The state the last PoRequestPowerIrp asked for, and its completion. */
+static ULONG                   g_power_requested;
+static int                     g_power_requests;
+static PREQUEST_POWER_COMPLETE g_power_complete;
+static PVOID                   g_power_context;
+static PDEVICE_OBJECT          g_power_device;
+
+/* Where a passed-down power IRP went, and what completion was attached. */
+static PIO_COMPLETION_ROUTINE g_power_completion;
+static PVOID                  g_power_completion_ctx;
+
+void PoStartNextPowerIrp(PIRP Irp)
+{
+	(void)Irp;
+	power_note("next");
+	/* The triage tests watch the PnP log rather than this one, and both
+	 * are recording the same call. */
+	pnp_note("nextpower");
+}
+
+NTSTATUS PoCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	(void)DeviceObject;
+	power_note("down");
+	/*
+	 * The fake stack completes synchronously, so a completion routine is
+	 * run here - the real one would be called by the IRP machinery.
+	 */
+	if (g_power_completion != NULL) {
+		PIO_COMPLETION_ROUTINE r = g_power_completion;
+		PVOID                  c = g_power_completion_ctx;
+
+		g_power_completion     = NULL;
+		g_power_completion_ctx = NULL;
+		r(DeviceObject, Irp, c);
+		power_note("completed");
+	}
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS PoRequestPowerIrp(PDEVICE_OBJECT DeviceObject, UCHAR MinorFunction,
+                           POWER_STATE PowerState,
+                           PREQUEST_POWER_COMPLETE Complete,
+                           PVOID Context, PIRP *Irp)
+{
+	(void)MinorFunction;
+	(void)Irp;
+	power_note("request");
+	g_power_requests++;
+	g_power_requested = (ULONG)PowerState.DeviceState;
+	g_power_complete  = Complete;
+	g_power_context   = Context;
+	g_power_device    = DeviceObject;
+	return STATUS_PENDING;
+}
+
+/* Run the completion the last request registered, as the bus would. */
+static void power_run_completion(void)
+{
+	PREQUEST_POWER_COMPLETE c = g_power_complete;
+
+	g_power_complete = NULL;
+	if (c != NULL) {
+		IO_STATUS_BLOCK io;
+		POWER_STATE     ps;
+
+		io.Status      = STATUS_SUCCESS;
+		io.Information = 0;
+		ps.DeviceState = (DEVICE_POWER_STATE)g_power_requested;
+		c(g_power_device, 0, ps, g_power_context, &io);
+	}
+}
+
+void IoSetCompletionRoutine(PIRP Irp, PIO_COMPLETION_ROUTINE Routine,
+                            PVOID Context, BOOLEAN OnSuccess,
+                            BOOLEAN OnError, BOOLEAN OnCancel)
+{
+	(void)Irp;
+	(void)OnSuccess;
+	(void)OnError;
+	(void)OnCancel;
+	g_power_completion     = Routine;
+	g_power_completion_ctx = Context;
+}
+
+/* Cancellation. Single-threaded, so the lock is a counter to assert on. */
+static LONG g_cancel_lock_depth;
+
+void IoSetCancelRoutine(PIRP Irp, PVOID Routine)
+{
+	Irp->CancelRoutine = Routine;
+}
+
+void IoAcquireCancelSpinLock(KIRQL *Irql)
+{
+	*Irql = 0;
+	g_cancel_lock_depth++;
+}
+
+void IoReleaseCancelSpinLock(KIRQL Irql)
+{
+	(void)Irql;
+	g_cancel_lock_depth--;
+}
+
+/* Timers and DPCs. Recorded, never fired on their own. */
+void KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context)
+{
+	Dpc->Routine = Routine;
+	Dpc->Context = Context;
+	Dpc->Queued  = 0;
+}
+
+void KeInitializeTimer(PKTIMER Timer) { Timer->Due = 0; }
+
+BOOLEAN KeSetTimer(PKTIMER Timer, LONGLONG DueTime, PKDPC Dpc)
+{
+	BOOLEAN was = (BOOLEAN)(Timer->Due != 0);
+
+	Timer->Due = (ULONGLONG)DueTime;
+	if (Dpc != NULL) {
+		Dpc->Queued = 1;
+	}
+	return was;
+}
+
+BOOLEAN KeCancelTimer(PKTIMER Timer)
+{
+	BOOLEAN was = (BOOLEAN)(Timer->Due != 0);
+
+	Timer->Due = 0;
+	return was;
+}
+
+/* The fast mutex guarding the control-device singleton. */
+static LONG g_mutex_depth;
+static LONG g_mutex_max;
+
+void ExInitializeFastMutex(PFAST_MUTEX Mutex) { Mutex->Held = 0; }
+
+void ExAcquireFastMutex(PFAST_MUTEX Mutex)
+{
+	Mutex->Held++;
+	g_mutex_depth++;
+	if (g_mutex_depth > g_mutex_max) {
+		g_mutex_max = g_mutex_depth;
+	}
+}
+
+void ExReleaseFastMutex(PFAST_MUTEX Mutex)
+{
+	Mutex->Held--;
+	g_mutex_depth--;
+}
+
+/* The control device object itself. One static extension is enough; the
+ * driver only ever makes one. */
+static DEVICE_OBJECT g_made_device;
+/* The control-device extension carries the registry and the hundred-event
+ * notification queue, so it is far larger than the original's 0x78 bytes. */
+static UCHAR         g_made_ext[262144];
+static int           g_devices_created;
+static int           g_devices_deleted;
+static int           g_links_created;
+static int           g_links_deleted;
+static int           g_create_device_fails;
+static int           g_create_link_fails;
+
+void RtlInitUnicodeString(PUNICODE_STRING Target, PCWSTR Source)
+{
+	USHORT n = 0;
+
+	while (Source[n] != 0) {
+		n++;
+	}
+	Target->Buffer        = (PWSTR)Source;
+	Target->Length        = (USHORT)(n * sizeof(WCHAR));
+	Target->MaximumLength = (USHORT)(Target->Length + sizeof(WCHAR));
+}
+
+NTSTATUS IoCreateDevice(PDRIVER_OBJECT DriverObject, ULONG ExtensionSize,
+                        PUNICODE_STRING Name, ULONG DeviceType,
+                        ULONG Characteristics, BOOLEAN Exclusive,
+                        PDEVICE_OBJECT *DeviceObject)
+{
+	(void)DriverObject;
+	(void)Name;
+	(void)DeviceType;
+	(void)Characteristics;
+	(void)Exclusive;
+
+	if (g_create_device_fails) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	if (ExtensionSize > sizeof(g_made_ext)) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	memset(&g_made_device, 0, sizeof(g_made_device));
+	memset(g_made_ext, 0, ExtensionSize);
+	g_made_device.DeviceExtension = g_made_ext;
+	g_made_device.Flags           = DO_DEVICE_INITIALIZING;
+	*DeviceObject = &g_made_device;
+	g_devices_created++;
+	return STATUS_SUCCESS;
+}
+
+void IoDeleteDevice(PDEVICE_OBJECT DeviceObject)
+{
+	(void)DeviceObject;
+	g_devices_deleted++;
+}
+
+NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING Link, PUNICODE_STRING Target)
+{
+	(void)Link;
+	(void)Target;
+	if (g_create_link_fails) {
+		return STATUS_UNSUCCESSFUL;
+	}
+	g_links_created++;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS IoDeleteSymbolicLink(PUNICODE_STRING Link)
+{
+	(void)Link;
+	g_links_deleted++;
+	return STATUS_SUCCESS;
+}
+
+/*
+ * The OS edge of a power request. Kept here rather than in wdm.c for the
+ * same reason every other edge is: what the driver decides is testable, what
+ * the bus does with it is not.
+ */
+NTSTATUS AdaptoidRequestPowerIrp(PADAPTOID_DEVEXT DevExt, ULONG State,
+                                 PREQUEST_POWER_COMPLETE Complete)
+{
+	POWER_STATE ps;
+
+	ps.DeviceState = (DEVICE_POWER_STATE)State;
+	return PoRequestPowerIrp(DevExt->PhysicalDeviceObject, IRP_MN_SET_POWER,
+	                         ps, Complete, DevExt, NULL);
+}
 
 /* Which handler a triaged request reached. */
 static const char *g_route_hit;
@@ -5459,25 +5758,12 @@ static const char *g_route_hit;
 static NTSTATUS NTAPI hidclass_stub(PDEVICE_OBJECT d, PIRP Irp)
 { (void)d; (void)Irp; g_route_hit = "hidclass"; return STATUS_SUCCESS; }
 
-NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT d, PIRP Irp)
-{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
-NTSTATUS NTAPI AdaptoidControlCleanup(PDEVICE_OBJECT d, PIRP Irp)
-{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
-NTSTATUS NTAPI AdaptoidControlClose(PDEVICE_OBJECT d, PIRP Irp)
-{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
-NTSTATUS NTAPI AdaptoidControlIoctl(PDEVICE_OBJECT d, PIRP Irp)
-{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
-NTSTATUS NTAPI AdaptoidControlReadWrite(PDEVICE_OBJECT d, PIRP Irp)
-{ (void)d; (void)Irp; g_route_hit = "control"; return STATUS_SUCCESS; }
 NTSTATUS NTAPI AdaptoidChannelCreate(PDEVICE_OBJECT d, PIRP Irp)
 { (void)d; (void)Irp; g_route_hit = "private"; return STATUS_SUCCESS; }
 NTSTATUS NTAPI AdaptoidChannelClose(PDEVICE_OBJECT d, PIRP Irp)
 { (void)d; (void)Irp; g_route_hit = "private"; return STATUS_SUCCESS; }
 NTSTATUS NTAPI AdaptoidChannelIoctl(PDEVICE_OBJECT d, PIRP Irp)
 { (void)d; (void)Irp; g_route_hit = "private"; return STATUS_SUCCESS; }
-
-NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT d, PIRP Irp)
-{ (void)d; (void)Irp; return STATUS_SUCCESS; }
 
 /* ------------------------------------------------------------------ */
 /* the dispatch triage and PnP                                         */
@@ -5489,7 +5775,7 @@ static int dx_lock_balanced(PADAPTOID_DEVEXT dx)
 	return dx->RemoveLockA.IoCount == 1 && dx->RemoveLockB.IoCount == 1;
 }
 
-static ULONG          g_cdo_ext[4];
+static ADAPTOID_CDO_EXT g_cdo_ext;
 static ADAPTOID_DEVEXT g_hid_ext;
 static DEVICE_OBJECT  g_cdo_dev;
 static DEVICE_OBJECT  g_hid_dev;
@@ -5499,10 +5785,16 @@ static WCHAR          g_name[4];
 
 static void triage_setup(void)
 {
-	g_cdo_ext[0] = ADAPTOID_CDO_MAGIC0;
-	g_cdo_ext[1] = ADAPTOID_CDO_MAGIC1;
-	g_cdo_ext[2] = ADAPTOID_CDO_MAGIC2;
-	g_cdo_dev.DeviceExtension = g_cdo_ext;
+	memset(&g_cdo_ext, 0, sizeof(g_cdo_ext));
+	g_cdo_ext.Magic[0] = ADAPTOID_CDO_MAGIC0;
+	g_cdo_ext.Magic[1] = ADAPTOID_CDO_MAGIC1;
+	g_cdo_ext.Magic[2] = ADAPTOID_CDO_MAGIC2;
+	/* A REAL extension, because the control handlers are now real code
+	 * rather than route-marking stubs and they dereference it. */
+	core_registry_init(&g_cdo_ext.Registry);
+	core_cmd_channel_init(&g_cdo_ext.Channel);
+	AdaptoidNotifyInit(&g_cdo_ext);
+	g_cdo_dev.DeviceExtension = &g_cdo_ext;
 	g_hid_dev.DeviceExtension = &g_hid_ext;
 
 	AdaptoidSavedDispatch.Create        = hidclass_stub;
@@ -5513,6 +5805,7 @@ static void triage_setup(void)
 	AdaptoidSavedDispatch.DeviceControl = hidclass_stub;
 	AdaptoidSavedDispatch.Pnp           = hidclass_stub;
 	AdaptoidSavedDispatch.Power         = hidclass_stub;
+
 }
 
 /* Build an IRP whose FileName is the two WCHARs given, or none at all. */
@@ -5574,12 +5867,12 @@ static int test_triage_pnp(void)
 		             1, 1, &bad);
 
 		/* a near-miss on the magic is not the control device */
-		g_cdo_ext[2] = 0;
+		g_cdo_ext.Magic[2] = 0;
 		triage_irp(&irp, 0, 0, 0, 0);
 		sched_expect(AdaptoidRouteOf(&g_cdo_dev, &irp) ==
 		             ADAPTOID_ROUTE_HIDCLASS,
 		             "two thirds of the magic is not enough", 1, 1, &bad);
-		g_cdo_ext[2] = ADAPTOID_CDO_MAGIC2;
+		g_cdo_ext.Magic[2] = ADAPTOID_CDO_MAGIC2;
 		groups++;
 	}
 
@@ -5587,10 +5880,17 @@ static int test_triage_pnp(void)
 	{
 		triage_setup();
 
+		/*
+		 * OBSERVED BY EFFECT, not by a marker: with no adapter
+		 * registered the real control handler refuses the open with
+		 * STATUS_DELETE_PENDING, which hidclass_stub cannot produce.
+		 * That proves the control CODE ran, not merely that some
+		 * handler did.
+		 */
 		triage_irp(&irp, 0, 0, 0, 0);
 		g_route_hit = 0;
-		AdaptoidCreate(&g_cdo_dev, &irp);
-		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'c',
+		sched_expect(AdaptoidCreate(&g_cdo_dev, &irp) ==
+		             STATUS_DELETE_PENDING && g_route_hit == 0,
 		             "create: magic goes to the control device", 1, 1,
 		             &bad);
 
@@ -5629,9 +5929,13 @@ static int test_triage_pnp(void)
 		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'h',
 		             "and so is write", 1, 1, &bad);
 		g_route_hit = 0;
-		AdaptoidRead(&g_cdo_dev, &irp);
-		sched_expect(g_route_hit != 0 && g_route_hit[0] == 'c',
+		g_sp.MajorFunction = IRP_MJ_READ;
+		g_sp.Parameters.Read.Length = CORE_CMD_BLOCK_BYTES;
+		sched_expect(AdaptoidRead(&g_cdo_dev, &irp) ==
+		             (NTSTATUS)CORE_ST_NO_SUCH_DEVICE &&
+		             g_route_hit == 0,
 		             "but the control device still reads", 1, 1, &bad);
+		g_sp.MajorFunction = 0;
 
 		/* PNP and POWER refuse the control device outright */
 		g_route_hit = 0;
@@ -5677,6 +5981,14 @@ static int test_triage_pnp(void)
 		g_pnp_devext   = &g_hid_ext;
 		g_lower_status = STATUS_SUCCESS;
 		g_pnp_count    = 0;
+		/*
+		 * AdaptoidStartDevice asks the adapter for its bus address and
+		 * WAITS for the answer, so the fake transport has to complete
+		 * by itself here. Without this the harness reports that
+		 * KeWaitForSingleObject would block forever, which is how the
+		 * new call was noticed.
+		 */
+		g_urb_autocomplete = 1;
 		triage_irp(&irp, 0, 0, 0, 0);
 		g_sp.MinorFunction = IRP_MN_START_DEVICE;
 
@@ -6805,6 +7117,1371 @@ static void usage(const char *argv0)
 	printf("  --trace FILE  write the numeric trace to FILE\n");
 }
 
+/* ======================================================================
+ * THE SDK COMMAND-BLOCK CHANNEL
+ *
+ * Six of these test something the original does that a reasonable
+ * reimplementation would get wrong: the cached read that never reaches the
+ * bus, the emulated Rumble Pak, the inverted CRC that means "no accessory",
+ * the status byte that lands on top of a command byte and is put back, the
+ * reply arriving reversed, and the byte-order word that is also the go flag.
+ * ====================================================================== */
+
+typedef struct cmd_xfer_log {
+	u8  setup[6];
+	u32 len;
+	int keep;
+} cmd_xfer_log;
+
+static cmd_xfer_log g_cmd_xfers[16];
+static int          g_cmd_xfer_count;
+static int          g_cmd_claims;
+static int          g_cmd_claim_ok = 1;
+static int          g_cmd_enables;
+static int          g_cmd_enable_last;
+
+/* What the fake transport writes back, and how much of it. */
+static u8  g_cmd_reply[64];
+static u32 g_cmd_reply_len;
+
+static void cmd_reset_log(void)
+{
+	g_cmd_xfer_count  = 0;
+	g_cmd_claims      = 0;
+	g_cmd_claim_ok    = 1;
+	g_cmd_enables     = 0;
+	g_cmd_enable_last = -1;
+	g_cmd_reply_len   = 0;
+	memset(g_cmd_xfers, 0, sizeof(g_cmd_xfers));
+	memset(g_cmd_reply, 0, sizeof(g_cmd_reply));
+}
+
+static int cmd_claim(void *ctx)
+{
+	(void)ctx;
+	g_cmd_claims++;
+	return g_cmd_claim_ok;
+}
+
+static u32 cmd_xfer(void *ctx, const u8 *setup, u8 *data, u32 len, int keep)
+{
+	cmd_xfer_log *e;
+
+	(void)ctx;
+	if (g_cmd_xfer_count < (int)(sizeof(g_cmd_xfers) /
+	                             sizeof(g_cmd_xfers[0]))) {
+		e = &g_cmd_xfers[g_cmd_xfer_count];
+		memcpy(e->setup, setup, 6);
+		e->len  = len;
+		e->keep = keep;
+	}
+	g_cmd_xfer_count++;
+
+	/* A device-to-host transfer gets whatever the test staged. */
+	if ((setup[0] & 0x80) != 0 && g_cmd_reply_len != 0) {
+		u32 n = g_cmd_reply_len < len ? g_cmd_reply_len : len;
+
+		memcpy(data, g_cmd_reply, n);
+	}
+	return CORE_ST_SUCCESS;
+}
+
+static void cmd_enable(void *ctx, int on)
+{
+	(void)ctx;
+	g_cmd_enables++;
+	g_cmd_enable_last = on;
+}
+
+/* One registry with one adapter wired to the fake transport. */
+static void cmd_setup_one(core_registry *reg, core_device_entry *ent,
+                          core_state *cs)
+{
+	core_registry_init(reg);
+	memset(ent, 0, sizeof(*ent));
+	memset(cs, 0, sizeof(*cs));
+	ent->handle    = 0x1234;
+	ent->cs        = cs;
+	ent->live      = 1;
+	ent->enable    = cmd_enable;
+	ent->cmd_claim = cmd_claim;
+	ent->cmd_xfer  = cmd_xfer;
+	ent->os_ctx    = 0;
+	core_registry_add(reg, ent);
+	reg->live_count = 1;
+	cmd_reset_log();
+}
+
+static int test_command_block(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_registry     reg;
+	core_device_entry ent;
+	core_state        cs;
+	core_cmd_channel  ch;
+	u8  blk[CORE_CMD_BLOCK_BYTES];
+	u32 st, info;
+	int i;
+
+	/* ---- 1. the four emulated CRCs really are CRC-8 ---------------- */
+	{
+		/*
+		 * THE POINT OF THIS GROUP. The original answers an emulated Pak
+		 * write with one of four CONSTANTS and never computes anything.
+		 * If those constants are the CRC-8 of thirty-two identical
+		 * bytes then the emulation is a faithful Rumble Pak and the
+		 * reading of the whole path is right; if they are not, it is
+		 * something else and the path has been misread.
+		 *
+		 * core_pak_data_crc8 was ported from drv_N64PakDataCrc8, a
+		 * different function analysed at a different time, so this is
+		 * an independent check and not a restatement.
+		 */
+		static const struct { u8 value; u8 crc; } vec[] = {
+			{ 0x00, 0x00 }, { 0x01, 0xEB },
+			{ 0x80, 0xB8 }, { 0xFE, 0xE1 }
+		};
+		u8 buf[32];
+
+		for (i = 0; i < 4; i++) {
+			memset(buf, vec[i].value, sizeof(buf));
+			sched_expect(core_pak_data_crc8(buf, 32) == vec[i].crc,
+			             "emulated CRC is the real CRC-8",
+			             core_pak_data_crc8(buf, 32), vec[i].crc,
+			             &bad);
+		}
+		groups++;
+	}
+
+	/* ---- 2. the cached controller read touches no transport -------- */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+		/* X, Y, status, buttons high, buttons low */
+		cs.raw[0] = 0x11; cs.raw[1] = 0x22; cs.raw[2] = 0x80;
+		cs.raw[3] = 0x33; cs.raw[4] = 0x44;
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x01;      /* command length */
+		blk[1] = 0x04;      /* reply length   */
+		blk[2] = 0x01;      /* joybus: read controller state */
+		blk[3 + 4] = CORE_CMD_END;
+
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect(g_cmd_xfer_count == 0 && g_cmd_claims == 0,
+		             "answered without touching the bus",
+		             g_cmd_xfer_count, 0, &bad);
+		sched_expect(blk[3] == 0x44 && blk[4] == 0x33 &&
+		             blk[5] == 0x11 && blk[6] == 0x22,
+		             "reply is buttons-hi, buttons-lo, X, Y",
+		             blk[3], 0x44, &bad);
+		sched_expect((blk[1] & CORE_CMD_FAILED) == 0,
+		             "and the entry is not marked failed", 0, 0, &bad);
+
+		/* pass 0 must leave it alone - it is pass 1's entry */
+		memset(blk + 3, 0, 4);
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(blk[3] == 0 && blk[4] == 0,
+		             "pass 0 does not answer it", blk[3], 0, &bad);
+		groups++;
+	}
+
+	/* ---- 3. the emulated Rumble Pak identify sequence -------------- */
+	{
+		u8 *reply;
+
+		cmd_setup_one(&reg, &ent, &cs);
+		cs.emu_pak_present = 1;
+
+		/* write 32 x 0x80 to address 0x8000 (carried as 0x8001) */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x23;
+		blk[1] = 0x01;
+		blk[2] = 0x03;          /* joybus write */
+		blk[3] = 0x80;
+		blk[4] = 0x01;
+		memset(blk + 5, 0x80, 32);
+		reply = blk + 0x23 + 2;
+		*reply = 0x5A;          /* poison, must be overwritten */
+
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_xfer_count == 0,
+		             "the Pak write never reaches the bus",
+		             g_cmd_xfer_count, 0, &bad);
+		sched_expect(*reply == 0xB8, "and answers CRC-8 of 32 x 0x80",
+		             *reply, 0xB8, &bad);
+		sched_expect(cs.emu_pak_value == 0x80, "the value is remembered",
+		             (long)cs.emu_pak_value, 0x80, &bad);
+
+		/* read it back: a Rumble Pak returns 32 x 0x80 */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x03;
+		blk[1] = 0x21;
+		blk[2] = 0x02;          /* joybus read */
+		blk[3] = 0x80;
+		blk[4] = 0x01;
+		reply = blk + 3 + 2;
+
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(reply[0] == 0x80 && reply[31] == 0x80,
+		             "read back as thirty-two 0x80 bytes",
+		             reply[0], 0x80, &bad);
+		sched_expect(reply[32] == 0xB8, "with the matching CRC",
+		             reply[32], 0xB8, &bad);
+
+		/* the Controller Pak probe writes 0xFE and reads zeroes */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x23; blk[1] = 0x01; blk[2] = 0x03;
+		blk[3] = 0x80; blk[4] = 0x01;
+		memset(blk + 5, 0xFE, 32);
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(blk[0x23 + 2] == 0xE1, "0xFE answers 0xE1",
+		             blk[0x23 + 2], 0xE1, &bad);
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x03; blk[1] = 0x21; blk[2] = 0x02;
+		blk[3] = 0x80; blk[4] = 0x01;
+		reply = blk + 5;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(reply[0] == 0x00 && reply[32] == 0x00,
+		             "and then reads back as zeroes", reply[32], 0,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 4. no accessory inverts the CRC --------------------------- */
+	{
+		u8 *reply;
+
+		cmd_setup_one(&reg, &ent, &cs);
+		cs.emu_pak_present = 0;
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x23; blk[1] = 0x01; blk[2] = 0x03;
+		blk[3] = 0x80; blk[4] = 0x01;
+		memset(blk + 5, 0x80, 32);
+		reply = blk + 0x23 + 2;
+
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(*reply == (u8)~0xB8,
+		             "with no pak the CRC comes back inverted",
+		             *reply, (u8)~0xB8, &bad);
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x03; blk[1] = 0x21; blk[2] = 0x02;
+		blk[3] = 0x80; blk[4] = 0x01;
+		reply = blk + 5;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(reply[32] == 0xFF && reply[0] == 0x00,
+		             "and a read gives zeroes and 0xFF", reply[32],
+		             0xFF, &bad);
+		groups++;
+	}
+
+	/* ---- 5. the motor register drives the real enable -------------- */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+		cs.emu_pak_present = 1;
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x23; blk[1] = 0x01; blk[2] = 0x03;
+		blk[3] = 0xC0; blk[4] = 0x1B;   /* address 0xC000, the motor */
+		memset(blk + 5, 0x01, 32);
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_enables == 1 && g_cmd_enable_last == 1,
+		             "writing 1 to 0xC000 turns the motor on",
+		             g_cmd_enable_last, 1, &bad);
+
+		memset(blk + 5, 0x00, 32);
+		blk[1] = 0x01;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_enables == 2 && g_cmd_enable_last == 0,
+		             "and writing 0 turns it off", g_cmd_enable_last, 0,
+		             &bad);
+
+		/* the identify region must NOT drive it */
+		blk[3] = 0x80; blk[4] = 0x01; blk[1] = 0x01;
+		memset(blk + 5, 0x01, 32);
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_enables == 2,
+		             "the identify region does not", g_cmd_enables, 2,
+		             &bad);
+
+		/* and neither does it with no accessory present */
+		cs.emu_pak_present = 0;
+		blk[3] = 0xC0; blk[4] = 0x1B; blk[1] = 0x01;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_enables == 2,
+		             "nor does it with no pak", g_cmd_enables, 2, &bad);
+		groups++;
+	}
+
+	/* ---- 6. the short form, and the borrowed status byte ----------- */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x04;          /* four command bytes */
+		blk[1] = 0x02;          /* two reply bytes    */
+		blk[2] = 0xAA; blk[3] = 0xBB; blk[4] = 0xCC; blk[5] = 0xDD;
+
+		/* status byte, then the two reply bytes */
+		g_cmd_reply[0] = 0x01;
+		g_cmd_reply[1] = 0x11;
+		g_cmd_reply[2] = 0x22;
+		g_cmd_reply_len = 3;
+
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_xfer_count == 1, "one transfer",
+		             g_cmd_xfer_count, 1, &bad);
+		sched_expect(g_cmd_xfers[0].setup[0] == 0xC0 &&
+		             g_cmd_xfers[0].setup[1] == 0x24,
+		             "bRequest is 0x20 plus the command length",
+		             g_cmd_xfers[0].setup[1], 0x24, &bad);
+		sched_expect(g_cmd_xfers[0].setup[2] == 0xAA &&
+		             g_cmd_xfers[0].setup[3] == 0xBB &&
+		             g_cmd_xfers[0].setup[4] == 0xCC &&
+		             g_cmd_xfers[0].setup[5] == 0xDD,
+		             "command bytes fill wValue then wIndex",
+		             g_cmd_xfers[0].setup[2], 0xAA, &bad);
+		sched_expect(g_cmd_xfers[0].len == 3,
+		             "and it reads reply length plus one",
+		             (long)g_cmd_xfers[0].len, 3, &bad);
+		sched_expect(g_cmd_xfers[0].keep == 0, "releasing the slot",
+		             g_cmd_xfers[0].keep, 0, &bad);
+		sched_expect(blk[5] == 0xDD,
+		             "the borrowed command byte is put back", blk[5],
+		             0xDD, &bad);
+		/* two reply bytes, reversed */
+		sched_expect(blk[6] == 0x22 && blk[7] == 0x11,
+		             "and the reply comes back reversed", blk[6], 0x22,
+		             &bad);
+		sched_expect((blk[1] & CORE_CMD_FAILED) == 0,
+		             "a non-zero status is success", 0, 0, &bad);
+
+		/* a zero status byte marks the entry */
+		cmd_reset_log();
+		blk[0] = 0x04; blk[1] = 0x02;
+		g_cmd_reply[0] = 0x00;
+		g_cmd_reply_len = 3;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect((blk[1] & CORE_CMD_FAILED) != 0,
+		             "a zero status marks it failed", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 7. the long form is two transfers, the first keeping ------ */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x08;          /* eight command bytes -> long form */
+		blk[1] = 0x03;          /* three reply bytes                */
+		for (i = 0; i < 8; i++) {
+			blk[2 + i] = (u8)(0xA0 + i);
+		}
+		/* status 0x80 | 3, then three reply bytes */
+		g_cmd_reply[0] = 0x83;
+		g_cmd_reply[1] = 0x01;
+		g_cmd_reply[2] = 0x02;
+		g_cmd_reply[3] = 0x03;
+		g_cmd_reply_len = 4;
+
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_claims == 1, "the slot is claimed once",
+		             g_cmd_claims, 1, &bad);
+		sched_expect(g_cmd_xfer_count == 2, "and there are two transfers",
+		             g_cmd_xfer_count, 2, &bad);
+		sched_expect(g_cmd_xfers[0].setup[0] == 0x40 &&
+		             g_cmd_xfers[0].setup[1] == 0x20,
+		             "the first is a host-to-device write",
+		             g_cmd_xfers[0].setup[0], 0x40, &bad);
+		sched_expect(g_cmd_xfers[0].setup[2] == 0x03 &&
+		             g_cmd_xfers[0].setup[3] == 0xA0,
+		             "carrying the reply length and the first command byte",
+		             g_cmd_xfers[0].setup[2], 0x03, &bad);
+		sched_expect(g_cmd_xfers[0].len == 5,
+		             "of command length minus three bytes",
+		             (long)g_cmd_xfers[0].len, 5, &bad);
+		sched_expect(g_cmd_xfers[0].keep == 1,
+		             "AND IT KEEPS THE SLOT", g_cmd_xfers[0].keep, 1,
+		             &bad);
+		sched_expect(g_cmd_xfers[1].setup[0] == 0xC0 &&
+		             g_cmd_xfers[1].setup[1] == 0x71 &&
+		             g_cmd_xfers[1].setup[2] == 0x30,
+		             "the second is the fixed 0x71 read",
+		             g_cmd_xfers[1].setup[1], 0x71, &bad);
+		sched_expect(g_cmd_xfers[1].keep == 0,
+		             "which releases it", g_cmd_xfers[1].keep, 0, &bad);
+		sched_expect(blk[9] == (u8)(0xA0 + 7),
+		             "the borrowed command byte is put back", blk[9],
+		             0xA7, &bad);
+		sched_expect(blk[10] == 0x03 && blk[12] == 0x01,
+		             "and the three reply bytes are reversed", blk[10],
+		             0x03, &bad);
+		sched_expect((blk[1] & CORE_CMD_FAILED) == 0,
+		             "status 0x80|len is success", 0, 0, &bad);
+
+		/* the status byte is a LENGTH: a mismatch is a failure */
+		cmd_reset_log();
+		blk[0] = 0x08; blk[1] = 0x03;
+		g_cmd_reply[0] = 0x82;      /* says two, we asked for three */
+		g_cmd_reply_len = 4;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect((blk[1] & CORE_CMD_FAILED) != 0,
+		             "a short length in the status marks it failed", 1,
+		             1, &bad);
+
+		cmd_reset_log();
+		blk[0] = 0x08; blk[1] = 0x03;
+		g_cmd_reply[0] = 0x03;      /* right length, valid bit clear */
+		g_cmd_reply_len = 4;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect((blk[1] & CORE_CMD_FAILED) != 0,
+		             "so does a clear valid bit", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 8. a busy slot is silent, and so is the long-and-wide gap - */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+		g_cmd_claim_ok = 0;
+
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x04; blk[1] = 0x02;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_xfer_count == 0,
+		             "a busy slot runs no transfer", g_cmd_xfer_count,
+		             0, &bad);
+		sched_expect((blk[1] & CORE_CMD_FAILED) == 0,
+		             "AND DOES NOT MARK THE ENTRY - defect", 0, 0,
+		             &bad);
+
+		/*
+		 * A command of five bytes or more that also wants four or more
+		 * back is rejected by the WALKER, which is what makes the
+		 * matching guard inside core_cmd_exec unreachable from here -
+		 * see the comment on it.
+		 */
+		cmd_reset_log();
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x05; blk[1] = 0x04;
+		blk[2] = 0x01; blk[3] = 0x04; blk[4] = 0x01;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_xfer_count == 0 && g_cmd_claims == 0,
+		             "a long command with a wide reply never runs",
+		             g_cmd_claims, 0, &bad);
+		sched_expect((blk[1] & CORE_CMD_FAILED) != 0,
+		             "the walker marks it structurally bad", 1, 1,
+		             &bad);
+		sched_expect(blk[5] == 0x00,
+		             "and stops before the next entry", blk[5], 0x00,
+		             &bad);
+
+		/* One byte narrower in either direction and it does run. */
+		cmd_reset_log();
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x05; blk[1] = 0x03;
+		core_cmd_process(&reg, blk, 0, 0);
+		sched_expect(g_cmd_claims == 1,
+		             "a three-byte reply is accepted", g_cmd_claims, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 9. the walk: padding, skip, end, and the two failure kinds  */
+	{
+		core_device_entry ent2;
+		core_state        cs2;
+
+		cmd_setup_one(&reg, &ent, &cs);
+		memset(&ent2, 0, sizeof(ent2));
+		memset(&cs2, 0, sizeof(cs2));
+		ent2.handle = 0x5678;
+		ent2.cs     = &cs2;
+		ent2.live   = 1;
+		core_registry_add(&reg, &ent2);
+		reg.live_count = 2;
+
+		cs.raw[0]  = 0x01; cs.raw[1]  = 0x02;
+		cs.raw[3]  = 0x03; cs.raw[4]  = 0x04;
+		cs2.raw[0] = 0x11; cs2.raw[1] = 0x12;
+		cs2.raw[3] = 0x13; cs2.raw[4] = 0x14;
+
+		/* padding, then an entry: the entry addresses adapter 1 */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = CORE_CMD_PAD;
+		blk[1] = 0x01; blk[2] = 0x04; blk[3] = 0x01;
+		blk[8] = CORE_CMD_END;
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect(blk[4] == 0x14 && blk[6] == 0x11,
+		             "padding advances the device index", blk[4], 0x14,
+		             &bad);
+
+		/* 0xFF skips a byte WITHOUT advancing it */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = CORE_CMD_SKIP;
+		blk[1] = 0x01; blk[2] = 0x04; blk[3] = 0x01;
+		blk[8] = CORE_CMD_END;
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect(blk[4] == 0x04 && blk[6] == 0x01,
+		             "but 0xFF does not", blk[4], 0x04, &bad);
+
+		/* 0xFE stops the walk before the entry after it */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = CORE_CMD_END;
+		blk[1] = 0x01; blk[2] = 0x04; blk[3] = 0x01;
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect(blk[4] == 0x00,
+		             "0xFE ends the block", blk[4], 0x00, &bad);
+
+		/*
+		 * A STRUCTURAL ERROR STOPS THE WALK, a missing device does not.
+		 * Two entries: the first over-long, the second valid. Only the
+		 * first is marked and the second is never reached.
+		 */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x30;          /* longer than CORE_CMD_MAX_LEN */
+		blk[1] = 0x01;
+		blk[2] = 0x01; blk[3] = 0x04; blk[4] = 0x01;
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect((blk[1] & CORE_CMD_FAILED) != 0,
+		             "an over-long command is marked", 1, 1, &bad);
+		sched_expect(blk[5] == 0x00 && (blk[3] & CORE_CMD_FAILED) == 0,
+		             "AND STOPS THE WALK", blk[5], 0x00, &bad);
+
+		/*
+		 * A missing device marks and CARRIES ON. Index 2 has no
+		 * adapter; the entry after it addresses index 3, also missing,
+		 * so both must be marked - which proves the walk continued.
+		 */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = CORE_CMD_PAD;
+		blk[1] = CORE_CMD_PAD;      /* index is now 2 */
+		blk[2] = 0x01; blk[3] = 0x04; blk[4] = 0x01;
+		blk[9] = 0x01; blk[10] = 0x04; blk[11] = 0x01;
+		blk[16] = CORE_CMD_END;
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect((blk[3] & CORE_CMD_FAILED) != 0 &&
+		             (blk[10] & CORE_CMD_FAILED) != 0,
+		             "a missing device marks and carries on",
+		             blk[10] & CORE_CMD_FAILED, CORE_CMD_FAILED, &bad);
+		groups++;
+	}
+
+	/* ---- 10. the identify updates the pak state and keep-alive ----- */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+		cs.keepalive_time  = 12345;
+		cs.emu_pak_present = 0;
+
+		/* three reply bytes with bit 0 set: an accessory is present */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x01; blk[1] = 0x03; blk[2] = 0x00;
+		/*
+		 * NOTE THE ORDER. The transport status byte comes first, then
+		 * the joybus reply AS THE ADAPTER RETURNS IT - reversed. A
+		 * controller identifies as 05 00 <status> on the bus, so over
+		 * USB that is <status> 00 05, and the driver reverses it back.
+		 */
+		g_cmd_reply[0] = 0x04;      /* transport status, non-zero = ok */
+		g_cmd_reply[1] = 0x01;      /* joybus status, bit 0 set        */
+		g_cmd_reply[2] = 0x00;
+		g_cmd_reply[3] = 0x05;
+		g_cmd_reply_len = 4;
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect(cs.emu_pak_present == 1,
+		             "bit 0 of the status byte is pak present",
+		             cs.emu_pak_present, 1, &bad);
+		sched_expect(cs.keepalive_time == 12345,
+		             "and bits 0..1 of 01 leave the keep-alive alone",
+		             (long)cs.keepalive_time, 12345, &bad);
+		sched_expect(blk[3] == 0x05 && blk[4] == 0x00 && blk[5] == 0x01,
+		             "the reply is back in joybus order", blk[3], 0x05,
+		             &bad);
+
+		/* bits 0..1 == 11: the accessory changed, drop the keep-alive */
+		cmd_reset_log();
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x01; blk[1] = 0x03; blk[2] = 0x00;
+		g_cmd_reply[0] = 0x04;
+		g_cmd_reply[1] = 0x03;      /* bits 0..1 both set: it changed */
+		g_cmd_reply[2] = 0x00;
+		g_cmd_reply[3] = 0x05;
+		g_cmd_reply_len = 4;
+		core_cmd_process(&reg, blk, 1, 0);
+		sched_expect(cs.keepalive_time == 0,
+		             "a changed accessory drops the keep-alive",
+		             (long)cs.keepalive_time, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 11. the read and write channel ---------------------------- */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+		core_cmd_channel_init(&ch);
+		cs.raw[0] = 0x11; cs.raw[1] = 0x22;
+		cs.raw[3] = 0x33; cs.raw[4] = 0x44;
+
+		/* a one-byte read is the adapter count */
+		memset(blk, 0, sizeof(blk));
+		st = core_cmd_read(&reg, &ch, blk, 1, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && blk[0] == 1 && info == 1,
+		             "a one-byte read is the adapter count", blk[0], 1,
+		             &bad);
+
+		/* write a block asking for the cached controller read */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x01; blk[1] = 0x04; blk[2] = 0x01;
+		blk[7] = CORE_CMD_END;
+		blk[CORE_CMD_GO] = 1;
+		st = core_cmd_write(&reg, &ch, blk, CORE_CMD_BLOCK_BYTES, 0,
+		                    &info);
+		sched_expect(st == CORE_ST_SUCCESS &&
+		             info == CORE_CMD_BLOCK_BYTES,
+		             "the write is accepted", (long)info,
+		             CORE_CMD_BLOCK_BYTES, &bad);
+		sched_expect(ch.swap_bytes == 0, "little-endian client",
+		             ch.swap_bytes, 0, &bad);
+
+		/* read it back: pass 1 runs and the go flag is cleared */
+		memset(blk, 0, sizeof(blk));
+		st = core_cmd_read(&reg, &ch, blk, CORE_CMD_BLOCK_BYTES, 0,
+		                   &info);
+		sched_expect(blk[3] == 0x44 && blk[6] == 0x22,
+		             "the read answers from the cache", blk[3], 0x44,
+		             &bad);
+		sched_expect(blk[CORE_CMD_GO] == 0,
+		             "the go flag is cleared in the copy",
+		             blk[CORE_CMD_GO], 0, &bad);
+		sched_expect(ch.block[CORE_CMD_GO] == 1,
+		             "BUT NOT IN THE CHANNEL, so a re-read re-polls",
+		             ch.block[CORE_CMD_GO], 1, &bad);
+
+		/* and it does re-poll - a fresh packet shows up next read */
+		cs.raw[4] = 0x99;
+		memset(blk, 0, sizeof(blk));
+		core_cmd_read(&reg, &ch, blk, CORE_CMD_BLOCK_BYTES, 0, &info);
+		sched_expect(blk[3] == 0x99,
+		             "a second read sees the newer packet", blk[3],
+		             0x99, &bad);
+		groups++;
+	}
+
+	/* ---- 12. the byte-order word is also the go flag --------------- */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+		core_cmd_channel_init(&ch);
+		cs.raw[0] = 0xA1; cs.raw[1] = 0xA2;
+		cs.raw[3] = 0xA3; cs.raw[4] = 0xA4;
+
+		/*
+		 * A big-endian client's block, written as it arrives: every
+		 * dword reversed. The entry 01 04 01 .. occupies dword 0, so
+		 * big-endian it is 00 01 04 01 at bytes 0..3 - and the
+		 * byte-order word is 00 00 00 01 at 0x3C, whose leading byte
+		 * is the 1 the driver looks for.
+		 */
+		memset(blk, 0, sizeof(blk));
+		blk[0] = 0x00; blk[1] = 0x01; blk[2] = 0x04; blk[3] = 0x01;
+		/* the terminator sits at byte 7 unswapped, so dword 1 */
+		blk[4] = CORE_CMD_END;
+		blk[CORE_CMD_SWAP_AT + 0] = 0x01;
+
+		st = core_cmd_write(&reg, &ch, blk, CORE_CMD_BLOCK_BYTES, 0,
+		                    &info);
+		sched_expect(st == CORE_ST_SUCCESS && ch.swap_bytes == 1,
+		             "a 1 at 0x3C selects byte-swapped", ch.swap_bytes,
+		             1, &bad);
+		sched_expect(ch.block[0] == 0x01 && ch.block[1] == 0x04,
+		             "the block is swapped on the way in", ch.block[0],
+		             0x01, &bad);
+		sched_expect(ch.block[CORE_CMD_GO] == 1,
+		             "AND THE SWAP WORD BECOMES THE GO FLAG",
+		             ch.block[CORE_CMD_GO], 1, &bad);
+
+		/* the read comes back swapped too */
+		memset(blk, 0, sizeof(blk));
+		core_cmd_read(&reg, &ch, blk, CORE_CMD_BLOCK_BYTES, 0, &info);
+		/*
+		 * The cached answer went to byte 3 of the block, and byte 3 of
+		 * a dword becomes byte 0 when it is reversed - so a big-endian
+		 * client reads its reply out of the same place it would have
+		 * put the command.
+		 */
+		sched_expect(blk[0] == 0xA4 && blk[1] == 0x01,
+		             "and the reply is swapped on the way out", blk[0],
+		             0xA4, &bad);
+		sched_expect(blk[3] == 0x01 && blk[2] == 0x04,
+		             "with the command bytes reversed with it", blk[3],
+		             0x01, &bad);
+		groups++;
+	}
+
+	/* ---- 13. what the channel refuses ------------------------------ */
+	{
+		cmd_setup_one(&reg, &ent, &cs);
+		core_cmd_channel_init(&ch);
+
+		sched_expect(core_cmd_read(&reg, &ch, blk, 0x41, 0, &info) ==
+		             CORE_ST_INVALID_PARAM,
+		             "a read longer than a block is refused", 1, 1,
+		             &bad);
+		sched_expect(core_cmd_write(&reg, &ch, blk, 0x20, 0, &info) ==
+		             CORE_ST_INVALID_PARAM,
+		             "so is a short write", 1, 1, &bad);
+		sched_expect(core_cmd_read(&reg, &ch, blk, 0, 0, &info) ==
+		             CORE_ST_SUCCESS,
+		             "a zero-length read succeeds", 1, 1, &bad);
+
+		/* with no adapter, only the one-byte read is allowed */
+		reg.live_count = 0;
+		sched_expect(core_cmd_read(&reg, &ch, blk, 1, 0, &info) ==
+		             CORE_ST_SUCCESS && blk[0] == 0,
+		             "the count is readable with no adapter", blk[0],
+		             0, &bad);
+		sched_expect(core_cmd_read(&reg, &ch, blk,
+		                           CORE_CMD_BLOCK_BYTES, 0, &info) ==
+		             CORE_ST_NO_SUCH_DEVICE,
+		             "but a block read is not", 1, 1, &bad);
+		sched_expect(core_cmd_write(&reg, &ch, blk,
+		                            CORE_CMD_BLOCK_BYTES, 0, &info) ==
+		             CORE_ST_NO_SUCH_DEVICE,
+		             "and neither is a write", 1, 1, &bad);
+		groups++;
+	}
+
+	hlog("SDK command block      : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ======================================================================
+ * POWER, THE CONTROL DEVICE AND THE NOTIFICATION IRPS
+ *
+ * The three things stage five added that are decisions rather than
+ * plumbing. What is checked here is the ORDER of the power protocol, the
+ * system-to-device mapping rule that is easy to get wrong, the two counts
+ * that between them decide when the control device dies, and the claim
+ * handshake on a cancelled waiter.
+ * ====================================================================== */
+
+static DEVICE_OBJECT     g_pw_dev;
+static ADAPTOID_DEVEXT   g_pw_ext;
+static HID_DEVICE_EXTENSION g_pw_hid;
+static DEVICE_OBJECT     g_pw_lower;
+static IO_STACK_LOCATION g_pw_sp;
+static IRP               g_pw_irp;
+
+static void power_setup(void)
+{
+	memset(&g_pw_ext, 0, sizeof(g_pw_ext));
+	AdaptoidDevExtInit(&g_pw_ext);
+	g_pw_ext.NextDeviceObject     = &g_pw_lower;
+	g_pw_ext.PhysicalDeviceObject = &g_pw_lower;
+	g_pw_ext.Started              = 1;
+	g_pw_ext.DevicePowerState     = ADAPTOID_POWER_D0;
+	/* AdaptoidDevExtInit leaves polling stopped for PnP, as it should;
+	 * these tests are about a device that is already running. */
+	g_pw_ext.PollStopMask         = 0;
+
+	g_pw_hid.MiniDeviceExtension = &g_pw_ext;
+	g_pw_dev.DeviceExtension     = &g_pw_hid;
+	/* AdaptoidDevExtOf is a harness stub that answers from here rather
+	 * than walking hidclass's extension, so it has to be pointed at this
+	 * device before any dispatch entry point is called. */
+	g_pnp_devext = &g_pw_ext;
+
+	memset(&g_pw_irp, 0, sizeof(g_pw_irp));
+	memset(&g_pw_sp, 0, sizeof(g_pw_sp));
+	g_pw_sp.MajorFunction         = IRP_MJ_POWER;
+	g_pw_irp.CurrentStackLocation = &g_pw_sp;
+	g_pw_irp.NextStackLocation    = &g_pw_sp;
+
+	power_reset();
+	g_power_requests       = 0;
+	g_power_complete       = NULL;
+	g_power_completion     = NULL;
+	g_irp_count            = 0;
+}
+
+static void power_irp(UCHAR minor, ULONG type, ULONG state)
+{
+	g_pw_sp.MajorFunction        = IRP_MJ_POWER;
+	g_pw_sp.MinorFunction        = minor;
+	g_pw_sp.Parameters.Power.Type  = (POWER_STATE_TYPE)type;
+	g_pw_sp.Parameters.Power.State.DeviceState =
+	        (DEVICE_POWER_STATE)state;
+	g_pw_irp.IoStatus.Status      = 0;
+	g_pw_irp.IoStatus.Information = 0;
+}
+
+/* Does the log start with "next down"? That is the power protocol. */
+static int power_next_before_down(void)
+{
+	return strncmp(g_power_log, "next down", 9) == 0;
+}
+
+static int test_power_and_control(void)
+{
+	int bad    = 0;
+	int groups = 0;
+
+	/* ---- 1. the system-to-device mapping rule ---------------------- */
+	{
+		power_setup();
+		g_pw_ext.Capabilities.DeviceState[2] = 2;   /* S1 -> D2 */
+		g_pw_ext.Capabilities.DeviceState[3] = 3;
+		g_pw_ext.Capabilities.DeviceWake     = 3;
+
+		sched_expect(AdaptoidDeviceStateFor(&g_pw_ext,
+		                                    ADAPTOID_POWER_S0) ==
+		             ADAPTOID_POWER_D0,
+		             "the working system state is always D0", 1, 1,
+		             &bad);
+
+		/*
+		 * THE RULE THAT IS EASY TO MISS. With no WAIT_WAKE armed the
+		 * device goes all the way to D3 whatever the capability table
+		 * says, because a light sleep buys nothing if it cannot wake
+		 * the machine.
+		 */
+		g_pw_ext.WaitWakePending = 0;
+		sched_expect(AdaptoidDeviceStateFor(&g_pw_ext, 2) ==
+		             ADAPTOID_POWER_D3,
+		             "with no wake armed it drops straight to D3",
+		             AdaptoidDeviceStateFor(&g_pw_ext, 2),
+		             ADAPTOID_POWER_D3, &bad);
+
+		g_pw_ext.WaitWakePending = 1;
+		sched_expect(AdaptoidDeviceStateFor(&g_pw_ext, 2) == 2,
+		             "with it armed the capability table decides",
+		             AdaptoidDeviceStateFor(&g_pw_ext, 2), 2, &bad);
+		sched_expect(AdaptoidDeviceStateFor(&g_pw_ext, 3) == 3,
+		             "and it is indexed by the system state",
+		             AdaptoidDeviceStateFor(&g_pw_ext, 3), 3, &bad);
+
+		/* out of range is bounded, which the original is not */
+		sched_expect(AdaptoidDeviceStateFor(&g_pw_ext, 99) ==
+		             ADAPTOID_POWER_D3,
+		             "an out-of-range system state is bounded", 1, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 2. a device power IRP down stops polling BEFORE passing on - */
+	{
+		power_setup();
+		AdaptoidPollStart(&g_pw_ext, 0);
+		sched_expect(g_pw_ext.PollStopMask == 0, "polling is running",
+		             (long)g_pw_ext.PollStopMask, 0, &bad);
+
+		power_irp(IRP_MN_SET_POWER, DevicePowerState, ADAPTOID_POWER_D3);
+		AdaptoidPower(&g_pw_dev, &g_pw_irp);
+
+		sched_expect((g_pw_ext.PollStopMask &
+		              ADAPTOID_STOP_REASON_POWER) != 0,
+		             "going down stops the poll", 1, 1, &bad);
+		sched_expect(g_pw_ext.DevicePowerState == ADAPTOID_POWER_D3,
+		             "and records the new state",
+		             (long)g_pw_ext.DevicePowerState,
+		             ADAPTOID_POWER_D3, &bad);
+		sched_expect(power_next_before_down(),
+		             "PoStartNextPowerIrp came before PoCallDriver", 1,
+		             1, &bad);
+		sched_expect(strstr(g_power_log, "completed") == NULL,
+		             "and no completion routine was attached", 1, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 3. coming back up restarts it IN THE COMPLETION ------------ */
+	{
+		power_setup();
+		AdaptoidPollStart(&g_pw_ext, 0);
+		power_irp(IRP_MN_SET_POWER, DevicePowerState, ADAPTOID_POWER_D3);
+		AdaptoidPower(&g_pw_dev, &g_pw_irp);
+
+		power_reset();
+		power_irp(IRP_MN_SET_POWER, DevicePowerState, ADAPTOID_POWER_D0);
+		AdaptoidPower(&g_pw_dev, &g_pw_irp);
+
+		sched_expect(strstr(g_power_log, "completed") != NULL,
+		             "coming up attaches a completion routine", 1, 1,
+		             &bad);
+		sched_expect((g_pw_ext.PollStopMask &
+		              ADAPTOID_STOP_REASON_POWER) == 0,
+		             "which is where the poll is restarted", 1, 1,
+		             &bad);
+		sched_expect(g_pw_ext.DevicePowerState == ADAPTOID_POWER_D0,
+		             "and where D0 is recorded",
+		             (long)g_pw_ext.DevicePowerState,
+		             ADAPTOID_POWER_D0, &bad);
+		groups++;
+	}
+
+	/* ---- 4. a system IRP is parked until the device one finishes ---- */
+	{
+		power_setup();
+		g_pw_ext.WaitWakePending = 1;
+		g_pw_ext.Capabilities.DeviceState[3] = 3;
+
+		power_irp(IRP_MN_SET_POWER, SystemPowerState, 3);
+		AdaptoidPower(&g_pw_dev, &g_pw_irp);
+
+		sched_expect(g_power_requests == 1 && g_power_requested == 3,
+		             "a device power IRP is requested for D3",
+		             (long)g_power_requested, 3, &bad);
+		sched_expect(g_pw_ext.PendingSystemPowerIrp == &g_pw_irp,
+		             "and the system IRP is PARKED, not completed", 1,
+		             1, &bad);
+		sched_expect(strstr(g_power_log, "down") == NULL,
+		             "nothing went down yet", 1, 1, &bad);
+
+		/* the bus finishes the device IRP */
+		power_run_completion();
+		sched_expect(g_pw_ext.PendingSystemPowerIrp == NULL,
+		             "the completion releases the parked IRP", 1, 1,
+		             &bad);
+		sched_expect(strstr(g_power_log, "next down") != NULL,
+		             "and only then passes it down, next first", 1, 1,
+		             &bad);
+
+		/* asking for the state it is already in skips the request */
+		power_setup();
+		g_pw_ext.WaitWakePending = 1;
+		g_pw_ext.Capabilities.DeviceState[3] = ADAPTOID_POWER_D0;
+		power_irp(IRP_MN_SET_POWER, SystemPowerState, 3);
+		AdaptoidPower(&g_pw_dev, &g_pw_irp);
+		sched_expect(g_power_requests == 0,
+		             "no request when already in the right state",
+		             g_power_requests, 0, &bad);
+		sched_expect(power_next_before_down(),
+		             "it is just passed down", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 5. wait-wake is refused when it cannot help ---------------- */
+	{
+		power_setup();
+		g_pw_ext.DevicePowerState        = ADAPTOID_POWER_D0;
+		g_pw_ext.Capabilities.DeviceWake = 3;
+
+		power_irp(IRP_MN_WAIT_WAKE, 0, 0);
+		sched_expect(AdaptoidPower(&g_pw_dev, &g_pw_irp) ==
+		             STATUS_INVALID_DEVICE_STATE,
+		             "wake is refused while the device is in D0", 1, 1,
+		             &bad);
+		sched_expect(g_pw_ext.WaitWakePending == 0,
+		             "and nothing is armed",
+		             (long)g_pw_ext.WaitWakePending, 0, &bad);
+
+		/*
+		 * AND SEPARATELY, with a wake state that would otherwise be
+		 * acceptable. Without this case the first half of the
+		 * condition is never the one doing the refusing, and a
+		 * reimplementation could drop it unnoticed.
+		 */
+		power_setup();
+		g_pw_ext.DevicePowerState        = ADAPTOID_POWER_D0;
+		g_pw_ext.Capabilities.DeviceWake = ADAPTOID_POWER_D0;
+		power_irp(IRP_MN_WAIT_WAKE, 0, 0);
+		sched_expect(AdaptoidPower(&g_pw_dev, &g_pw_irp) ==
+		             STATUS_INVALID_DEVICE_STATE,
+		             "being in D0 alone is enough to refuse it", 1, 1,
+		             &bad);
+
+		/* deeper than the hardware can wake from is refused too */
+		power_setup();
+		g_pw_ext.DevicePowerState        = 2;
+		g_pw_ext.Capabilities.DeviceWake = 3;
+		power_irp(IRP_MN_WAIT_WAKE, 0, 0);
+		sched_expect(AdaptoidPower(&g_pw_dev, &g_pw_irp) ==
+		             STATUS_INVALID_DEVICE_STATE,
+		             "and when the device is shallower than its wake "
+		             "state", 1, 1, &bad);
+
+		/* but accepted when both conditions hold */
+		power_setup();
+		g_pw_ext.DevicePowerState        = 3;
+		g_pw_ext.Capabilities.DeviceWake = 2;
+		power_irp(IRP_MN_WAIT_WAKE, 0, 0);
+		AdaptoidPower(&g_pw_dev, &g_pw_irp);
+		sched_expect(power_next_before_down(),
+		             "otherwise it is armed and passed down", 1, 1,
+		             &bad);
+		sched_expect(g_pw_ext.WakeIdleDeviceState == 2,
+		             "with the wake state recorded",
+		             (long)g_pw_ext.WakeIdleDeviceState, 2, &bad);
+		groups++;
+	}
+
+	/* ---- 6. the remove lock is balanced on every path --------------- */
+	{
+		static const struct { UCHAR minor; ULONG type; ULONG state; }
+		vec[] = {
+			{ IRP_MN_SET_POWER, DevicePowerState, ADAPTOID_POWER_D3 },
+			{ IRP_MN_SET_POWER, DevicePowerState, ADAPTOID_POWER_D0 },
+			{ IRP_MN_SET_POWER, SystemPowerState, ADAPTOID_POWER_S0 },
+			{ 0x7F,             0,                0 }
+		};
+		int i;
+
+		for (i = 0; i < 4; i++) {
+			LONG before;
+
+			power_setup();
+			before = g_pw_ext.RemoveLockB.IoCount;
+			power_irp(vec[i].minor, vec[i].type, vec[i].state);
+			AdaptoidPower(&g_pw_dev, &g_pw_irp);
+			sched_expect(g_pw_ext.RemoveLockB.IoCount == before,
+			             "the power path balances its remove lock",
+			             g_pw_ext.RemoveLockB.IoCount, before,
+			             &bad);
+		}
+
+		/* and a device being removed refuses the IRP outright */
+		power_setup();
+		g_pw_ext.RemoveLockA.Removed = 1;
+		g_pw_ext.RemoveLockB.Removed = 1;
+		power_irp(IRP_MN_SET_POWER, DevicePowerState, ADAPTOID_POWER_D3);
+		sched_expect(!NT_SUCCESS(AdaptoidPower(&g_pw_dev, &g_pw_irp)),
+		             "a removed device refuses power", 1, 1, &bad);
+		sched_expect(strstr(g_power_log, "next") != NULL,
+		             "still calling PoStartNextPowerIrp first", 1, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 7. the idle gate that can never wake ---------------------- */
+	{
+		power_setup();
+		g_pw_ext.WakeIdleDeviceState = 3;
+		g_pw_ext.AbortedPipeCount    = 0;
+
+		/* The request reaches the bus, so the status is the bus's -
+		 * what matters is that a request was made at all. */
+		AdaptoidUpdateIdlePower(&g_pw_ext, 1);
+		sched_expect(g_power_requests == 1,
+		             "idling is allowed with no aborted pipes",
+		             g_power_requests, 1, &bad);
+		sched_expect(g_power_requested == 3, "into the wake state",
+		             (long)g_power_requested, 3, &bad);
+
+		/*
+		 * THE DEAD HALF. Waking needs AbortedPipeCount non-zero, and
+		 * nothing in the driver ever increments it - so this can never
+		 * fire in the original either. Checked so that the day someone
+		 * "fixes" the counter, the change is visible.
+		 */
+		power_setup();
+		g_pw_ext.WakeIdleDeviceState = 3;
+		g_pw_ext.AbortedPipeCount    = 0;
+		sched_expect(AdaptoidUpdateIdlePower(&g_pw_ext, 0) ==
+		             STATUS_SUCCESS && g_power_requests == 0,
+		             "waking is refused with the count at zero",
+		             g_power_requests, 0, &bad);
+
+		/* a request already in flight blocks another */
+		power_setup();
+		g_pw_ext.WakeIdleDeviceState   = 3;
+		g_pw_ext.PowerRequestInProgress = 1;
+		sched_expect(AdaptoidUpdateIdlePower(&g_pw_ext, 1) ==
+		             STATUS_SUCCESS && g_power_requests == 0,
+		             "and so is a second request", g_power_requests, 0,
+		             &bad);
+
+		/* as does a device that is not ready */
+		power_setup();
+		g_pw_ext.WakeIdleDeviceState = 3;
+		g_pw_ext.Started             = 0;
+		sched_expect(AdaptoidUpdateIdlePower(&g_pw_ext, 1) ==
+		             STATUS_DELETE_PENDING,
+		             "an unstarted device is not idled", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 8. the enable keep-alive window ---------------------------- */
+	{
+		power_setup();
+		core_init(&g_pw_ext.Core, harness_sink, &g_pw_ext);
+		g_urb_count = 0;
+		g_urb_ret   = STATUS_PENDING;
+
+		/* nothing sent yet, so the window is long past */
+		g_pw_ext.Core.keepalive_time = 0;
+		clock_advance_ms(10000);
+		AdaptoidSetDeviceEnable(&g_pw_ext, 1);
+		sched_expect(g_urb_setup.bRequest ==
+		             ADAPTOID_ENABLE_START_REQUEST,
+		             "outside the window it is the full start",
+		             g_urb_setup.bRequest,
+		             ADAPTOID_ENABLE_START_REQUEST, &bad);
+		sched_expect(g_pw_ext.Core.keepalive_time != 0,
+		             "and the window is opened", 1, 1, &bad);
+
+		/* inside it, one short kick and no re-initialisation */
+		g_pw_ext.Vendor.State = 0;
+		clock_advance_ms(1000);
+		AdaptoidSetDeviceEnable(&g_pw_ext, 1);
+		sched_expect(g_urb_setup.bRequest ==
+		             ADAPTOID_ENABLE_KICK_REQUEST &&
+		             g_urb_setup.wIndex == ADAPTOID_ENABLE_KICK_INDEX,
+		             "inside it, only the short kick",
+		             g_urb_setup.bRequest,
+		             ADAPTOID_ENABLE_KICK_REQUEST, &bad);
+
+		/* past three seconds it starts over */
+		g_pw_ext.Vendor.State = 0;
+		clock_advance_ms(3001);
+		AdaptoidSetDeviceEnable(&g_pw_ext, 1);
+		sched_expect(g_urb_setup.bRequest ==
+		             ADAPTOID_ENABLE_START_REQUEST,
+		             "past three seconds it starts over",
+		             g_urb_setup.bRequest,
+		             ADAPTOID_ENABLE_START_REQUEST, &bad);
+		groups++;
+	}
+
+	/* ---- 9. a busy slot: off defers, on is refused ------------------ */
+	{
+		power_setup();
+		core_init(&g_pw_ext.Core, harness_sink, &g_pw_ext);
+		core_set_vendor(&g_pw_ext.Core, harness_vendor, 0);
+		g_urb_count = 0;
+		g_urb_ret   = STATUS_PENDING;
+
+		g_pw_ext.Vendor.State = 1;          /* somebody else has it */
+		sched_expect(AdaptoidSetDeviceEnable(&g_pw_ext, 1) ==
+		             STATUS_DEVICE_BUSY,
+		             "switching on a busy device is refused", 1, 1,
+		             &bad);
+		sched_expect(g_pw_ext.Core.claim_idle_command == 0,
+		             "and nothing is deferred",
+		             g_pw_ext.Core.claim_idle_command, 0, &bad);
+
+		sched_expect(AdaptoidSetDeviceEnable(&g_pw_ext, 0) ==
+		             STATUS_DEVICE_BUSY,
+		             "switching off is refused too", 1, 1, &bad);
+		sched_expect(g_pw_ext.Core.claim_idle_command == 1,
+		             "BUT IT IS DEFERRED - a lost off leaves a motor "
+		             "running", g_pw_ext.Core.claim_idle_command, 1,
+		             &bad);
+
+		/* and the deferred drain picks it up first */
+		g_pw_ext.Core.claim_effect_tick = 1;
+		g_bus_count = 0;
+		g_bus_busy  = 0;
+		core_effect_run_deferred(&g_pw_ext.Core, KeQueryInterruptTime());
+		sched_expect(g_bus_cur.bRequest == CORE_FX_CMD_STOP &&
+		             g_bus_cur.wIndex == CORE_FX_IDLE_INDEX,
+		             "the drain sends the idle command before the tick",
+		             g_bus_cur.wIndex, CORE_FX_IDLE_INDEX, &bad);
+		sched_expect(g_pw_ext.Core.claim_idle_command == 0,
+		             "clearing its claim",
+		             g_pw_ext.Core.claim_idle_command, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 10. the control device's two reference counts -------------- */
+	{
+		PADAPTOID_CDO_EXT cx;
+		DRIVER_OBJECT     drv;
+		IRP               irp;
+		IO_STACK_LOCATION sp;
+
+		memset(&drv, 0, sizeof(drv));
+		g_devices_created = g_devices_deleted = 0;
+		g_links_created   = g_links_deleted   = 0;
+
+		sched_expect(NT_SUCCESS(AdaptoidCreateControlDevice(&drv)) &&
+		             g_devices_created == 1 && g_links_created == 1,
+		             "the first adapter creates the control device",
+		             g_devices_created, 1, &bad);
+		cx = AdaptoidControlDeviceExt();
+		sched_expect(cx != NULL && cx->Magic[0] == ADAPTOID_CDO_MAGIC0,
+		             "with its magic in place", 1, 1, &bad);
+
+		sched_expect(NT_SUCCESS(AdaptoidCreateControlDevice(&drv)) &&
+		             g_devices_created == 1,
+		             "a second adapter shares it", g_devices_created, 1,
+		             &bad);
+
+		AdaptoidReleaseControlDevice();
+		sched_expect(g_devices_deleted == 0,
+		             "one leaving does not delete it",
+		             g_devices_deleted, 0, &bad);
+		AdaptoidReleaseControlDevice();
+		sched_expect(g_devices_deleted == 1 && g_links_deleted == 1,
+		             "the last one does", g_devices_deleted, 1, &bad);
+
+		/*
+		 * AND THE OTHER WAY ROUND: an open handle keeps the device
+		 * alive past the last adapter. Both counts have to reach zero,
+		 * and either can be last.
+		 */
+		g_devices_created = g_devices_deleted = 0;
+		AdaptoidCreateControlDevice(&drv);
+		cx = AdaptoidControlDeviceExt();
+		cx->Registry.live_count = 1;
+
+		memset(&irp, 0, sizeof(irp));
+		memset(&sp, 0, sizeof(sp));
+		irp.CurrentStackLocation = &sp;
+		irp.NextStackLocation    = &sp;
+		sched_expect(NT_SUCCESS(AdaptoidControlCreate(cx->Self, &irp)) &&
+		             cx->OpenCount == 1,
+		             "a handle opens", cx->OpenCount, 1, &bad);
+
+		AdaptoidReleaseControlDevice();
+		sched_expect(g_devices_deleted == 0,
+		             "the last adapter leaving does not delete it "
+		             "while a handle is open", g_devices_deleted, 0,
+		             &bad);
+		AdaptoidControlClose(cx->Self, &irp);
+		sched_expect(g_devices_deleted == 1,
+		             "closing the handle does", g_devices_deleted, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 11. a failed creation does not count as a user ------------- */
+	{
+		DRIVER_OBJECT drv;
+
+		memset(&drv, 0, sizeof(drv));
+		g_devices_created = g_devices_deleted = 0;
+		g_links_created   = g_links_deleted   = 0;
+
+		g_create_device_fails = 1;
+		sched_expect(!NT_SUCCESS(AdaptoidCreateControlDevice(&drv)),
+		             "a failed creation reports failure", 1, 1, &bad);
+		g_create_device_fails = 0;
+
+		/*
+		 * THE ORIGINAL COUNTS IT ANYWAY. drv_CreateControlDevice
+		 * increments its reference count outside the success test, so
+		 * a device that was never made has a user. Here the next
+		 * successful creation must still be the FIRST one.
+		 */
+		sched_expect(NT_SUCCESS(AdaptoidCreateControlDevice(&drv)),
+		             "and a later one succeeds", 1, 1, &bad);
+		AdaptoidReleaseControlDevice();
+		sched_expect(g_devices_deleted == 1,
+		             "with a balanced count - one release deletes it",
+		             g_devices_deleted, 1, &bad);
+
+		/* a symlink failure unwinds the device too */
+		g_devices_created = g_devices_deleted = 0;
+		g_create_link_fails = 1;
+		sched_expect(!NT_SUCCESS(AdaptoidCreateControlDevice(&drv)) &&
+		             g_devices_created == 1 && g_devices_deleted == 1,
+		             "a symlink failure unwinds the device",
+		             g_devices_deleted, 1, &bad);
+		g_create_link_fails = 0;
+		groups++;
+	}
+
+	/* ---- 12. notification IRPs: park, deliver, cancel --------------- */
+	{
+		PADAPTOID_CDO_EXT cx;
+		DRIVER_OBJECT     drv;
+		IRP               irp[3];
+		IO_STACK_LOCATION sp[3];
+		FILE_OBJECT       fo[2];
+		UCHAR             buf[3][CORE_NOTIFY_BYTES];
+		int               i;
+
+		memset(&drv, 0, sizeof(drv));
+		AdaptoidCreateControlDevice(&drv);
+		cx = AdaptoidControlDeviceExt();
+		cx->Registry.live_count = 1;
+
+		for (i = 0; i < 3; i++) {
+			memset(&irp[i], 0, sizeof(irp[i]));
+			memset(&sp[i], 0, sizeof(sp[i]));
+			irp[i].CurrentStackLocation = &sp[i];
+			irp[i].NextStackLocation    = &sp[i];
+			irp[i].SystemBuffer         = buf[i];
+			sp[i].FileObject            = &fo[i < 2 ? 0 : 1];
+			memset(buf[i], 0, sizeof(buf[i]));
+		}
+		g_irp_count = 0;
+
+		sched_expect(AdaptoidWaitNotification(cx, &irp[0]) ==
+		             STATUS_PENDING,
+		             "a waiter with no event parks", 1, 1, &bad);
+		sched_expect(irp[0].PendingReturned != 0,
+		             "marked pending", 1, 1, &bad);
+		sched_expect(irp[0].CancelRoutine != NULL,
+		             "with a cancel routine", 1, 1, &bad);
+		sched_expect(g_irp_count == 0, "and not completed",
+		             g_irp_count, 0, &bad);
+
+		/* an event finds it */
+		core_notify_post(&cx->Registry.notify, CORE_EVENT_DEBUG, 7, 0);
+		sched_expect(g_irp_count == 1,
+		             "an event completes the parked waiter",
+		             g_irp_count, 1, &bad);
+		sched_expect(irp[0].IoStatus.Information == CORE_NOTIFY_BYTES,
+		             "with twelve bytes",
+		             (long)irp[0].IoStatus.Information,
+		             CORE_NOTIFY_BYTES, &bad);
+		sched_expect(buf[0][4] == 7,
+		             "carrying the event's argument", buf[0][4], 7,
+		             &bad);
+
+		/*
+		 * CANCELLATION SELECTS BY FILE OBJECT. Waiters 0 and 1 share
+		 * one handle, waiter 2 has another; cancelling by waiter 1's
+		 * IRP must take only the first handle's.
+		 */
+		g_irp_count = 0;
+		AdaptoidWaitNotification(cx, &irp[0]);
+		AdaptoidWaitNotification(cx, &irp[1]);
+		AdaptoidWaitNotification(cx, &irp[2]);
+		AdaptoidCancelNotifications(cx, &irp[1]);
+		sched_expect(g_irp_count == 2,
+		             "cancelling one handle takes only its waiters",
+		             g_irp_count, 2, &bad);
+		sched_expect(irp[2].IoStatus.Status != STATUS_CANCELLED,
+		             "the other handle's is untouched", 1, 1, &bad);
+		sched_expect(irp[0].IoStatus.Status == STATUS_CANCELLED,
+		             "and the cancelled ones say so", 1, 1, &bad);
+
+		/* NULL takes everything */
+		g_irp_count = 0;
+		AdaptoidCancelNotifications(cx, NULL);
+		sched_expect(g_irp_count == 1,
+		             "and NULL takes what is left", g_irp_count, 1,
+		             &bad);
+
+		/*
+		 * A WAITER ALREADY CLAIMED IS DROPPED, NOT COMPLETED TWICE.
+		 * g_claim_refuse is what a completion already in flight looks
+		 * like from here - the harness owns AdaptoidClaimIrp, so
+		 * clearing the IRP's cancel routine by hand would prove
+		 * nothing.
+		 */
+		g_irp_count    = 0;
+		g_claim_refuse = 1;
+		AdaptoidWaitNotification(cx, &irp[0]);
+		AdaptoidCancelNotifications(cx, NULL);
+		g_claim_refuse = 0;
+		sched_expect(g_irp_count == 0,
+		             "a waiter already claimed is not completed twice",
+		             g_irp_count, 0, &bad);
+
+		cx->Registry.live_count = 0;
+		AdaptoidReleaseControlDevice();
+		groups++;
+	}
+
+	hlog("Power and control dev  : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
 int main(int argc, char **argv)
 {
 	DRIVER_OBJECT        driver;
@@ -6816,6 +8493,13 @@ int main(int argc, char **argv)
 	int                  i;
 	int                  count;
 	int                  bad = 0;
+
+	/*
+	 * UNBUFFERED. A test group that crashes takes the whole buffer with
+	 * it otherwise, and "no output at all" is the least useful thing a
+	 * failing harness can say.
+	 */
+	setvbuf(stdout, NULL, _IONBF, 0);
 
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-v") == 0) {
@@ -6878,6 +8562,8 @@ int main(int argc, char **argv)
 	bad += test_triage_pnp();
 	bad += test_input_path();
 	bad += test_naming_recovery();
+	bad += test_command_block();
+	bad += test_power_and_control();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

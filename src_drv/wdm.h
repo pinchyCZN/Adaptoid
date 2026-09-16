@@ -17,9 +17,18 @@
 #else
 #include <ntddk.h>
 #include <hidport.h>
+/* The USB layer. usbdi.h must come before usbdlib.h, and usbioctl.h brings
+ * the IOCTL_INTERNAL_USB_* codes the port recovery sends. */
+#include <usbdi.h>
+#include <usbdlib.h>
+#include <usbioctl.h>
 #endif
 
 #include "core.h"
+#include "ioctl.h"
+
+/* How many system power states DEVICE_CAPABILITIES.DeviceState maps. */
+#define ADAPTOID_SYSTEM_STATE_MAX  PowerSystemMaximum
 
 /*
  * The per-device extension.
@@ -95,6 +104,14 @@ typedef struct _ADAPTOID_VENDOR_SLOT {
 	PVOID      Urb;
 	ADAPTOID_VENDOR_CALLBACK Callback;
 
+	/*
+	 * Signalled when a transfer has finished, for the ONE caller that
+	 * waits: AdaptoidQueryFirmwareInfo, which runs at PASSIVE_LEVEL
+	 * during start and needs the answer before it can name the device.
+	 * Nothing else on this transport blocks.
+	 */
+	KEVENT     Done;
+
 	/* The last transfer's outcome, which the pending IRP inherits. */
 	NTSTATUS   LastStatus;
 	ULONG      LastInformation;
@@ -108,6 +125,9 @@ typedef struct _ADAPTOID_SETUP {
 	USHORT wValue;
 	USHORT wIndex;
 } ADAPTOID_SETUP, *PADAPTOID_SETUP;
+
+/* "Where am I on the bus?" - see AdaptoidQueryFirmwareInfo. */
+#define ADAPTOID_REQUEST_BUS_ADDRESS 0x75
 
 #define ADAPTOID_VENDOR_OUT     0x40u
 #define ADAPTOID_VENDOR_IN      0xC0u
@@ -199,6 +219,33 @@ int AdaptoidRouteOf(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 #define ADAPTOID_POLL_SLOTS     2
 #define ADAPTOID_POLL_BYTES     CORE_RAW_PACKET_BYTES
+
+/*
+ * The pool tag, which shows as "Adp0" in a pool dump. The original uses
+ * "Wish"; a replacement wants its own so the two can be told apart if they
+ * are ever loaded on the same machine.
+ */
+/* "Adp0" as it appears in a pool dump. Written as the number rather than a
+ * four-character constant, which overflows an int and warns. */
+#define ADAPTOID_POOL_TAG       0x30706441UL
+
+/*
+ * How large the first configuration-descriptor fetch asks for. Generous on
+ * purpose - this adapter's is a small fraction of it, so the fetch normally
+ * costs one round trip rather than two. wTotalLength drives the retry when
+ * it is not enough.
+ */
+#define ADAPTOID_CONFIG_FIRST_TRY 0x209
+
+/*
+ * What a poll completion is handed. The slot NUMBER rather than a pointer to
+ * it, so the completion can reach the extension as well - and embedded in
+ * the extension so submitting a read allocates nothing but the URB and IRP.
+ */
+typedef struct _ADAPTOID_POLL_CONTEXT {
+	struct _ADAPTOID_DEVEXT *DevExt;
+	ULONG                    Slot;
+} ADAPTOID_POLL_CONTEXT, *PADAPTOID_POLL_CONTEXT;
 
 typedef struct _ADAPTOID_POLL_SLOT {
 	/*
@@ -361,6 +408,236 @@ NTSTATUS AdaptoidUsbGetPortStatus(struct _ADAPTOID_DEVEXT *DevExt,
 NTSTATUS AdaptoidUsbResetPort(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidUsbCyclePort(struct _ADAPTOID_DEVEXT *DevExt);
 
+/* ======================================================================
+ * POWER
+ *
+ * THE DRIVER IS ITS OWN POWER POLICY OWNER. It does not simply pass power
+ * IRPs down: it maps system states to device states itself, out of the
+ * DEVICE_CAPABILITIES it fetched at start, and asks for the device IRP that
+ * the mapping calls for.
+ *
+ * It also supports REMOTE WAKE, which for a 2001 game controller is unusual
+ * and is easy to lose in a reimplementation - IRP_MN_WAIT_WAKE is accepted
+ * whenever the device is out of D0 and the machine is no deeper than the
+ * state the device can wake from.
+ *
+ * Two device-extension fields carry all of it, and the original's names for
+ * them are misleading enough to be worth restating. DevicePowerState is the
+ * CURRENT D-state; the original calls it SystemPowerState even though
+ * drv_PrepareDevicePowerChange writes D1..D3 into it directly.
+ * WakeIdleDeviceState is the state the device idles into, which is also the
+ * deepest it can wake from; the original calls it PowerState.
+ * ====================================================================== */
+
+/* Device power states, as the Power.State parameter carries them. */
+#define ADAPTOID_POWER_D0       1
+#define ADAPTOID_POWER_D3       4
+
+/* System power states. S0 is 1, matching PowerSystemWorking. */
+#define ADAPTOID_POWER_S0       1
+
+NTSTATUS AdaptoidPowerWaitWake(struct _ADAPTOID_DEVEXT *DevExt, PIRP Irp);
+
+/*
+ * The device state to move to for a given system state.
+ *
+ * THREE RULES, IN ORDER: the working system state always means D0; with no
+ * wake armed the device drops straight to D3 whatever the capabilities say;
+ * otherwise the capability table decides.
+ *
+ * Pure, so it is testable without a power IRP - which matters, because the
+ * middle rule is the one a reimplementation gets wrong.
+ */
+ULONG AdaptoidDeviceStateFor(struct _ADAPTOID_DEVEXT *DevExt,
+                             ULONG SystemState);
+
+/*
+ * Decide what a device power transition needs before it is passed down, and
+ * do it. Returns non-zero if the transition needs a completion routine.
+ *
+ * Going DOWN is done here and needs no completion: polling is stopped and
+ * I/O quiesced before the bus driver is allowed to remove power. Coming UP
+ * is the other way round - nothing can be restarted until the bus driver has
+ * actually powered the device, so that work happens in the completion, which
+ * is what the non-zero return asks for.
+ */
+int AdaptoidPrepareDevicePower(struct _ADAPTOID_DEVEXT *DevExt, ULONG State);
+
+/*
+ * Move the device between its idle and working states, if it may.
+ *
+ * GoIdle non-zero asks to drop to WakeIdleDeviceState, zero asks to return
+ * to D1. Returns the status of the request, or success having done nothing.
+ *
+ * THE AbortedPipeCount GATE IS DEAD IN THE ORIGINAL. Idling is refused while
+ * it is non-zero and waking is refused while it is zero, and NOTHING IN THE
+ * DRIVER EVER INCREMENTS IT - so the wake half can never run and the idle
+ * half always passes. Reproduced, because a replacement that "fixes" it
+ * silently changes when the device powers down.
+ */
+NTSTATUS AdaptoidUpdateIdlePower(struct _ADAPTOID_DEVEXT *DevExt,
+                                 int GoIdle);
+
+/* Is the device in a state where a power request makes sense? */
+int AdaptoidIsDeviceReady(struct _ADAPTOID_DEVEXT *DevExt);
+
+/*
+ * THE OS EDGE OF POWER: ask the bus for a device power IRP, naming the
+ * completion that finishes whatever this request was for. Two callers with
+ * two different completions, which is why the routine is a parameter and not
+ * a fixed choice inside.
+ */
+NTSTATUS AdaptoidRequestPowerIrp(struct _ADAPTOID_DEVEXT *DevExt, ULONG State,
+                                 PREQUEST_POWER_COMPLETE Complete);
+
+/* Ask for an idle transition on this driver's own behalf. */
+NTSTATUS AdaptoidRequestDevicePower(struct _ADAPTOID_DEVEXT *DevExt,
+                                    ULONG State);
+
+void NTAPI AdaptoidSystemPowerComplete(PDEVICE_OBJECT DeviceObject,
+                                       UCHAR MinorFunction,
+                                       POWER_STATE PowerState,
+                                       PVOID Context,
+                                       PIO_STATUS_BLOCK IoStatus);
+void NTAPI AdaptoidIdlePowerComplete(PDEVICE_OBJECT DeviceObject,
+                                     UCHAR MinorFunction,
+                                     POWER_STATE PowerState,
+                                     PVOID Context,
+                                     PIO_STATUS_BLOCK IoStatus);
+
+/* The DPC that drives the script scheduler. */
+void NTAPI AdaptoidScriptDpc(PKDPC Dpc, PVOID Context, PVOID Arg1,
+                             PVOID Arg2);
+
+/* ======================================================================
+ * THE DEVICE ENABLE, AND THE KEEP-ALIVE WINDOW
+ *
+ * Turning the adapter on is not one vendor request but two, chosen by HOW
+ * RECENTLY the last one went out:
+ *
+ *   inside three seconds of the last poke   a short kick, bRequest 0x32
+ *   otherwise                               the full start, bRequest 0x72,
+ *                                           whose completion then sends the
+ *                                           same 0x32 kick
+ *
+ * so a device that is already running is not re-initialised. Turning it off
+ * is always the single idle command.
+ *
+ * A BUSY VENDOR SLOT IS HANDLED ASYMMETRICALLY. Switching off defers - the
+ * claim flag is set and the deferred-work drain will send it - while
+ * switching on is simply dropped and STATUS_DEVICE_BUSY returned. That is
+ * the safe way round, and deliberate: a missed "off" leaves a motor running.
+ * ====================================================================== */
+
+/* Three seconds, in 100ns units. */
+#define ADAPTOID_KEEPALIVE_100NS  30000000ULL
+
+/*
+ * The two enable sequences, as they go on the wire. The kick and the idle
+ * command share bRequest 0x32 and are told apart by wValue and wIndex, which
+ * is worth naming rather than leaving as four bare numbers.
+ */
+#define ADAPTOID_ENABLE_KICK_REQUEST   0x32
+#define ADAPTOID_ENABLE_KICK_VALUE     0x0002
+#define ADAPTOID_ENABLE_KICK_INDEX     0xFE80
+#define ADAPTOID_ENABLE_START_REQUEST  0x72
+#define ADAPTOID_ENABLE_START_VALUE    0x0022
+#define ADAPTOID_ENABLE_START_INDEX    0x0094
+
+NTSTATUS AdaptoidSetDeviceEnable(struct _ADAPTOID_DEVEXT *DevExt, int On);
+void     AdaptoidQueryFirmwareInfo(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidCancelVendorRequest(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidNotifyInterfaceChange(struct _ADAPTOID_DEVEXT *DevExt,
+                                       int Live);
+NTSTATUS NTAPI AdaptoidPassThroughDeviceControl(PDEVICE_OBJECT DeviceObject,
+                                                PIRP Irp);
+/* Publish this adapter's device interface; AddDevice's last step. */
+NTSTATUS AdaptoidRegisterDeviceInterface(struct _ADAPTOID_DEVEXT *DevExt);
+/* One DWORD out of the driver's service key, or Default if it is absent. */
+ULONG    AdaptoidRegQueryDword(PUNICODE_STRING RegistryPath,
+                               PCWSTR Name, ULONG Default);
+void     AdaptoidSendIdleCommand(struct _ADAPTOID_DEVEXT *DevExt);
+
+/* ======================================================================
+ * THE CONTROL DEVICE OBJECT
+ *
+ * One singleton for the whole driver, created on the first adapter's arrival
+ * and deleted with the last. It carries the registry every adapter registers
+ * into, the driver-wide notification queue, and the SDK command-block
+ * channel - all three of which are ioctl.c's, so what is here is the object,
+ * the symbolic link and the reference count.
+ *
+ * THE REFERENCE COUNT IS THE SUBTLE PART, and the original gets it wrong:
+ * drv_CreateControlDevice increments it even when IoCreateDevice FAILED, so
+ * a failed creation still counts as a user. See known-defects.txt.
+ * ====================================================================== */
+
+/*
+ * The names user mode reaches it by. \.\Wish_NA1 in the original, kept
+ * because the SDK's own clients open it by that name and a replacement that
+ * renames it is not a replacement.
+ *
+ * The device type 0xB98C is the same value the private IOCTL codes encode,
+ * which is a useful consistency check when decoding them.
+ */
+#define ADAPTOID_CDO_NAME        L"\\Device\\Wish_NA1"
+#define ADAPTOID_CDO_LINK        L"\\DosDevices\\Wish_NA1"
+#define ADAPTOID_CDO_DEVICE_TYPE 0xB98C
+
+typedef struct _ADAPTOID_CDO_EXT {
+	/* What every dispatch wrapper tests to recognise this device. It has
+	 * to be first, because that test runs on an extension whose type is
+	 * not yet known. */
+	ULONG            Magic[3];
+	PDEVICE_OBJECT   Self;
+
+	/* All three of the control device's surfaces live in ioctl.c. */
+	core_registry    Registry;
+	core_cmd_channel Channel;
+
+	KSPIN_LOCK       Lock;
+	LONG             OpenCount;
+} ADAPTOID_CDO_EXT, *PADAPTOID_CDO_EXT;
+
+/* 0x78 bytes in the original; ours is larger because the queue and the
+ * registry are inside it rather than in pool. */
+NTSTATUS AdaptoidCreateControlDevice(PDRIVER_OBJECT DriverObject);
+void     AdaptoidReleaseControlDevice(void);
+
+/* Delete the singleton when neither an adapter nor a handle needs it. */
+void     AdaptoidControlMaybeDelete(void);
+
+/* The singleton, or NULL. Does NOT take a reference - unlike the original's
+ * drv_AcquireControlDeviceExt, which takes one and then leaks it on one of
+ * its two failure paths. See known-defects.txt section 16. */
+PADAPTOID_CDO_EXT AdaptoidControlDeviceExt(void);
+
+/* ======================================================================
+ * THE NOTIFICATION WAITER
+ *
+ * core_notify owns the queue; what is here is the IRP. A waiter is embedded
+ * in the IRP's driver context so that no allocation can fail on this path,
+ * and the cancel routine claims it with the same interlocked exchange the
+ * report queue uses.
+ * ====================================================================== */
+
+/* Park this IRP on the queue. Returns STATUS_PENDING if it parked. */
+/*
+ * WHERE THE WAITER LIVES. In the IRP's own driver context, which the DDK
+ * gives a driver four pointers of while it owns the request - a
+ * core_notify_waiter is three. Parking it there rather than allocating means
+ * queueing a notification has no failure path at all.
+ */
+#define ADAPTOID_IRP_WAITER(Irp) \
+    ((core_notify_waiter *)ADAPTOID_IRP_CONTEXT(Irp))
+
+void     AdaptoidNotifyInit(PADAPTOID_CDO_EXT CdoExt);
+NTSTATUS AdaptoidWaitNotification(PADAPTOID_CDO_EXT CdoExt, PIRP Irp);
+
+/* Cancel every parked waiter, or only those belonging to one file object.
+ * Irp names the handle; NULL means all of them. */
+void AdaptoidCancelNotifications(PADAPTOID_CDO_EXT CdoExt, PIRP Irp);
+
 typedef struct _ADAPTOID_DEVEXT {
 	PDEVICE_OBJECT  Self;
 	PDEVICE_OBJECT  NextDeviceObject;
@@ -386,6 +663,8 @@ typedef struct _ADAPTOID_DEVEXT {
 	/* The polling engine. */
 	KSPIN_LOCK          PollLock;
 	ADAPTOID_POLL_SLOT  PollSlot[ADAPTOID_POLL_SLOTS];
+	ADAPTOID_POLL_CONTEXT PollContext[ADAPTOID_POLL_SLOTS];
+	PVOID               PollWorkItem;   /* PIO_WORKITEM */
 	ULONG               PollStopMask;
 	ULONG               PollRestartPending;
 
@@ -416,6 +695,55 @@ typedef struct _ADAPTOID_DEVEXT {
 	/* How to walk the hubs. Filled at AddDevice; a seam so that naming
 	 * can be tested against a topology that does not exist. */
 	ADAPTOID_TOPOLOGY    Topology;
+
+	/*
+	 * The script scheduler, and the timer and DPC that drive it. The
+	 * scheduler itself is OS-free; what is here is only what wakes it.
+	 */
+	core_sched           Sched;
+	KTIMER               ScriptTimer;
+	KDPC                 ScriptDpc;
+	KSPIN_LOCK           ScriptLock;
+	/*
+	 * NOT A BOOLEAN, AND IT STARTS AT -1. The scheduler DPC increments it
+	 * only while it is non-negative and decrements only while it is
+	 * positive, so it stays latched at -1 until something else lifts it,
+	 * and the report builder tests it for >= 0 to decide whether a script
+	 * owns the stick. See drv_ScriptSchedulerDpc (00017910).
+	 */
+	LONG                 ScriptDepth;
+
+	/* This adapter's row in the driver-wide registry. */
+	core_device_entry    Registration;
+
+	/* ---- power ---- */
+	DEVICE_CAPABILITIES  Capabilities;
+	ULONG                DevicePowerState;     /* D0 = 1 .. D3 = 4      */
+	ULONG                WakeIdleDeviceState;  /* and the deepest wake  */
+	ULONG                WaitWakePending;
+	ULONG                PowerRequestInProgress;
+	PIRP                 PendingSystemPowerIrp;
+	/*
+	 * NOTHING EVER INCREMENTS THIS, in the original or here. It gates the
+	 * idle transition in AdaptoidUpdateIdlePower, and it is kept so that
+	 * the gate behaves as the original's does.
+	 */
+	LONG                 AbortedPipeCount;
+
+	/*
+	 * ---- USB configuration ----
+	 *
+	 * Held as PVOID rather than as their USB types so that kstub.h does
+	 * not have to reproduce the USB headers for a harness that never
+	 * touches any of them.
+	 */
+	PVOID                ConfigDescriptor;    /* PUSB_CONFIGURATION_... */
+	PVOID                ConfigurationHandle; /* USBD_CONFIGURATION_HANDLE */
+	PVOID                InterfaceInfo;       /* PUSBD_INTERFACE_INFO... */
+	PVOID                InterruptPipe;       /* USBD_PIPE_HANDLE        */
+
+	/* The device interface this adapter is published under. */
+	UNICODE_STRING       InterfaceName;
 } ADAPTOID_DEVEXT, *PADAPTOID_DEVEXT;
 
 /*
@@ -472,6 +800,7 @@ NTSTATUS AdaptoidVendorSubmitUrb(struct _ADAPTOID_DEVEXT *DevExt,
 #define ADAPTOID_STOP_REASON_PNP    4
 #define ADAPTOID_STOP_REASON_REMOVE 8
 #define ADAPTOID_STOP_REASON_ERROR  1
+#define ADAPTOID_STOP_REASON_POWER  0x20
 
 /*
  * Where an IRP's queue link lives. The DDK puts it in Tail.Overlay; the
@@ -479,10 +808,19 @@ NTSTATUS AdaptoidVendorSubmitUrb(struct _ADAPTOID_DEVEXT *DevExt,
  */
 #ifdef ADAPTOID_USERMODE
 #define ADAPTOID_IRP_LIST_ENTRY(Irp)  (&(Irp)->ListEntry)
-#define ADAPTOID_IRP_FROM_ENTRY(e)    	((PIRP)((char *)(e) - (char *)&(((PIRP)0)->ListEntry)))
+#define ADAPTOID_IRP_FROM_ENTRY(e)    \
+    ((PIRP)((char *)(e) - (char *)&(((PIRP)0)->ListEntry)))
+#define ADAPTOID_IRP_CONTEXT(Irp)     ((PVOID)(Irp)->DriverContext)
+/* METHOD_BUFFERED gives one buffer for both directions; the DDK keeps it
+ * inside a union the harness has no reason to reproduce. */
+#define ADAPTOID_IRP_BUFFER(Irp)      ((Irp)->SystemBuffer)
 #else
 #define ADAPTOID_IRP_LIST_ENTRY(Irp)  (&(Irp)->Tail.Overlay.ListEntry)
-#define ADAPTOID_IRP_FROM_ENTRY(e)    	CONTAINING_RECORD((e), IRP, Tail.Overlay.ListEntry)
+#define ADAPTOID_IRP_FROM_ENTRY(e)    \
+    CONTAINING_RECORD((e), IRP, Tail.Overlay.ListEntry)
+/* Four pointers a driver may use while it owns the IRP. */
+#define ADAPTOID_IRP_CONTEXT(Irp)     ((PVOID)(Irp)->Tail.Overlay.DriverContext)
+#define ADAPTOID_IRP_BUFFER(Irp)      ((Irp)->AssociatedIrp.SystemBuffer)
 #endif
 
 void     AdaptoidDevExtInit(struct _ADAPTOID_DEVEXT *DevExt);
@@ -517,7 +855,6 @@ void     AdaptoidFreeDeviceResources(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidEnableInterface(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidRegistryRemove(struct _ADAPTOID_DEVEXT *DevExt);
 void     AdaptoidSetCompletionRoutine(PIRP Irp, PVOID Event);
-void     AdaptoidStartNextPowerIrp(PIRP Irp);
 
 /* The control device and private channel handlers, stage three. */
 NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp);

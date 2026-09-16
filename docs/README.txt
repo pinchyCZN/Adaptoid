@@ -63,6 +63,12 @@ Table of Contents
    |                       | wishd201.exe and wishk201.sys, with its     |
    |                       | input and output buffer layout.             |
    +-----------------------+---------------------------------------------+
+   | command-block.txt     | DONE. The control device's OTHER surface:   |
+   |                       | the 64-byte joybus command block the vendor |
+   |                       | SDK's clients read and write, its two-pass  |
+   |                       | execution, and the Rumble Pak the driver    |
+   |                       | emulates rather than putting on the wire.   |
+   +-----------------------+---------------------------------------------+
    | script-bytecode.txt   | DONE. The flex/bison compiler and the       |
    |                       | 32-bit opcode format it emits.              |
    +-----------------------+---------------------------------------------+

@@ -257,6 +257,76 @@ int  core_notify_cancel(core_notify *n, core_notify_waiter *w);
  * does closing the control device. */
 void core_notify_flush(core_notify *n);
 
+/* ======================================================================
+ * THE SDK COMMAND-BLOCK CHANNEL
+ *
+ * The control device's OTHER user-mode surface. Alongside its eleven IOCTLs
+ * it answers IRP_MJ_READ and IRP_MJ_WRITE, and what flows over those is a
+ * 64-byte block of N64 JOYBUS COMMANDS - the simple interface the vendor SDK
+ * documents, as against the IOCTLs the configurator itself uses.
+ *
+ * A block is a sequence of variable-length entries:
+ *
+ *     +------+------+--------------------+------------------+
+ *     | 0x00 | 0x01 | 0x02 .. 0x01+CMD   | .. + REPLY       |
+ *     +======+======+====================+==================+
+ *     | CMD  | RPLY | the command bytes  | space for the    |
+ *     | len  | len  | to put on the bus  | controller reply |
+ *     +------+------+--------------------+------------------+
+ *
+ * with three length bytes that are not lengths at all:
+ *
+ *     0x00   padding. Skip one byte AND ADVANCE THE DEVICE INDEX.
+ *     0xFE   end of block.
+ *     0xFF   skip one byte, device index unchanged.
+ *
+ * Each real entry addresses the Nth adapter, N counting entries so far, so
+ * position in the block is what selects the controller - a block can poll
+ * four adapters in one transfer. Bit 0x80 in the reply-length byte is how a
+ * failed entry is reported back.
+ *
+ * TWO PASSES, WHICH IS THE WHOLE TRICK. A write runs pass 0 and a read runs
+ * pass 1, over the same block. Pass 1 handles the two entries the driver can
+ * answer from state it already has; pass 0 handles everything else, on the
+ * wire. So the common case - "read the controller" - costs a read call and
+ * NO USB TRAFFIC AT ALL, because the answer comes out of the interrupt-poll
+ * cache. A game polling at 60Hz never touches the bus.
+ *
+ * See ../docs/command-block.txt.
+ * ====================================================================== */
+
+#define CORE_CMD_BLOCK_BYTES    0x40    /* one block, fixed                */
+#define CORE_CMD_GO             0x3F    /* the go flag, last byte of it    */
+#define CORE_CMD_SWAP_AT        0x3C    /* the byte-order word             */
+#define CORE_CMD_MAX_LEN        0x26    /* largest command or reply        */
+#define CORE_CMD_MAX_DEVICES    5       /* entries per block               */
+#define CORE_CMD_FAILED         0x80    /* set in the reply-length byte    */
+#define CORE_CMD_LEN_MASK       0x3F
+
+/* The entry lengths that are not lengths. */
+#define CORE_CMD_PAD            0x00
+#define CORE_CMD_END            0xFE
+#define CORE_CMD_SKIP           0xFF
+
+/*
+ * THE TRANSPORT SEAM, in two halves because the original distinguishes them.
+ *
+ * cmd_claim takes the adapter's vendor slot and returns non-zero on success;
+ * a busy slot means the entry is skipped. cmd_xfer runs one control transfer
+ * and returns the status.
+ *
+ * keep IS THE INTERESTING ARGUMENT. A long-form command is two transfers,
+ * a write carrying the command and a read collecting the reply, and nothing
+ * may be interleaved between them. keep non-zero on the first says "hold the
+ * slot, another transfer follows"; zero on the last releases it. That is
+ * exactly the distinction between drv_VendorRequestCompleteKeepSlot
+ * (00018d10) and drv_VendorRequestComplete (00018cf0), two functions whose
+ * only difference is the value they return.
+ */
+typedef int (*core_cmd_claim_fn)(void *ctx);
+typedef u32 (*core_cmd_xfer_fn)(void *ctx, const u8 *setup, u8 *data,
+                                u32 len, int keep);
+
 /* ---- the device registry ---------------------------------------------- */
 
 /*
@@ -275,6 +345,22 @@ typedef struct core_device_entry {
 	core_sched *sched;
 	int         live;       /* its device interface is enabled */
 	int         needs_resubmit;
+
+	/*
+	 * THE OS SEAMS FOR THIS ADAPTER. A request that arrives on the
+	 * control device names a device by handle and is then executed
+	 * against it, so the transport cannot come from the caller's
+	 * environment the way it does on the per-device surface - it has to
+	 * be reachable from the registry entry.
+	 *
+	 * All four may be null, in which case the affected requests fail
+	 * rather than reaching a device.
+	 */
+	core_ioctl_vendor_fn vendor;
+	core_ioctl_enable_fn enable;
+	core_cmd_claim_fn    cmd_claim;
+	core_cmd_xfer_fn     cmd_xfer;
+	void                *os_ctx;
 } core_device_entry;
 
 typedef struct core_registry {
@@ -315,5 +401,69 @@ void core_registry_set_live(core_registry *reg, core_device_entry *dev,
  */
 u32 core_ctl_dispatch(core_registry *reg, const core_ioctl *req,
                       core_notify_waiter *waiter, u64 now_100ns, u32 *info);
+
+/* ---- the command-block channel ---------------------------------------- */
+
+/*
+ * The channel's own state, one instance per control device.
+ *
+ * block IS THE DRIVER'S COPY, not the caller's. A write stores into it and a
+ * read hands it back, so the two directions share one buffer and a client
+ * can write a block of commands and then read the answers out of it.
+ *
+ * swap_bytes REMEMBERS A BIG-ENDIAN CLIENT. A write whose dword at
+ * CORE_CMD_SWAP_AT is 1 is byte-swapped on the way in and every subsequent
+ * read is byte-swapped on the way out. Note what that word becomes after
+ * swapping its own dword: byte 0x3C moves to 0x3F, which is the go flag. A
+ * big-endian client therefore cannot write a block WITHOUT asking for it to
+ * run. That is the original's behaviour, not an accident of this port.
+ */
+typedef struct core_cmd_channel {
+	u8  block[CORE_CMD_BLOCK_BYTES];
+	int swap_bytes;
+} core_cmd_channel;
+
+void core_cmd_channel_init(core_cmd_channel *ch);
+
+/*
+ * Walk one block, executing the entries this pass owns.
+ *
+ * pass 1 answers from cached state: the controller-state read (command 0x01
+ * reply 4) entirely, and the identify (command 0x01 reply 3) by running it
+ * and then updating the emulated Pak state from the result. pass 0 runs
+ * everything else through the transport.
+ *
+ * Failures are marked in place with CORE_CMD_FAILED, and there are TWO KINDS
+ * of them: a structural error - a length out of range, too many entries, an
+ * entry running off the end - marks the entry and STOPS the walk, while a
+ * missing device or an over-long reply marks it and CARRIES ON. The original
+ * distinguishes these by whether the failure path returns or falls through,
+ * and a client can tell them apart by whether later entries were answered.
+ */
+void core_cmd_process(core_registry *reg, u8 *block, int pass, u64 now_100ns);
+
+/*
+ * Execute one entry against one adapter. entry[0] is the command length and
+ * entry[1] the reply length, already masked.
+ *
+ * Three paths, and only one of them reaches the bus - see the comment on the
+ * definition for what the driver emulates and why.
+ */
+void core_cmd_exec(core_device_entry *dev, u8 *entry);
+
+/*
+ * The IRP_MJ_READ and IRP_MJ_WRITE halves of the channel.
+ *
+ * buf is the caller's buffer and len its length, both directions. *info
+ * receives the byte count for IoStatus.Information.
+ *
+ * A one-byte READ is the live adapter count and is the ONE request allowed
+ * when no adapter is present, so a client can poll for arrival. Everything
+ * else needs a device and a length of exactly CORE_CMD_BLOCK_BYTES.
+ */
+u32 core_cmd_read(core_registry *reg, core_cmd_channel *ch, u8 *buf, u32 len,
+                  u64 now_100ns, u32 *info);
+u32 core_cmd_write(core_registry *reg, core_cmd_channel *ch, u8 *buf, u32 len,
+                   u64 now_100ns, u32 *info);
 
 #endif /* ADAPTOID_IOCTL_H */

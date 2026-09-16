@@ -62,6 +62,7 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	mj[IRP_MJ_CREATE]                  = AdaptoidChannelCreate;
 	mj[IRP_MJ_CLOSE]                   = AdaptoidChannelClose;
 	mj[IRP_MJ_INTERNAL_DEVICE_CONTROL] = AdaptoidIntDeviceControl;
+	mj[IRP_MJ_DEVICE_CONTROL]          = AdaptoidPassThroughDeviceControl;
 	mj[IRP_MJ_PNP]                     = AdaptoidPnp;
 	mj[IRP_MJ_POWER]                   = AdaptoidPower;
 	DriverObject->DriverUnload         = AdaptoidUnload;
@@ -418,6 +419,10 @@ void AdaptoidVendorComplete(PADAPTOID_DEVEXT DevExt, NTSTATUS Status,
 		}
 	}
 
+	/* Signalled unconditionally: the one waiter is only ever waiting for
+	 * "this transfer is over", not for a particular outcome. */
+	KeSetEvent(&slot->Done, IO_NO_INCREMENT, FALSE);
+
 	if (held) {
 		AdaptoidLockRelease(&DevExt->RemoveLockA);
 	}
@@ -453,32 +458,6 @@ void AdaptoidCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG Information)
  * STILL A STUB: the URB layout needs usbdi.h and there is no device to send
  * it to yet.
  */
-NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
-                                 const ADAPTOID_SETUP *Setup,
-                                 ULONG TransferLength, PVOID TransferBuffer)
-{
-	UNREFERENCED_PARAMETER(DevExt);
-	UNREFERENCED_PARAMETER(Setup);
-	UNREFERENCED_PARAMETER(TransferLength);
-	UNREFERENCED_PARAMETER(TransferBuffer);
-	return STATUS_NOT_IMPLEMENTED;
-}
-/*
- * The OS edge of the poll loop and the read queue. Like
- * AdaptoidVendorSubmitUrb these have two definitions selected by
- * ADAPTOID_USERMODE - harness.c supplies observable ones - and one origin
- * row each; see origin.txt.
- *
- * STAGE FOUR: the URB build needs usbdi.h and there is no device to send it
- * to yet.
- */
-NTSTATUS AdaptoidPollSubmit(PADAPTOID_DEVEXT DevExt, ULONG Slot)
-{
-	UNREFERENCED_PARAMETER(DevExt);
-	UNREFERENCED_PARAMETER(Slot);
-	return STATUS_NOT_IMPLEMENTED;
-}
-
 void AdaptoidFreePollIrp(PIRP Irp, PVOID Urb)
 {
 	if (Urb != NULL) {
@@ -492,11 +471,6 @@ void AdaptoidFreePollIrp(PIRP Irp, PVOID Urb)
 void AdaptoidCancelIrp(PIRP Irp)
 {
 	IoCancelIrp(Irp);
-}
-
-void AdaptoidQueuePollRestart(PADAPTOID_DEVEXT DevExt)
-{
-	UNREFERENCED_PARAMETER(DevExt);
 }
 
 /*
@@ -522,25 +496,6 @@ NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
 	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, Length);
 	AdaptoidLockRelease(&DevExt->RemoveLockB);
 	return STATUS_SUCCESS;
-}
-
-/* STAGE FIVE: these need usbdi.h and a live bus. */
-NTSTATUS AdaptoidUsbGetPortStatus(PADAPTOID_DEVEXT DevExt, ULONG *Status)
-{
-	UNREFERENCED_PARAMETER(DevExt);
-	*Status = 0;
-	return STATUS_NOT_IMPLEMENTED;
-}
-
-NTSTATUS AdaptoidUsbResetPort(PADAPTOID_DEVEXT DevExt)
-{
-	UNREFERENCED_PARAMETER(DevExt);
-	return STATUS_NOT_IMPLEMENTED;
-}
-
-void AdaptoidUsbCyclePort(PADAPTOID_DEVEXT DevExt)
-{
-	UNREFERENCED_PARAMETER(DevExt);
 }
 
 #endif /* !ADAPTOID_USERMODE */
@@ -693,7 +648,14 @@ NTSTATUS NTAPI AdaptoidPnpTriage(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 NTSTATUS NTAPI AdaptoidPowerTriage(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
 	if (AdaptoidRouteOf(DeviceObject, Irp) == ADAPTOID_ROUTE_CONTROL) {
-		AdaptoidStartNextPowerIrp(Irp);
+		/*
+		 * THE ORIGINAL DOES NOT DO THIS. drv_PowerTriage completes a
+		 * control-device power IRP without calling PoStartNextPowerIrp
+		 * first, which stalls the power queue for that device object -
+		 * the one path in the driver that breaks a rule its own
+		 * adapter dispatcher keeps everywhere. See known-defects.txt.
+		 */
+		PoStartNextPowerIrp(Irp);
 		return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
 		       STATUS_NOT_SUPPORTED;
 	}
@@ -738,6 +700,9 @@ NTSTATUS AdaptoidStartDevice(PADAPTOID_DEVEXT DevExt)
 	}
 
 	DevExt->Started = 1;
+	/* The name is a hub path found by matching this address, so the
+	 * address has to be known first. */
+	AdaptoidQueryFirmwareInfo(DevExt);
 	AdaptoidSetDeviceName(DevExt);
 	AdaptoidPollStart(DevExt, ADAPTOID_STOP_REASON_PNP);
 	AdaptoidEnableInterface(DevExt);
@@ -936,66 +901,574 @@ PADAPTOID_DEVEXT AdaptoidDevExtOf(PDEVICE_OBJECT DeviceObject)
 	        ->MiniDeviceExtension);
 }
 
+/* ------------------------------------------------------------------ */
+/* the USB layer                                                       */
+/*                                                                     */
+/* Driver build only. Everything above this line decides WHAT to send; */
+/* this decides how to put it on the wire, and it is the one part of   */
+/* the driver the harness cannot exercise - there is no bus to talk to.*/
+/* ------------------------------------------------------------------ */
+
+/*
+ * Send one IRP down and wait for it. The bus driver's port requests and the
+ * descriptor fetch are all synchronous, and all three want the same eleven
+ * lines, so they share them.
+ */
+static NTSTATUS NTAPI SyncComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                                   PVOID Context)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+	UNREFERENCED_PARAMETER(Irp);
+	KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+static NTSTATUS SendInternalIoctlSync(PADAPTOID_DEVEXT DevExt, ULONG Code,
+                                      PVOID Argument1, PVOID Argument2)
+{
+	KEVENT             done;
+	IO_STATUS_BLOCK    io;
+	PIRP               irp;
+	PIO_STACK_LOCATION sl;
+	NTSTATUS           st;
+
+	KeInitializeEvent(&done, NotificationEvent, FALSE);
+	irp = IoBuildDeviceIoControlRequest(Code, DevExt->NextDeviceObject,
+	                                    NULL, 0, NULL, 0, TRUE, &done,
+	                                    &io);
+	if (irp == NULL) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	sl = IoGetNextIrpStackLocation(irp);
+	sl->Parameters.Others.Argument1 = Argument1;
+	sl->Parameters.Others.Argument2 = Argument2;
+	/*
+	 * IoBuildDeviceIoControlRequest already set the event; the completion
+	 * routine below would double-signal it, so this one is left to the
+	 * I/O manager and only the wait is ours.
+	 */
+	st = IoCallDriver(DevExt->NextDeviceObject, irp);
+	if (st == STATUS_PENDING) {
+		KeWaitForSingleObject(&done, Executive, KernelMode, FALSE,
+		                      NULL);
+		st = io.Status;
+	}
+	return st;
+}
+
+/* Put one URB on the bus and wait for it. */
+static NTSTATUS SubmitUrbSync(PADAPTOID_DEVEXT DevExt, PURB Urb)
+{
+	return SendInternalIoctlSync(DevExt, IOCTL_INTERNAL_USB_SUBMIT_URB,
+	                             Urb, NULL);
+}
+
+/*
+ * Fetch the configuration descriptor, growing the buffer until the whole of
+ * it fits.
+ *
+ * THE FIRST ASK IS DELIBERATELY GENEROUS - one page and change - because a
+ * descriptor that fits first time saves a round trip, and this adapter's is
+ * far smaller than that. wTotalLength in the reply says how much there
+ * really is; anything larger than what was asked for means the reply was
+ * truncated and the fetch is repeated at the size it named.
+ */
+/* The URB type's own name runs past eighty columns everywhere it is used. */
+typedef struct _URB_CONTROL_DESCRIPTOR_REQUEST DESC_REQUEST;
+
 NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 {
-	UNREFERENCED_PARAMETER(DevExt);
+	PURB     urb;
+	ULONG    size = ADAPTOID_CONFIG_FIRST_TRY;
+	NTSTATUS st;
+
+	urb = (PURB)ExAllocatePoolWithTag(NonPagedPool, sizeof(DESC_REQUEST),
+	                                  ADAPTOID_POOL_TAG);
+	if (urb == NULL) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	for (;;) {
+		PUSB_CONFIGURATION_DESCRIPTOR cd;
+
+		DevExt->ConfigDescriptor =
+		        ExAllocatePoolWithTag(NonPagedPool, size,
+		                              ADAPTOID_POOL_TAG);
+		if (DevExt->ConfigDescriptor == NULL) {
+			ExFreePool(urb);
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+
+		UsbBuildGetDescriptorRequest(urb, (USHORT)sizeof(DESC_REQUEST),
+		        USB_CONFIGURATION_DESCRIPTOR_TYPE, 0, 0,
+		        DevExt->ConfigDescriptor, NULL, size, NULL);
+		st = SubmitUrbSync(DevExt, urb);
+
+		cd = (PUSB_CONFIGURATION_DESCRIPTOR)DevExt->ConfigDescriptor;
+		if (!NT_SUCCESS(st) ||
+		    urb->UrbControlDescriptorRequest.TransferBufferLength == 0) {
+			break;
+		}
+		if (cd->wTotalLength <= size) {
+			break;              /* the whole of it arrived */
+		}
+		/* Truncated. Try again at the size the device named. */
+		size = cd->wTotalLength;
+		ExFreePool(DevExt->ConfigDescriptor);
+		DevExt->ConfigDescriptor = NULL;
+	}
+
+	ExFreePool(urb);
+	if (DevExt->ConfigDescriptor == NULL) {
+		return STATUS_DEVICE_DATA_ERROR;
+	}
+	/*
+	 * The original tail-calls drv_SelectConfiguration from here.
+	 * AdaptoidStartDevice makes that call instead, so the start sequence
+	 * reads in one place rather than half of it hiding inside the fetch.
+	 */
 	return STATUS_SUCCESS;
 }
 
+/*
+ * Select the one configuration and its one interface, and keep the pipe the
+ * controller state arrives on.
+ *
+ * THE INTERRUPT IN PIPE IS FOUND BY TYPE AND DIRECTION, not by index. The
+ * adapter has exactly one, but reading it out of the descriptor rather than
+ * assuming pipe 0 is what makes this survive a firmware revision that adds
+ * another endpoint.
+ */
 NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
 {
-	UNREFERENCED_PARAMETER(DevExt);
+	PUSB_CONFIGURATION_DESCRIPTOR cd =
+	        (PUSB_CONFIGURATION_DESCRIPTOR)DevExt->ConfigDescriptor;
+	USBD_INTERFACE_LIST_ENTRY     list[2];
+	PUSBD_INTERFACE_INFORMATION   info;
+	PURB                          urb;
+	NTSTATUS                      st;
+	ULONG                         i;
+
+	if (cd == NULL) {
+		return STATUS_DEVICE_DATA_ERROR;
+	}
+	list[0].InterfaceDescriptor =
+	        USBD_ParseConfigurationDescriptorEx(cd, cd, -1, -1, -1, -1, -1);
+	list[0].Interface = NULL;
+	list[1].InterfaceDescriptor = NULL;
+	list[1].Interface = NULL;
+	if (list[0].InterfaceDescriptor == NULL) {
+		return STATUS_DEVICE_DATA_ERROR;
+	}
+
+	urb = USBD_CreateConfigurationRequestEx(cd, list);
+	if (urb == NULL) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	st = SubmitUrbSync(DevExt, urb);
+	if (!NT_SUCCESS(st)) {
+		ExFreePool(urb);
+		return st;
+	}
+
+	DevExt->ConfigurationHandle =
+	        urb->UrbSelectConfiguration.ConfigurationHandle;
+
+	info = list[0].Interface;
+	DevExt->InterfaceInfo =
+	        ExAllocatePoolWithTag(NonPagedPool, info->Length,
+	                              ADAPTOID_POOL_TAG);
+	if (DevExt->InterfaceInfo == NULL) {
+		ExFreePool(urb);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	RtlCopyMemory(DevExt->InterfaceInfo, info, info->Length);
+	info = (PUSBD_INTERFACE_INFORMATION)DevExt->InterfaceInfo;
+
+	DevExt->InterruptPipe = NULL;
+	for (i = 0; i < info->NumberOfPipes; i++) {
+		if (info->Pipes[i].PipeType == UsbdPipeTypeInterrupt &&
+		    USB_ENDPOINT_DIRECTION_IN(
+		            info->Pipes[i].EndpointAddress)) {
+			DevExt->InterruptPipe = info->Pipes[i].PipeHandle;
+			break;
+		}
+	}
+	ExFreePool(urb);
+	if (DevExt->InterruptPipe == NULL) {
+		return STATUS_DEVICE_DATA_ERROR;
+	}
 	return STATUS_SUCCESS;
 }
 
-
-
-
-void AdaptoidQuiesceIo(PADAPTOID_DEVEXT DevExt)
-{ UNREFERENCED_PARAMETER(DevExt); }
-
+/*
+ * Drop the configuration. A SELECT_CONFIGURATION with a null descriptor is
+ * the USB way of saying "unconfigured", and it is what invalidates every
+ * pipe handle - so nothing may be in flight when it goes out.
+ */
 void AdaptoidUnconfigureDevice(PADAPTOID_DEVEXT DevExt)
-{ UNREFERENCED_PARAMETER(DevExt); }
+{
+	PURB  urb;
+	/*
+	 * NOT GET_SELECT_CONFIGURATION_REQUEST_SIZE(0, 0). That macro
+	 * subtracts one from the interface count before multiplying, so at
+	 * zero interfaces it underflows - the compiler says so. An
+	 * unconfigure request carries no interface array, so the bare
+	 * structure is exactly the right size.
+	 */
+	ULONG size = sizeof(struct _URB_SELECT_CONFIGURATION);
 
+	if (DevExt->ConfigurationHandle == NULL) {
+		return;
+	}
+	urb = (PURB)ExAllocatePoolWithTag(NonPagedPool, size,
+	                                  ADAPTOID_POOL_TAG);
+	if (urb == NULL) {
+		return;
+	}
+	UsbBuildSelectConfigurationRequest(urb, (USHORT)size, NULL);
+	SubmitUrbSync(DevExt, urb);
+	ExFreePool(urb);
+
+	DevExt->ConfigurationHandle = NULL;
+	DevExt->InterruptPipe       = NULL;
+}
+
+/*
+ * Abort whatever is outstanding on the interrupt pipe.
+ *
+ * NOT THE SAME AS CANCELLING THE IRPS. Cancelling asks the bus driver to
+ * give an IRP back; aborting tells it to discard everything queued on the
+ * pipe and put it back in a known state. Removal does both, in that order.
+ */
 void AdaptoidAbortPipes(PADAPTOID_DEVEXT DevExt)
-{ UNREFERENCED_PARAMETER(DevExt); }
+{
+	struct _URB_PIPE_REQUEST urb;
+
+	if (DevExt->InterruptPipe == NULL) {
+		return;
+	}
+	RtlZeroMemory(&urb, sizeof(urb));
+	urb.Hdr.Length     = (USHORT)sizeof(urb);
+	urb.Hdr.Function   = URB_FUNCTION_ABORT_PIPE;
+	urb.PipeHandle     = DevExt->InterruptPipe;
+	SubmitUrbSync(DevExt, (PURB)&urb);
+}
+
+/*
+ * Stop everything and wait for it to have stopped.
+ *
+ * THE WAIT IS THE POINT. AdaptoidPollStop only asks; the reads come back
+ * through their completion routine some time later, and unconfiguring the
+ * device before then would invalidate pipe handles that are still in use.
+ */
+void AdaptoidQuiesceIo(PADAPTOID_DEVEXT DevExt)
+{
+	AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_PNP,
+	                 ADAPTOID_POLL_SLOTS);
+	AdaptoidAbortPipes(DevExt);
+}
 
 void AdaptoidFreeDeviceResources(PADAPTOID_DEVEXT DevExt)
-{ UNREFERENCED_PARAMETER(DevExt); }
+{
+	if (DevExt->ConfigDescriptor != NULL) {
+		ExFreePool(DevExt->ConfigDescriptor);
+		DevExt->ConfigDescriptor = NULL;
+	}
+	if (DevExt->InterfaceInfo != NULL) {
+		ExFreePool(DevExt->InterfaceInfo);
+		DevExt->InterfaceInfo = NULL;
+	}
+	if (DevExt->PollWorkItem != NULL) {
+		IoFreeWorkItem((PIO_WORKITEM)DevExt->PollWorkItem);
+		DevExt->PollWorkItem = NULL;
+	}
+}
+
+/* ---- the two asynchronous transfers -------------------------------- */
+
+/*
+ * A vendor control transfer. The URB and the IRP are freed by the
+ * completion, not here, because this returns as soon as the bus driver has
+ * taken the request.
+ */
+static NTSTATUS NTAPI VendorUrbComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                                        PVOID Context)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)Context;
+	PURB             urb = (PURB)dx->Vendor.Urb;
+	ULONG            length = 0;
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+
+	if (urb != NULL) {
+		length = urb->UrbControlVendorClassRequest.TransferBufferLength;
+		ExFreePool(urb);
+		dx->Vendor.Urb = NULL;
+	}
+	dx->Vendor.UrbIrp = NULL;
+	IoFreeIrp(Irp);
+
+	AdaptoidVendorComplete(dx, Irp->IoStatus.Status, length);
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
+                                 const ADAPTOID_SETUP *Setup,
+                                 ULONG TransferLength, PVOID TransferBuffer)
+{
+	struct _URB_CONTROL_VENDOR_OR_CLASS_REQUEST *urb;
+	PIRP               irp;
+	PIO_STACK_LOCATION sl;
+	ULONG              flags;
+
+	urb = (struct _URB_CONTROL_VENDOR_OR_CLASS_REQUEST *)
+	        ExAllocatePoolWithTag(NonPagedPool, sizeof(*urb),
+	                              ADAPTOID_POOL_TAG);
+	if (urb == NULL) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	irp = IoAllocateIrp(DevExt->NextDeviceObject->StackSize, FALSE);
+	if (irp == NULL) {
+		ExFreePool(urb);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	/*
+	 * SHORT TRANSFERS ARE NOT ERRORS on this device: a reply shorter than
+	 * the buffer is how it says "that is all there was", and the status
+	 * byte in the reply carries the real outcome.
+	 */
+	flags = USBD_SHORT_TRANSFER_OK;
+	if (Setup->bmRequestType == ADAPTOID_VENDOR_IN) {
+		flags |= USBD_TRANSFER_DIRECTION_IN;
+	}
+	UsbBuildVendorRequest((PURB)urb,
+	                      URB_FUNCTION_VENDOR_DEVICE,
+	                      (USHORT)sizeof(*urb), flags, 0,
+	                      Setup->bRequest, Setup->wValue, Setup->wIndex,
+	                      TransferBuffer, NULL, TransferLength, NULL);
+
+	DevExt->Vendor.Urb    = urb;
+	DevExt->Vendor.UrbIrp = irp;
+
+	sl = IoGetNextIrpStackLocation(irp);
+	sl->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
+	sl->Parameters.DeviceIoControl.IoControlCode =
+	        IOCTL_INTERNAL_USB_SUBMIT_URB;
+	sl->Parameters.Others.Argument1 = urb;
+	IoSetCompletionRoutine(irp, VendorUrbComplete, DevExt, TRUE, TRUE,
+	                       TRUE);
+	return IoCallDriver(DevExt->NextDeviceObject, irp);
+}
+
+/*
+ * One interrupt read into one of the two slots.
+ *
+ * WHICH SLOT IS CARRIED IN THE CONTEXT, as a small integer rather than a
+ * pointer, so the completion can find its slot without a search and without
+ * a second allocation to hold the pairing.
+ */
+static NTSTATUS NTAPI PollUrbComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                                      PVOID Context)
+{
+	PADAPTOID_POLL_CONTEXT ctx = (PADAPTOID_POLL_CONTEXT)Context;
+	PADAPTOID_DEVEXT       dx  = ctx->DevExt;
+	ULONG                  slot = ctx->Slot;
+	PURB                   urb = (PURB)dx->PollSlot[slot].Urb;
+	ULONG                  length = 0;
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+
+	if (urb != NULL) {
+		length = urb->UrbBulkOrInterruptTransfer.TransferBufferLength;
+	}
+	AdaptoidPollComplete(dx, slot, Irp->IoStatus.Status, length);
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+NTSTATUS AdaptoidPollSubmit(PADAPTOID_DEVEXT DevExt, ULONG Slot)
+{
+	struct _URB_BULK_OR_INTERRUPT_TRANSFER *urb;
+	PIRP                irp;
+	PIO_STACK_LOCATION  sl;
+	PADAPTOID_POLL_CONTEXT ctx;
+
+	if (Slot >= ADAPTOID_POLL_SLOTS || DevExt->InterruptPipe == NULL) {
+		return STATUS_INVALID_PARAMETER;
+	}
+	urb = (struct _URB_BULK_OR_INTERRUPT_TRANSFER *)
+	        ExAllocatePoolWithTag(NonPagedPool, sizeof(*urb),
+	                              ADAPTOID_POOL_TAG);
+	if (urb == NULL) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	irp = IoAllocateIrp(DevExt->NextDeviceObject->StackSize, FALSE);
+	if (irp == NULL) {
+		ExFreePool(urb);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	UsbBuildInterruptOrBulkTransferRequest((PURB)urb, (USHORT)sizeof(*urb),
+	        DevExt->InterruptPipe, DevExt->PollSlot[Slot].Buffer, NULL,
+	        ADAPTOID_POLL_BYTES,
+	        USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK, NULL);
+
+	DevExt->PollSlot[Slot].Urb = urb;
+	DevExt->PollSlot[Slot].Irp = irp;
+
+	ctx = &DevExt->PollContext[Slot];
+	ctx->DevExt = DevExt;
+	ctx->Slot   = Slot;
+
+	sl = IoGetNextIrpStackLocation(irp);
+	sl->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
+	sl->Parameters.DeviceIoControl.IoControlCode =
+	        IOCTL_INTERNAL_USB_SUBMIT_URB;
+	sl->Parameters.Others.Argument1 = urb;
+	IoSetCompletionRoutine(irp, PollUrbComplete, ctx, TRUE, TRUE, TRUE);
+	return IoCallDriver(DevExt->NextDeviceObject, irp);
+}
+
+/* ---- port recovery ------------------------------------------------- */
+
+NTSTATUS AdaptoidUsbGetPortStatus(PADAPTOID_DEVEXT DevExt, ULONG *Status)
+{
+	*Status = 0;
+	return SendInternalIoctlSync(DevExt,
+	                             IOCTL_INTERNAL_USB_GET_PORT_STATUS,
+	                             Status, NULL);
+}
+
+NTSTATUS AdaptoidUsbResetPort(PADAPTOID_DEVEXT DevExt)
+{
+	return SendInternalIoctlSync(DevExt, IOCTL_INTERNAL_USB_RESET_PORT,
+	                             NULL, NULL);
+}
+
+void AdaptoidUsbCyclePort(PADAPTOID_DEVEXT DevExt)
+{
+	SendInternalIoctlSync(DevExt, IOCTL_INTERNAL_USB_CYCLE_PORT, NULL,
+	                      NULL);
+}
+
+/* ---- the rest of the kernel edge ----------------------------------- */
+
+static void NTAPI PollRestartWorker(PDEVICE_OBJECT DeviceObject,
+                                    PVOID Context)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+	AdaptoidPollRestartWorker((PADAPTOID_DEVEXT)Context);
+}
+
+/*
+ * THE RESTART RUNS ON A WORK ITEM BECAUSE IT BLOCKS. A read completes at
+ * DISPATCH_LEVEL and the recovery ladder sends synchronous port requests, so
+ * it cannot possibly run where it was decided.
+ */
+void AdaptoidQueuePollRestart(PADAPTOID_DEVEXT DevExt)
+{
+	if (DevExt->PollWorkItem == NULL) {
+		return;
+	}
+	IoQueueWorkItem((PIO_WORKITEM)DevExt->PollWorkItem, PollRestartWorker,
+	                DelayedWorkQueue, DevExt);
+}
 
 void AdaptoidEnableInterface(PADAPTOID_DEVEXT DevExt)
-{ UNREFERENCED_PARAMETER(DevExt); }
+{
+	if (DevExt->InterfaceName.Buffer != NULL) {
+		IoSetDeviceInterfaceState(&DevExt->InterfaceName, TRUE);
+	}
+}
 
 void AdaptoidRegistryRemove(PADAPTOID_DEVEXT DevExt)
-{ UNREFERENCED_PARAMETER(DevExt); }
+{
+	if (DevExt->InterfaceName.Buffer != NULL) {
+		IoSetDeviceInterfaceState(&DevExt->InterfaceName, FALSE);
+		RtlFreeUnicodeString(&DevExt->InterfaceName);
+		DevExt->InterfaceName.Buffer = NULL;
+	}
+}
 
 void AdaptoidSetCompletionRoutine(PIRP Irp, PVOID Event)
-{ UNREFERENCED_PARAMETER(Irp); UNREFERENCED_PARAMETER(Event); }
+{
+	IoSetCompletionRoutine(Irp, SyncComplete, Event, TRUE, TRUE, TRUE);
+}
 
-void AdaptoidStartNextPowerIrp(PIRP Irp)
-{ UNREFERENCED_PARAMETER(Irp); }
+/*
+ * THE DEVICE INTERFACE CLASS, read out of the original at 00010358:
+ *
+ *     a1 71 7e 82 af 2c d3 11 85 27 00 a0 c9 9b 19 df
+ *
+ * REUSED DELIBERATELY. The configurator opens adapters by enumerating this
+ * class, so a replacement that invents its own GUID is invisible to every
+ * existing client - the same reason the control device keeps the name
+ * Wish_NA1.
+ */
+static const GUID GUID_DEVINTERFACE_ADAPTOID = {
+	0x827E71A1, 0x2CAF, 0x11D3,
+	{ 0x85, 0x27, 0x00, 0xA0, 0xC9, 0x9B, 0x19, 0xDF }
+};
 
-NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{ UNREFERENCED_PARAMETER(DeviceObject);
-  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+/*
+ * Publish the device interface user mode finds this adapter by, and record
+ * the name so it can be enabled at start and torn down at removal.
+ *
+ * NO COPY, which is the difference that matters. The original copies the
+ * returned name into a fixed 0x200-byte field with a loop driven only by the
+ * source length - see known-defects.txt section 6. Here the UNICODE_STRING
+ * the I/O manager allocated is kept as it stands and freed at removal, so
+ * there is no destination to overrun.
+ */
+NTSTATUS AdaptoidRegisterDeviceInterface(PADAPTOID_DEVEXT DevExt)
+{
+	return IoRegisterDeviceInterface(DevExt->PhysicalDeviceObject,
+	                                 &GUID_DEVINTERFACE_ADAPTOID, NULL,
+	                                 &DevExt->InterfaceName);
+}
 
-NTSTATUS NTAPI AdaptoidControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{ UNREFERENCED_PARAMETER(DeviceObject);
-  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+/*
+ * Read one DWORD out of the driver's service key.
+ *
+ * ABSENT IS NOT AN ERROR - it means "use the default", which is how the
+ * virtual-device mask is made configurable without needing an INF to write
+ * it. Anything that goes wrong gives the default too, because a driver that
+ * refuses to start over a missing optional registry value is worse than one
+ * that uses its built-in answer.
+ */
+ULONG AdaptoidRegQueryDword(PUNICODE_STRING RegistryPath, PCWSTR Name,
+                            ULONG Default)
+{
+	RTL_QUERY_REGISTRY_TABLE table[2];
+	ULONG                    value = Default;
 
-NTSTATUS NTAPI AdaptoidControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{ UNREFERENCED_PARAMETER(DeviceObject);
-  return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
+	RtlZeroMemory(table, sizeof(table));
+	table[0].Flags         = RTL_QUERY_REGISTRY_DIRECT |
+	                         RTL_QUERY_REGISTRY_REQUIRED;
+	table[0].Name          = (PWSTR)Name;
+	table[0].EntryContext  = &value;
+	table[0].DefaultType   = REG_DWORD;
+	table[0].DefaultData   = &Default;
+	table[0].DefaultLength = sizeof(Default);
 
-NTSTATUS NTAPI AdaptoidControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{ UNREFERENCED_PARAMETER(DeviceObject);
-  return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
-	     STATUS_NOT_SUPPORTED; }
+	if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE,
+	                                       RegistryPath->Buffer, table,
+	                                       NULL, NULL))) {
+		return Default;
+	}
+	return value;
+}
 
-NTSTATUS NTAPI AdaptoidControlReadWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{ UNREFERENCED_PARAMETER(DeviceObject);
-  return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
-	     STATUS_NOT_SUPPORTED; }
+NTSTATUS AdaptoidRequestPowerIrp(PADAPTOID_DEVEXT DevExt, ULONG State,
+                                 PREQUEST_POWER_COMPLETE Complete)
+{
+	POWER_STATE ps;
+
+	ps.DeviceState = (DEVICE_POWER_STATE)State;
+	return PoRequestPowerIrp(DevExt->PhysicalDeviceObject,
+	                         IRP_MN_SET_POWER, ps, Complete, DevExt, NULL);
+}
 
 NTSTATUS NTAPI AdaptoidChannelCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 { UNREFERENCED_PARAMETER(DeviceObject);
@@ -1009,15 +1482,6 @@ NTSTATUS NTAPI AdaptoidChannelIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 { UNREFERENCED_PARAMETER(DeviceObject);
   return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
 	     STATUS_NOT_SUPPORTED; }
-
-NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-	PADAPTOID_DEVEXT dx = AdaptoidDevExtOf(DeviceObject);
-
-	AdaptoidStartNextPowerIrp(Irp);
-	IoSkipCurrentIrpStackLocation(Irp);
-	return IofCallDriver(dx->NextDeviceObject, Irp);
-}
 
 #endif /* !ADAPTOID_USERMODE */
 
@@ -1579,4 +2043,940 @@ void AdaptoidPollRestartWorker(PADAPTOID_DEVEXT DevExt)
 		AdaptoidUsbCyclePort(DevExt);
 	}
 	AdaptoidLockRelease(&DevExt->RemoveLockB);
+}
+
+/* ------------------------------------------------------------------ */
+/* power                                                               */
+/* ------------------------------------------------------------------ */
+
+int AdaptoidIsDeviceReady(PADAPTOID_DEVEXT DevExt)
+{
+	return DevExt != NULL &&
+	       DevExt->Started != 0 &&
+	       DevExt->Removing == 0 &&
+	       DevExt->RemovePending == 0 &&
+	       DevExt->StopPending == 0;
+}
+
+ULONG AdaptoidDeviceStateFor(PADAPTOID_DEVEXT DevExt, ULONG SystemState)
+{
+	if (SystemState == ADAPTOID_POWER_S0) {
+		return ADAPTOID_POWER_D0;
+	}
+	/*
+	 * NO WAKE ARMED MEANS D3, whatever the capability table says. This is
+	 * the rule that is easy to miss: without an outstanding WAIT_WAKE
+	 * there is nothing a light sleep buys, so the device goes all the way
+	 * off rather than to the capability's D-state.
+	 */
+	if (DevExt->WaitWakePending == 0) {
+		return ADAPTOID_POWER_D3;
+	}
+	/*
+	 * BOUNDS CHECKED, which the original is not: it indexes DeviceState
+	 * with the system state straight off the stack location. Nothing
+	 * below the driver sends a bad one, so it is not a live bug, but the
+	 * check costs nothing and the array is only seven entries.
+	 */
+	if (SystemState >= ADAPTOID_SYSTEM_STATE_MAX) {
+		return ADAPTOID_POWER_D3;
+	}
+	return DevExt->Capabilities.DeviceState[SystemState];
+}
+
+int AdaptoidPrepareDevicePower(PADAPTOID_DEVEXT DevExt, ULONG State)
+{
+	if (State == ADAPTOID_POWER_D0) {
+		/*
+		 * Coming up. Nothing may be restarted until the bus driver has
+		 * actually applied power, so the work belongs in the
+		 * completion - which is what the non-zero return asks for.
+		 */
+		return 1;
+	}
+	if (State > ADAPTOID_POWER_D0 && State <= ADAPTOID_POWER_D3) {
+		/*
+		 * Going down, and it is done HERE, before the IRP is passed
+		 * on. Stopping the poll after the bus driver had removed power
+		 * would be stopping it against a device that is already gone.
+		 */
+		DevExt->DevicePowerState = State;
+		AdaptoidPollStop(DevExt, ADAPTOID_STOP_REASON_POWER,
+		                 ADAPTOID_POLL_SLOTS);
+		AdaptoidQuiesceIo(DevExt);
+		return 0;
+	}
+	/* Not a state this driver knows; pass it down bare. */
+	return 0;
+}
+
+/*
+ * The completion for a transition into D0. Running here rather than in
+ * AdaptoidPrepareDevicePower is the whole point: the device is powered by
+ * the time this is called, so polling can genuinely start again.
+ */
+static NTSTATUS NTAPI PowerUpComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                                      PVOID Context)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)Context;
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+
+	dx->DevicePowerState = ADAPTOID_POWER_D0;
+	AdaptoidPollStart(dx, ADAPTOID_STOP_REASON_POWER);
+	Irp->IoStatus.Status = STATUS_SUCCESS;
+	AdaptoidLockRelease(&dx->RemoveLockB);
+	return STATUS_SUCCESS;
+}
+
+/*
+ * The completion for the DEVICE power IRP this driver asked for on behalf of
+ * a SYSTEM power IRP. The system IRP was parked; now that the device has
+ * moved, it can be finished.
+ */
+void NTAPI AdaptoidSystemPowerComplete(PDEVICE_OBJECT DeviceObject,
+                                       UCHAR MinorFunction,
+                                       POWER_STATE PowerState,
+                                       PVOID Context,
+                                       PIO_STATUS_BLOCK IoStatus)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)Context;
+	PIRP             irp;
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+	UNREFERENCED_PARAMETER(MinorFunction);
+	UNREFERENCED_PARAMETER(PowerState);
+	UNREFERENCED_PARAMETER(IoStatus);
+
+	irp = dx->PendingSystemPowerIrp;
+	dx->PendingSystemPowerIrp = NULL;
+	if (irp == NULL) {
+		return;
+	}
+	PoStartNextPowerIrp(irp);
+	IoCopyCurrentIrpStackLocationToNext(irp);
+	PoCallDriver(dx->NextDeviceObject, irp);
+	AdaptoidLockRelease(&dx->RemoveLockB);
+}
+
+/* The completion for an idle transition this driver asked for itself. */
+void NTAPI AdaptoidIdlePowerComplete(PDEVICE_OBJECT DeviceObject,
+                                     UCHAR MinorFunction,
+                                     POWER_STATE PowerState,
+                                     PVOID Context, PIO_STATUS_BLOCK IoStatus)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)Context;
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+	UNREFERENCED_PARAMETER(MinorFunction);
+	UNREFERENCED_PARAMETER(PowerState);
+	UNREFERENCED_PARAMETER(IoStatus);
+
+	dx->PowerRequestInProgress = 0;
+}
+
+NTSTATUS AdaptoidRequestDevicePower(PADAPTOID_DEVEXT DevExt, ULONG State)
+{
+	DevExt->PowerRequestInProgress = 1;
+	return AdaptoidRequestPowerIrp(DevExt, State,
+	                               AdaptoidIdlePowerComplete);
+}
+
+NTSTATUS AdaptoidUpdateIdlePower(PADAPTOID_DEVEXT DevExt, int GoIdle)
+{
+	ULONG target;
+
+	if (!AdaptoidIsDeviceReady(DevExt)) {
+		return STATUS_DELETE_PENDING;
+	}
+	if (DevExt->PendingSystemPowerIrp != NULL ||
+	    DevExt->PowerRequestInProgress != 0) {
+		return STATUS_SUCCESS;
+	}
+	/*
+	 * THE DEAD GATE. Idling needs AbortedPipeCount zero and waking needs
+	 * it non-zero, and NOTHING ANYWHERE INCREMENTS IT - so the wake half
+	 * is unreachable and the idle half is a formality. Kept because a
+	 * replacement that drops it changes when the device powers down.
+	 */
+	if (GoIdle) {
+		if (DevExt->AbortedPipeCount != 0) {
+			return STATUS_SUCCESS;
+		}
+	} else if (DevExt->AbortedPipeCount == 0) {
+		return STATUS_SUCCESS;
+	}
+
+	target = DevExt->WakeIdleDeviceState;
+	if (target == 0 || target == ADAPTOID_POWER_D0 ||
+	    target > ADAPTOID_POWER_D3) {
+		return STATUS_SUCCESS;
+	}
+	if (!GoIdle) {
+		target = ADAPTOID_POWER_D0;
+	}
+	return AdaptoidRequestDevicePower(DevExt, target);
+}
+
+/*
+ * IRP_MN_WAIT_WAKE.
+ *
+ * Accepted only when the device is OUT of D0 and the machine is no deeper
+ * than the state the device can wake from - asking a powered device to arm
+ * remote wake is meaningless, and arming for a state past what the hardware
+ * supports would silently never fire.
+ *
+ * The IRP is passed down and WAITED FOR, which is legitimate here and only
+ * here: a wake request stays outstanding until the wake happens, so this
+ * returns when it has.
+ */
+NTSTATUS AdaptoidPowerWaitWake(PADAPTOID_DEVEXT DevExt, PIRP Irp)
+{
+	KEVENT   done;
+	NTSTATUS st;
+
+	DevExt->WakeIdleDeviceState = DevExt->Capabilities.DeviceWake;
+
+	if (DevExt->DevicePowerState == ADAPTOID_POWER_D0 ||
+	    (LONG)DevExt->Capabilities.DeviceWake >
+	    (LONG)DevExt->DevicePowerState) {
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
+		PoStartNextPowerIrp(Irp);
+		AdaptoidCompleteIrp(Irp, STATUS_INVALID_DEVICE_STATE, 0);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+
+	DevExt->WaitWakePending = 1;
+	KeInitializeEvent(&done, NotificationEvent, FALSE);
+	IoCopyCurrentIrpStackLocationToNext(Irp);
+	AdaptoidSetCompletionRoutine(Irp, &done);
+	PoStartNextPowerIrp(Irp);
+	st = PoCallDriver(DevExt->NextDeviceObject, Irp);
+	if (st == STATUS_PENDING) {
+		KeWaitForSingleObject(&done, Executive, KernelMode, FALSE,
+		                      NULL);
+	}
+	/* The wake has happened, or the request was cancelled. Either way the
+	 * device may now need to come back up. */
+	AdaptoidUpdateIdlePower(DevExt, 0);
+	DevExt->WaitWakePending = 0;
+	AdaptoidLockRelease(&DevExt->RemoveLockB);
+	return st;
+}
+
+/*
+ * IRP_MJ_POWER for an adapter.
+ *
+ * EVERY PATH CALLS PoStartNextPowerIrp BEFORE PoCallDriver. That is the
+ * power protocol and it is not optional - the original observes it here and
+ * notably does not in its control-device path.
+ */
+NTSTATUS NTAPI AdaptoidPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_DEVEXT   dx = AdaptoidDevExtOf(DeviceObject);
+	PIO_STACK_LOCATION sl = IoGetCurrentIrpStackLocation(Irp);
+	NTSTATUS           st;
+
+	st = AdaptoidLockAcquire(&dx->RemoveLockB);
+	if (!NT_SUCCESS(st)) {
+		PoStartNextPowerIrp(Irp);
+		AdaptoidCompleteIrp(Irp, st, 0);
+		return st;
+	}
+
+	if (sl->MinorFunction == IRP_MN_WAIT_WAKE) {
+		return AdaptoidPowerWaitWake(dx, Irp);
+	}
+
+	if (sl->MinorFunction == IRP_MN_SET_POWER &&
+	    sl->Parameters.Power.Type == SystemPowerState) {
+		ULONG want = AdaptoidDeviceStateFor(dx,
+		        (ULONG)sl->Parameters.Power.State.SystemState);
+
+		if (want != dx->DevicePowerState) {
+			/*
+			 * PARK THE SYSTEM IRP and ask for the device IRP the
+			 * mapping calls for. The system transition is not
+			 * finished until the device one is - which is why the
+			 * remove lock is NOT released here, and why the
+			 * completion does it instead.
+			 */
+			dx->PendingSystemPowerIrp = Irp;
+			return AdaptoidRequestPowerIrp(dx, want,
+			                        AdaptoidSystemPowerComplete);
+		}
+		/* Already in the right state; fall through and pass it down. */
+	} else if (sl->MinorFunction == IRP_MN_SET_POWER &&
+	           sl->Parameters.Power.Type == DevicePowerState) {
+		int completes = AdaptoidPrepareDevicePower(dx,
+		        (ULONG)sl->Parameters.Power.State.DeviceState);
+
+		IoCopyCurrentIrpStackLocationToNext(Irp);
+		if (completes) {
+			IoSetCompletionRoutine(Irp, PowerUpComplete, dx,
+			                       TRUE, TRUE, TRUE);
+		}
+		PoStartNextPowerIrp(Irp);
+		st = PoCallDriver(dx->NextDeviceObject, Irp);
+		if (!completes) {
+			/* With no completion routine nothing else will release
+			 * the lock, so it is released here. */
+			AdaptoidLockRelease(&dx->RemoveLockB);
+		}
+		return st;
+	}
+
+	IoCopyCurrentIrpStackLocationToNext(Irp);
+	PoStartNextPowerIrp(Irp);
+	st = PoCallDriver(dx->NextDeviceObject, Irp);
+	AdaptoidLockRelease(&dx->RemoveLockB);
+	return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* the device enable, and its keep-alive window                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One wire format for the idle command, shared with the deferred drain -
+ * core_effect_send_idle emits it through the same vendor seam this layer
+ * installs, so there is no second copy of the setup packet to drift.
+ */
+void AdaptoidSendIdleCommand(PADAPTOID_DEVEXT DevExt)
+{
+	core_effect_send_idle(&DevExt->Core);
+}
+
+/*
+ * The completion of the full start sequence: send the same short kick the
+ * already-running path sends, so both routes end at the same register write.
+ * Returning non-zero holds the vendor slot, because this has started more
+ * work on it.
+ */
+static int EnableSecondStage(PADAPTOID_DEVEXT DevExt)
+{
+	ADAPTOID_SETUP setup;
+
+	setup.bmRequestType = ADAPTOID_VENDOR_OUT;
+	setup.bRequest      = ADAPTOID_ENABLE_KICK_REQUEST;
+	setup.wValue        = ADAPTOID_ENABLE_KICK_VALUE;
+	setup.wIndex        = ADAPTOID_ENABLE_KICK_INDEX;
+	AdaptoidVendorSend(DevExt, &setup, 0, NULL, NULL);
+	return 1;
+}
+
+NTSTATUS AdaptoidSetDeviceEnable(PADAPTOID_DEVEXT DevExt, int On)
+{
+	ADAPTOID_SETUP setup;
+	ULONGLONG      now;
+
+	if (!AdaptoidVendorTryClaim(DevExt)) {
+		/*
+		 * THE ASYMMETRY IS DELIBERATE. Switching off is deferred so it
+		 * cannot be lost - a missed "off" leaves a motor running -
+		 * while switching on is simply refused, because the next
+		 * effect tick will ask again.
+		 */
+		if (!On) {
+			DevExt->Core.claim_idle_command = 1;
+		}
+		return STATUS_DEVICE_BUSY;
+	}
+
+	if (!On) {
+		AdaptoidSendIdleCommand(DevExt);
+		return STATUS_SUCCESS;
+	}
+
+	now = KeQueryInterruptTime();
+	if (DevExt->Core.keepalive_time <= now &&
+	    now <= DevExt->Core.keepalive_time + ADAPTOID_KEEPALIVE_100NS) {
+		/* Still inside the window: the adapter is already running, so
+		 * one short kick is enough and it is not re-initialised. */
+		setup.bmRequestType = ADAPTOID_VENDOR_OUT;
+		setup.bRequest      = ADAPTOID_ENABLE_KICK_REQUEST;
+		setup.wValue        = ADAPTOID_ENABLE_KICK_VALUE;
+		setup.wIndex        = ADAPTOID_ENABLE_KICK_INDEX;
+		AdaptoidVendorSend(DevExt, &setup, 0, NULL, NULL);
+		return STATUS_SUCCESS;
+	}
+
+	/* Outside it: the full start, whose completion sends the kick. */
+	DevExt->Core.keepalive_time = now;
+	setup.bmRequestType = ADAPTOID_VENDOR_OUT;
+	setup.bRequest      = ADAPTOID_ENABLE_START_REQUEST;
+	setup.wValue        = ADAPTOID_ENABLE_START_VALUE;
+	setup.wIndex        = ADAPTOID_ENABLE_START_INDEX;
+	AdaptoidVendorSend(DevExt, &setup, 0, NULL, EnableSecondStage);
+	return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/* the script scheduler DPC                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * THE DEPTH COUNTER IS NOT A BOOLEAN, and both guards are one-sided: the
+ * increment is skipped while it is negative and the decrement while it is
+ * non-positive. AdaptoidDevExtInit latches it at -1, so the DPC can never
+ * lift it on its own and a script cannot own the stick until something else
+ * does. Faithful to drv_ScriptSchedulerDpc (00017910).
+ */
+void NTAPI AdaptoidScriptDpc(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)Context;
+	KIRQL            irql;
+
+	UNREFERENCED_PARAMETER(Dpc);
+	UNREFERENCED_PARAMETER(Arg1);
+	UNREFERENCED_PARAMETER(Arg2);
+
+	KeAcquireSpinLock(&dx->ScriptLock, &irql);
+	if (dx->ScriptDepth >= 0) {
+		dx->ScriptDepth++;
+	}
+	KeReleaseSpinLock(&dx->ScriptLock, irql);
+
+	core_sched_run(&dx->Sched, KeQueryInterruptTime());
+
+	KeAcquireSpinLock(&dx->ScriptLock, &irql);
+	if (dx->ScriptDepth > 0) {
+		dx->ScriptDepth--;
+	}
+	KeReleaseSpinLock(&dx->ScriptLock, irql);
+}
+
+/*
+ * Ask the adapter where it is on the bus.
+ *
+ * Vendor request 0x75 returns two bytes and the FIRST is this device's own
+ * USB address. It is the key AdaptoidBuildLocationName walks the hub tree
+ * looking for, and the only thing that tells two identical adapters apart -
+ * vendor and product cannot.
+ *
+ * SYNCHRONOUS, which is why it may only be called from AdaptoidStartDevice:
+ * everything else on this path runs too high to wait.
+ *
+ * THE ORIGINAL READS THE BYTE THROUGH A SIGNED CHAR, so an address with bit
+ * 7 set would come out negative and never match any port. Harmless in
+ * practice - USB addresses run 1 to 127 - but there is no reason to copy it,
+ * and this does not.
+ */
+void AdaptoidQueryFirmwareInfo(PADAPTOID_DEVEXT DevExt)
+{
+	ADAPTOID_SETUP setup;
+	UCHAR          reply[2];
+
+	if (!AdaptoidVendorTryClaim(DevExt)) {
+		return;
+	}
+	reply[0] = 0;
+	reply[1] = 0;
+	setup.bmRequestType = ADAPTOID_VENDOR_IN;
+	setup.bRequest      = ADAPTOID_REQUEST_BUS_ADDRESS;
+	setup.wValue        = 0;
+	setup.wIndex        = 0;
+
+	KeInitializeEvent(&DevExt->Vendor.Done, NotificationEvent, FALSE);
+	AdaptoidVendorSend(DevExt, &setup, sizeof(reply), reply, NULL);
+	KeWaitForSingleObject(&DevExt->Vendor.Done, Executive, KernelMode,
+	                      FALSE, NULL);
+
+	DevExt->UsbAddress = reply[0];
+}
+
+/*
+ * The minidriver's OWN IRP_MJ_DEVICE_CONTROL, installed before
+ * HidRegisterMinidriver so that hidclass calls it - not to be confused with
+ * AdaptoidDeviceControl, the triage wrapper installed afterwards.
+ *
+ * It does nothing but pass the request to the bus driver. hidclass has
+ * already answered every code it understands by the time it gets here, and
+ * the driver has no device-control codes of its own on this path - its
+ * private surface is IRP_MJ_INTERNAL_DEVICE_CONTROL and the control device.
+ */
+NTSTATUS NTAPI AdaptoidPassThroughDeviceControl(PDEVICE_OBJECT DeviceObject,
+                                                PIRP Irp)
+{
+	PADAPTOID_DEVEXT dx = AdaptoidDevExtOf(DeviceObject);
+
+	IoCopyCurrentIrpStackLocationToNext(Irp);
+	return IofCallDriver(dx->NextDeviceObject, Irp);
+}
+
+/*
+ * Give up on an outstanding vendor request.
+ *
+ * CANCELLING THE URB IRP IS NOT ENOUGH ON ITS OWN - the slot has to be given
+ * back too, and only the completion knows whether it already has. So this
+ * asks, and lets the completion do the releasing, exactly as the original
+ * does.
+ */
+void AdaptoidCancelVendorRequest(PADAPTOID_DEVEXT DevExt)
+{
+	PIRP  irp;
+	KIRQL irql;
+
+	KeAcquireSpinLock(&DevExt->Vendor.Lock, &irql);
+	irp = (PIRP)DevExt->Vendor.UrbIrp;
+	KeReleaseSpinLock(&DevExt->Vendor.Lock, irql);
+
+	if (irp != NULL) {
+		AdaptoidCancelIrp(irp);
+	}
+}
+
+/*
+ * Tell user mode that this adapter's interface came up or went down.
+ *
+ * IT GOES ON THE DRIVER-WIDE NOTIFICATION QUEUE, not to the adapter that
+ * changed - core_registry_set_live posts it - which is why an event carries
+ * no device identity and a listener has to re-enumerate to find out what
+ * actually changed. See ioctl.h.
+ */
+void AdaptoidNotifyInterfaceChange(PADAPTOID_DEVEXT DevExt, int Live)
+{
+	PADAPTOID_CDO_EXT cx = AdaptoidControlDeviceExt();
+
+	if (cx == NULL) {
+		return;
+	}
+	core_registry_set_live(&cx->Registry, &DevExt->Registration, Live);
+}
+
+/* ------------------------------------------------------------------ */
+/* the control device object                                           */
+/* ------------------------------------------------------------------ */
+
+static PDEVICE_OBJECT g_ControlDevice;
+static LONG           g_ControlRefCount;
+static FAST_MUTEX     g_ControlMutex;
+
+PADAPTOID_CDO_EXT AdaptoidControlDeviceExt(void)
+{
+	if (g_ControlDevice == NULL) {
+		return NULL;
+	}
+	return (PADAPTOID_CDO_EXT)g_ControlDevice->DeviceExtension;
+}
+
+/*
+ * THE REFERENCE COUNT IS INCREMENTED ONLY ON SUCCESS, which the original
+ * does not do: drv_CreateControlDevice bumps it unconditionally, so an
+ * adapter arriving while creation fails still counts as a user of a device
+ * that was never made. See known-defects.txt.
+ */
+NTSTATUS AdaptoidCreateControlDevice(PDRIVER_OBJECT DriverObject)
+{
+	NTSTATUS       st = STATUS_SUCCESS;
+	PDEVICE_OBJECT dev = NULL;
+	UNICODE_STRING name, link;
+
+	ExAcquireFastMutex(&g_ControlMutex);
+	if (g_ControlDevice == NULL) {
+		RtlInitUnicodeString(&name, ADAPTOID_CDO_NAME);
+		st = IoCreateDevice(DriverObject, sizeof(ADAPTOID_CDO_EXT),
+		                    &name, ADAPTOID_CDO_DEVICE_TYPE, 0, FALSE,
+		                    &dev);
+		if (NT_SUCCESS(st)) {
+			RtlInitUnicodeString(&link, ADAPTOID_CDO_LINK);
+			st = IoCreateSymbolicLink(&link, &name);
+			if (!NT_SUCCESS(st)) {
+				IoDeleteDevice(dev);
+			} else {
+				PADAPTOID_CDO_EXT cx =
+				      (PADAPTOID_CDO_EXT)dev->DeviceExtension;
+
+				cx->Magic[0] = ADAPTOID_CDO_MAGIC0;
+				cx->Magic[1] = ADAPTOID_CDO_MAGIC1;
+				cx->Magic[2] = ADAPTOID_CDO_MAGIC2;
+				cx->Self      = dev;
+				cx->OpenCount = 0;
+				KeInitializeSpinLock(&cx->Lock);
+				core_registry_init(&cx->Registry);
+				core_cmd_channel_init(&cx->Channel);
+				AdaptoidNotifyInit(cx);
+
+				/* METHOD_BUFFERED on every private code, so
+				 * the object has to be buffered too. */
+				dev->Flags |= DO_BUFFERED_IO;
+				g_ControlDevice = dev;
+				dev->Flags &= ~DO_DEVICE_INITIALIZING;
+			}
+		}
+	}
+	if (NT_SUCCESS(st)) {
+		g_ControlRefCount++;
+	}
+	ExReleaseFastMutex(&g_ControlMutex);
+	return st;
+}
+
+/*
+ * Delete the singleton if nothing needs it any more - no adapter holding a
+ * reference AND no handle open. Called from both sides, because either can
+ * be the one that reaches zero last: the original tests the same pair in
+ * drv_ControlDeviceClose and in the adapter teardown.
+ */
+void AdaptoidControlMaybeDelete(void)
+{
+	PDEVICE_OBJECT dev = NULL;
+
+	ExAcquireFastMutex(&g_ControlMutex);
+	if (g_ControlRefCount == 0 && g_ControlDevice != NULL &&
+	    ((PADAPTOID_CDO_EXT)g_ControlDevice->DeviceExtension)->OpenCount
+	     == 0) {
+		dev = g_ControlDevice;
+		/*
+		 * THE POINTER IS CLEARED UNDER THE MUTEX so nothing can find
+		 * the device while it is being torn down. The original clears
+		 * it in the same order, which is what opens the window its
+		 * drv_AcquireControlDeviceExt leaks a remove lock into - here
+		 * nothing takes a lock merely to look the device up, so there
+		 * is no lock to leak.
+		 */
+		g_ControlDevice = NULL;
+	}
+	ExReleaseFastMutex(&g_ControlMutex);
+
+	if (dev != NULL) {
+		PADAPTOID_CDO_EXT cx = (PADAPTOID_CDO_EXT)dev->DeviceExtension;
+		UNICODE_STRING    link;
+
+		RtlInitUnicodeString(&link, ADAPTOID_CDO_LINK);
+		IoDeleteSymbolicLink(&link);
+		AdaptoidCancelNotifications(cx, NULL);
+		core_notify_flush(&cx->Registry.notify);
+		IoDeleteDevice(dev);
+	}
+}
+
+void AdaptoidReleaseControlDevice(void)
+{
+	ExAcquireFastMutex(&g_ControlMutex);
+	if (g_ControlRefCount > 0) {
+		g_ControlRefCount--;
+	}
+	ExReleaseFastMutex(&g_ControlMutex);
+	AdaptoidControlMaybeDelete();
+}
+
+/* ------------------------------------------------------------------ */
+/* the notification waiter                                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The three core_notify seams. The queue owns the ordering and the cap; what
+ * is here is only "is this request still ours" and "hand it the bytes".
+ */
+static int NotifyClaim(void *ctx, core_notify_waiter *w)
+{
+	UNREFERENCED_PARAMETER(ctx);
+	/* The same interlocked claim the report queue uses: whoever clears
+	 * the cancel routine owns completing the request. */
+	return AdaptoidClaimIrp((PIRP)w->request);
+}
+
+/*
+ * An event reaches user mode as THREE LITTLE-ENDIAN DWORDS - type, then the
+ * two arguments - which is the whole of the twelve bytes function 0x818
+ * hands back. Written a byte at a time rather than as three u32 stores so
+ * that the layout does not depend on the host's alignment rules.
+ */
+static void NotifyDeliver(void *ctx, core_notify_waiter *w, u32 type,
+                          u32 arg1, u32 arg2)
+{
+	PIRP   irp = (PIRP)w->request;
+	UCHAR *out;
+
+	UNREFERENCED_PARAMETER(ctx);
+	out = (UCHAR *)ADAPTOID_IRP_BUFFER(irp);
+	if (out != NULL) {
+		u32 i;
+		u32 word[3];
+
+		word[0] = type;
+		word[1] = arg1;
+		word[2] = arg2;
+		for (i = 0; i < 3; i++) {
+			out[i * 4 + 0] = (UCHAR)(word[i]);
+			out[i * 4 + 1] = (UCHAR)(word[i] >> 8);
+			out[i * 4 + 2] = (UCHAR)(word[i] >> 16);
+			out[i * 4 + 3] = (UCHAR)(word[i] >> 24);
+		}
+	}
+	AdaptoidCompleteIrp(irp, STATUS_SUCCESS, CORE_NOTIFY_BYTES);
+}
+
+static void NotifyAbort(void *ctx, core_notify_waiter *w)
+{
+	UNREFERENCED_PARAMETER(ctx);
+	AdaptoidCompleteIrp((PIRP)w->request, STATUS_CANCELLED, 0);
+}
+
+void AdaptoidNotifyInit(PADAPTOID_CDO_EXT CdoExt)
+{
+	core_notify_init(&CdoExt->Registry.notify, NotifyClaim, NotifyDeliver,
+	                 NotifyAbort, CdoExt);
+}
+
+static void NTAPI NotifyCancelRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_CDO_EXT cx =
+	        (PADAPTOID_CDO_EXT)DeviceObject->DeviceExtension;
+
+	IoReleaseCancelSpinLock(Irp->CancelIrql);
+	AdaptoidCancelNotifications(cx, Irp);
+}
+
+NTSTATUS AdaptoidWaitNotification(PADAPTOID_CDO_EXT CdoExt, PIRP Irp)
+{
+	core_notify_waiter *w = ADAPTOID_IRP_WAITER(Irp);
+	KIRQL               irql;
+
+	w->request = Irp;
+
+	KeAcquireSpinLock(&CdoExt->Lock, &irql);
+	/*
+	 * MARKED PENDING BEFORE THE CANCEL ROUTINE GOES ON, because from the
+	 * moment it does another thread may complete this IRP.
+	 */
+	IoMarkIrpPending(Irp);
+	IoSetCancelRoutine(Irp, (PVOID)NotifyCancelRoutine);
+	core_notify_wait(&CdoExt->Registry.notify, w);
+	KeReleaseSpinLock(&CdoExt->Lock, irql);
+
+	/*
+	 * PENDING EITHER WAY. core_notify_wait completes the IRP itself
+	 * through NotifyDeliver when an event was already queued, but
+	 * IoMarkIrpPending has been called by then and returning anything
+	 * else after that is a protocol violation.
+	 *
+	 * THE ORIGINAL VIOLATES IT. drv_IoctlWaitNotification marks the IRP
+	 * pending and then, if it finds the request already cancelled,
+	 * returns STATUS_CANCELLED. See known-defects.txt.
+	 */
+	return STATUS_PENDING;
+}
+
+void AdaptoidCancelNotifications(PADAPTOID_CDO_EXT CdoExt, PIRP Irp)
+{
+	PFILE_OBJECT owner = NULL;
+	KIRQL        irql;
+
+	if (CdoExt == NULL) {
+		return;
+	}
+	/*
+	 * Irp SELECTS WHICH ONES. NULL cancels every waiter; otherwise only
+	 * the waiters belonging to the same FILE OBJECT - that is, the same
+	 * user-mode handle - are cancelled, which is what makes a close
+	 * affect one client and not all of them.
+	 */
+	if (Irp != NULL) {
+		owner = IoGetCurrentIrpStackLocation(Irp)->FileObject;
+	}
+
+	for (;;) {
+		core_notify_waiter *w;
+		core_notify_waiter *victim = NULL;
+
+		KeAcquireSpinLock(&CdoExt->Lock, &irql);
+		for (w = CdoExt->Registry.notify.waiters.flink;
+		     w != &CdoExt->Registry.notify.waiters; w = w->flink) {
+			PIRP parked = (PIRP)w->request;
+
+			if (owner != NULL &&
+			    IoGetCurrentIrpStackLocation(parked)->FileObject !=
+			    owner) {
+				continue;
+			}
+			/* Unlinked under the lock, one per pass, so the
+			 * loop terminates however the claims go. */
+			core_notify_cancel(&CdoExt->Registry.notify, w);
+			victim = w;
+			break;
+		}
+		KeReleaseSpinLock(&CdoExt->Lock, irql);
+
+		if (victim == NULL) {
+			break;
+		}
+		/*
+		 * CLAIMED AND COMPLETED OUTSIDE THE LOCK. A waiter that cannot
+		 * be claimed is already being completed by whoever did claim
+		 * it, so it is dropped here rather than completed twice - and
+		 * because it is dropped after core_notify_cancel unlinked it,
+		 * no event is consumed on its behalf.
+		 */
+		if (AdaptoidClaimIrp((PIRP)victim->request)) {
+			AdaptoidCompleteIrp((PIRP)victim->request,
+			                    STATUS_CANCELLED, 0);
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* the control device's four dispatch entry points                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * IRP_MJ_CREATE. A handle is being opened on \\.\Wish_NA1.
+ *
+ * REFUSED WITH NO ADAPTER PRESENT. The control device exists as soon as one
+ * adapter has ever arrived, but opening it while none is live gets
+ * STATUS_DELETE_PENDING - so a client cannot hold a handle across the last
+ * unplug and expect it to keep working.
+ *
+ * TWO RESETS, ON DIFFERENT SCHEDULES. The FIRST open puts every adapter's
+ * stick tuning back to its defaults; EVERY open clears the keep-alive and
+ * emulated-Pak state. So opening the configurator silently discards stick
+ * tuning a previous client left behind, which a replacement that preserved
+ * it across sessions would get visibly wrong.
+ */
+NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_CDO_EXT cx = (PADAPTOID_CDO_EXT)DeviceObject->DeviceExtension;
+	core_device_entry *d;
+	LONG              was;
+
+	if (cx == NULL) {
+		AdaptoidCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+		return STATUS_DELETE_PENDING;
+	}
+	if (cx->Registry.live_count == 0) {
+		AdaptoidCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+		return STATUS_DELETE_PENDING;
+	}
+
+	ExAcquireFastMutex(&g_ControlMutex);
+	was = cx->OpenCount++;
+	ExReleaseFastMutex(&g_ControlMutex);
+
+	if (was == 0) {
+		for (d = cx->Registry.devices.flink;
+		     d != &cx->Registry.devices; d = d->flink) {
+			if (d->cs != NULL) {
+				d->cs->stick_clip    = CORE_STICK_CLIP_DEFAULT;
+				d->cs->stick_stretch = CORE_STICK_STRETCH_DEF;
+			}
+		}
+	}
+	for (d = cx->Registry.devices.flink; d != &cx->Registry.devices;
+	     d = d->flink) {
+		if (d->cs != NULL) {
+			d->cs->keepalive_time    = 0;
+			d->cs->emu_pak_present   = 0;
+		}
+	}
+
+	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0);
+	return STATUS_SUCCESS;
+}
+
+/*
+ * IRP_MJ_CLEANUP. The handle is going away but the file object is still
+ * alive, which is exactly when parked requests belonging to it must be
+ * released - so this cancels only THIS handle's notification waiters.
+ */
+NTSTATUS NTAPI AdaptoidControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	AdaptoidCancelNotifications(
+	        (PADAPTOID_CDO_EXT)DeviceObject->DeviceExtension, Irp);
+	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0);
+	return STATUS_SUCCESS;
+}
+
+/*
+ * IRP_MJ_CLOSE.
+ *
+ * THE DEVICE OUTLIVES THE LAST ADAPTER IF A HANDLE IS STILL OPEN. Deletion
+ * needs BOTH counts at zero, and either side can be the one that reaches
+ * zero last - so the same test lives here and in AdaptoidReleaseControlDevice
+ * rather than only in the adapter path.
+ */
+NTSTATUS NTAPI AdaptoidControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_CDO_EXT cx = (PADAPTOID_CDO_EXT)DeviceObject->DeviceExtension;
+
+	AdaptoidCancelNotifications(cx, Irp);
+
+	ExAcquireFastMutex(&g_ControlMutex);
+	if (cx->OpenCount > 0) {
+		cx->OpenCount--;
+	}
+	ExReleaseFastMutex(&g_ControlMutex);
+
+	AdaptoidControlMaybeDelete();
+	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0);
+	return STATUS_SUCCESS;
+}
+
+/*
+ * IRP_MJ_DEVICE_CONTROL. Eleven driver-wide codes and a forward for the
+ * per-device ones, all of which is core_ctl_dispatch's; what is here is the
+ * IRP, and the one code that cannot be answered synchronously.
+ */
+NTSTATUS NTAPI AdaptoidControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_CDO_EXT  cx = (PADAPTOID_CDO_EXT)DeviceObject->DeviceExtension;
+	PIO_STACK_LOCATION sl = IoGetCurrentIrpStackLocation(Irp);
+	core_ioctl         req;
+	u32                info = 0;
+	u32                st;
+
+	req.code    = sl->Parameters.DeviceIoControl.IoControlCode;
+	req.in      = (const u8 *)ADAPTOID_IRP_BUFFER(Irp);
+	req.in_len  = sl->Parameters.DeviceIoControl.InputBufferLength;
+	req.out     = (u8 *)ADAPTOID_IRP_BUFFER(Irp);
+	req.out_len = sl->Parameters.DeviceIoControl.OutputBufferLength;
+
+	/*
+	 * THE WAITER IS PARKED BEFORE THE DISPATCH, not after, because
+	 * core_notify_wait may deliver an event and complete the IRP inside
+	 * the call. Nothing may touch the IRP after that, which is why the
+	 * pending case returns immediately.
+	 */
+	if (CORE_IOCTL_FN(req.code) == CORE_CTL_WAIT_NOTIFY &&
+	    req.in_len == 0 && req.out_len == CORE_NOTIFY_BYTES) {
+		return AdaptoidWaitNotification(cx, Irp);
+	}
+
+	st = core_ctl_dispatch(&cx->Registry, &req, NULL,
+	                       KeQueryInterruptTime(), &info);
+	AdaptoidCompleteIrp(Irp, (NTSTATUS)st, info);
+	return (NTSTATUS)st;
+}
+
+/*
+ * IRP_MJ_READ and IRP_MJ_WRITE - the SDK command-block channel.
+ *
+ * ONE HANDLER FOR BOTH, as the original has, because the two directions
+ * share the block and differ only in which pass they run.
+ */
+NTSTATUS NTAPI AdaptoidControlReadWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_CDO_EXT  cx = (PADAPTOID_CDO_EXT)DeviceObject->DeviceExtension;
+	PIO_STACK_LOCATION sl = IoGetCurrentIrpStackLocation(Irp);
+	u8                *buf = (u8 *)ADAPTOID_IRP_BUFFER(Irp);
+	u32                info = 0;
+	u32                st;
+	ULONG              len;
+
+	if (cx == NULL) {
+		AdaptoidCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+		return STATUS_DELETE_PENDING;
+	}
+
+	if (sl->MajorFunction == IRP_MJ_WRITE) {
+		len = sl->Parameters.Write.Length;
+		st  = core_cmd_write(&cx->Registry, &cx->Channel, buf, len,
+		                     KeQueryInterruptTime(), &info);
+	} else {
+		len = sl->Parameters.Read.Length;
+		st  = core_cmd_read(&cx->Registry, &cx->Channel, buf, len,
+		                    KeQueryInterruptTime(), &info);
+	}
+	AdaptoidCompleteIrp(Irp, (NTSTATUS)st, info);
+	return (NTSTATUS)st;
 }

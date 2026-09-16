@@ -76,6 +76,7 @@ typedef signed   long long  LONGLONG;
 #define STATUS_NOT_SUPPORTED            ((NTSTATUS)0xC00000BBL)
 #define STATUS_DELETE_PENDING           ((NTSTATUS)0xC0000056L)
 #define STATUS_CANCELLED                ((NTSTATUS)0xC0000120L)
+#define STATUS_INVALID_DEVICE_STATE     ((NTSTATUS)0xC0000184L)
 
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 
@@ -110,6 +111,18 @@ typedef ULONG KIRQL;
 
 typedef struct _KEVENT  { LONG Signalled; } KEVENT,  *PKEVENT;
 typedef struct _KTIMER  { ULONGLONG Due;  } KTIMER,  *PKTIMER;
+
+struct _KDPC;
+typedef void (NTAPI *PKDEFERRED_ROUTINE)(struct _KDPC *, PVOID, PVOID, PVOID);
+typedef struct _KDPC {
+	PKDEFERRED_ROUTINE Routine;
+	PVOID              Context;
+	LONG               Queued;
+} KDPC, *PKDPC;
+
+/* The original guards its control-device singleton with a fast mutex. The
+ * harness is single-threaded, so this is a counter it can assert on. */
+typedef struct _FAST_MUTEX { LONG Held; } FAST_MUTEX, *PFAST_MUTEX;
 
 /*
  * DEVICE_OBJECT and IRP are opaque to the skeleton. Only the members the
@@ -153,7 +166,66 @@ typedef struct _DEVICE_CAPABILITIES {
 	ULONG  RawDeviceOK:1;
 	ULONG  SurpriseRemovalOK:1;     /* 0x200 */
 	ULONG  WakeFromD0:1;
+
+	/*
+	 * THE SYSTEM-TO-DEVICE POWER MAP, indexed by system power state. This
+	 * is what AdaptoidDeviceStateFor reads, and the reason the driver has
+	 * to fetch capabilities at all - without it there is no way to know
+	 * which D-state a given sleep state should mean.
+	 */
+	/* PowerSystemUnspecified .. PowerSystemMaximum. The literal rather
+	 * than ADAPTOID_SYSTEM_STATE_MAX because wdm.h defines that from
+	 * PowerSystemMaximum, and wdm.h includes this file first. */
+	ULONG  DeviceState[7];
+	ULONG  DeviceWake;      /* deepest D-state the device can wake from */
+	ULONG  SystemWake;
 } DEVICE_CAPABILITIES, *PDEVICE_CAPABILITIES;
+
+/* Power minor function codes. */
+#define IRP_MN_WAIT_WAKE                0x00
+#define IRP_MN_SET_POWER                0x02
+
+/*
+ * The two Power.Type values. An ENUM, not two #defines, because the DDK
+ * spells them this way and a macro named DevicePowerState would rewrite the
+ * device-extension member of the same name - which is exactly what happened
+ * the first time these were written as macros.
+ */
+typedef enum _POWER_STATE_TYPE {
+	SystemPowerState = 0,
+	DevicePowerState = 1
+} POWER_STATE_TYPE;
+
+/*
+ * The D and S state enumerations, and the union that carries either. Shaped
+ * exactly as the DDK shapes them, because PREQUEST_POWER_COMPLETE takes a
+ * POWER_STATE by value and a mismatch there is a silent ABI difference
+ * between the two builds rather than a compile error in one of them.
+ */
+typedef enum _DEVICE_POWER_STATE {
+	PowerDeviceUnspecified = 0,
+	PowerDeviceD0,
+	PowerDeviceD1,
+	PowerDeviceD2,
+	PowerDeviceD3,
+	PowerDeviceMaximum
+} DEVICE_POWER_STATE;
+
+typedef enum _SYSTEM_POWER_STATE {
+	PowerSystemUnspecified = 0,
+	PowerSystemWorking,
+	PowerSystemSleeping1,
+	PowerSystemSleeping2,
+	PowerSystemSleeping3,
+	PowerSystemHibernate,
+	PowerSystemShutdown,
+	PowerSystemMaximum
+} SYSTEM_POWER_STATE;
+
+typedef union _POWER_STATE {
+	SYSTEM_POWER_STATE SystemState;
+	DEVICE_POWER_STATE DeviceState;
+} POWER_STATE, *PPOWER_STATE;
 
 typedef struct _IO_STACK_LOCATION {
 	UCHAR        MajorFunction;
@@ -168,6 +240,25 @@ typedef struct _IO_STACK_LOCATION {
 		struct {
 			PDEVICE_CAPABILITIES Capabilities;
 		} DeviceCapabilities;
+		struct {
+			ULONG Length;
+		} Read;
+		struct {
+			ULONG Length;
+		} Write;
+		/*
+		 * Shaped like the DDK's, FIELD FOR FIELD. Type selects which
+		 * arm of the State union is meaningful, and State is a union
+		 * rather than a ULONG - getting that wrong compiles cleanly in
+		 * the harness and then fails to build against the real DDK,
+		 * which is how this was found.
+		 */
+		struct {
+			ULONG            SystemContext;
+			POWER_STATE_TYPE Type;
+			POWER_STATE      State;
+			ULONG            ShutdownType;
+		} Power;
 	} Parameters;
 } IO_STACK_LOCATION, *PIO_STACK_LOCATION;
 
@@ -199,6 +290,14 @@ typedef struct _IRP {
 	LIST_ENTRY         ListEntry;
 	PVOID              CancelRoutine;
 	BOOLEAN            Cancel;
+	BOOLEAN            PendingReturned;
+	KIRQL              CancelIrql;
+	/*
+	 * The DDK's Tail.Overlay.DriverContext - four pointers a driver may
+	 * use while it owns the IRP. wdm.c parks a core_notify_waiter here so
+	 * that queueing a notification cannot fail for want of memory.
+	 */
+	PVOID              DriverContext[4];
 } IRP, *PIRP;
 
 /*
@@ -208,6 +307,11 @@ typedef struct _IRP {
  */
 #define IoGetCurrentIrpStackLocation(Irp)   ((Irp)->CurrentStackLocation)
 #define IoGetNextIrpStackLocation(Irp)      ((Irp)->NextStackLocation)
+#define IoMarkIrpPending(Irp)               ((Irp)->PendingReturned = TRUE)
+
+void IoSetCancelRoutine(PIRP Irp, PVOID Routine);
+void IoAcquireCancelSpinLock(KIRQL *Irql);
+void IoReleaseCancelSpinLock(KIRQL Irql);
 
 struct _DRIVER_OBJECT;
 
@@ -306,6 +410,9 @@ ULONGLONG KeQueryInterruptTime(void);
 /* Completing a request is the one kernel call the transport cannot avoid. */
 #define IO_NO_INCREMENT 0
 
+/* The DDK spelling. In the driver build ntddk.h supplies it. */
+#define UNREFERENCED_PARAMETER(P)   ((void)(P))
+
 void     IoCompleteRequest(PIRP Irp, CHAR PriorityBoost);
 
 /*
@@ -315,5 +422,55 @@ void     IoCompleteRequest(PIRP Irp, CHAR PriorityBoost);
 NTSTATUS IofCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 void     IoCopyCurrentIrpStackLocationToNext(PIRP Irp);
 void     IoSkipCurrentIrpStackLocation(PIRP Irp);
+
+/*
+ * Power. PoCallDriver and PoStartNextPowerIrp are separate calls from the
+ * IRP ones on purpose: the ORDER of them is the protocol - every path must
+ * call PoStartNextPowerIrp before PoCallDriver - and the harness checks that
+ * by recording both.
+ */
+typedef void (NTAPI *PREQUEST_POWER_COMPLETE)(PDEVICE_OBJECT DeviceObject,
+                                        UCHAR MinorFunction,
+                                        POWER_STATE PowerState,
+                                        PVOID Context, PIO_STATUS_BLOCK Io);
+
+void     PoStartNextPowerIrp(PIRP Irp);
+NTSTATUS PoCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS PoRequestPowerIrp(PDEVICE_OBJECT DeviceObject, UCHAR MinorFunction,
+                           POWER_STATE PowerState,
+                           PREQUEST_POWER_COMPLETE Complete,
+                           PVOID Context, PIRP *Irp);
+
+/* Completion routines, and the three flags that say when to run one. */
+typedef NTSTATUS (NTAPI *PIO_COMPLETION_ROUTINE)(PDEVICE_OBJECT DeviceObject,
+                                           PIRP Irp, PVOID Context);
+
+void IoSetCompletionRoutine(PIRP Irp, PIO_COMPLETION_ROUTINE Routine,
+                            PVOID Context, BOOLEAN OnSuccess,
+                            BOOLEAN OnError, BOOLEAN OnCancel);
+
+/* Timers and DPCs, for the script scheduler. */
+void    KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context);
+void    KeInitializeTimer(PKTIMER Timer);
+BOOLEAN KeSetTimer(PKTIMER Timer, LONGLONG DueTime, PKDPC Dpc);
+BOOLEAN KeCancelTimer(PKTIMER Timer);
+
+/* The control device object. */
+void     ExInitializeFastMutex(PFAST_MUTEX Mutex);
+void     ExAcquireFastMutex(PFAST_MUTEX Mutex);
+void     ExReleaseFastMutex(PFAST_MUTEX Mutex);
+
+#define FILE_DEVICE_UNKNOWN 0x00000022
+#define DO_BUFFERED_IO      0x00000004
+#define DO_DEVICE_INITIALIZING 0x00000080
+
+void     RtlInitUnicodeString(PUNICODE_STRING Target, PCWSTR Source);
+NTSTATUS IoCreateDevice(PDRIVER_OBJECT DriverObject, ULONG ExtensionSize,
+                        PUNICODE_STRING Name, ULONG DeviceType,
+                        ULONG Characteristics, BOOLEAN Exclusive,
+                        PDEVICE_OBJECT *DeviceObject);
+void     IoDeleteDevice(PDEVICE_OBJECT DeviceObject);
+NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING Link, PUNICODE_STRING Target);
+NTSTATUS IoDeleteSymbolicLink(PUNICODE_STRING Link);
 
 #endif /* ADAPTOID_KSTUB_H */

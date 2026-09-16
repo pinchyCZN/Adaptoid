@@ -28,7 +28,48 @@ Table of Contents
    1.  The Format
    2.  Kinds
    3.  Entries That Are Not One To One
-   4.  Keeping It Honest
+      FIVE ORIGINALS HAVE NO ROW AT ALL, and the reason differs in each case.
+   They are listed here rather than left as a silent gap, because "no row"
+   and "not yet ported" look identical in the file.
+
+   +----------+-------------------------------+------------------------+
+   | Address  | Original                      | Why there is no row    |
+   +==========+===============================+========================+
+   | 000105e7 | drv_ReleaseControlDeviceExt   | Nothing to release.    |
+   |          |                               | AdaptoidControlDevice- |
+   |          |                               | Ext looks the          |
+   |          |                               | singleton up WITHOUT   |
+   |          |                               | taking a reference, so |
+   |          |                               | the paired release has |
+   |          |                               | no counterpart. That   |
+   |          |                               | is deliberate: the     |
+   |          |                               | original's coupling of |
+   |          |                               | the two is defect 14.  |
+   +----------+-------------------------------+------------------------+
+   | 000191f0 | drv_StrPrepend                | The location name is   |
+   | 00019270 | drv_StrCopy                   | built straight into    |
+   |          |                               | its destination,       |
+   |          |                               | outermost first, so    |
+   |          |                               | there is no string to  |
+   |          |                               | prepend to and no      |
+   |          |                               | second copy to make.   |
+   |          |                               | See known-defects.txt  |
+   |          |                               | section 6.             |
+   +----------+-------------------------------+------------------------+
+   | 00019a10 | __aulldiv                     | Compiler intrinsics    |
+   | 00019a80 | __alldiv                      | for 64-bit division on |
+   |          |                               | x86, emitted by the    |
+   |          |                               | 2001 toolchain. Not    |
+   |          |                               | the driver's code and  |
+   |          |                               | not ported; the        |
+   |          |                               | replacement's compiler |
+   |          |                               | supplies its own.      |
+   +----------+-------------------------------+------------------------+
+
+   So 142 of the 147 functions in wishk201.sys have at least one row, and
+   the five that do not are accounted for above.
+
+4.  Keeping It Honest
    5.  Why Not An Aligned Table
 
 1.  The Format

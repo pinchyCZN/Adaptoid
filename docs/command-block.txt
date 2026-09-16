@@ -1,0 +1,369 @@
+Adaptoid Reverse Engineering                               Analysis Note
+
+
+                      THE SDK COMMAND-BLOCK CHANNEL
+
+
+Abstract
+
+   The control device \\.\Wish_NA1 has two user-mode surfaces. One is the
+   eleven private IOCTLs the configurator drives, specified in
+   ioctl-surface.txt. The other is IRP_MJ_READ and IRP_MJ_WRITE, and what
+   flows over those is a 64-byte block of N64 JOYBUS COMMANDS - the simple
+   interface the vendor SDK documents for third-party software.
+
+   This note specifies that channel: the block format, the two-pass
+   execution model, which commands the driver answers from cached state,
+   which two joybus addresses it EMULATES rather than putting on the wire,
+   and the byte-order convention a big-endian client uses.
+
+   The interesting finding is that a polling application costs NO USB
+   TRAFFIC AT ALL. The controller-state read is answered out of the
+   interrupt-poll cache, so a game reading the stick sixty times a second
+   never touches the bus.
+
+Table of Contents
+
+   1.  Where It Lives
+   2.  The Block Format
+   3.  The Two Passes
+   4.  The Emulated Controller Pak
+   5.  The Wire Path
+   6.  Byte Order
+   7.  Failure Reporting
+   8.  Dead Code
+   9.  Open Questions
+
+
+1.  Where It Lives
+
+   drv_ControlDeviceReadWrite, 000113b0, is the single handler for both
+   IRP_MJ_READ and IRP_MJ_WRITE on the control device. It calls
+   drv_ProcessCommandBlock, 00010c30, which walks the block, and that calls
+   drv_ExecuteRawCommand, 00010e20, once per entry.
+
+   The driver keeps ONE BLOCK, in the control device's extension, shared by
+   both directions. A write stores into it; a read hands it back. So the
+   normal sequence is write-then-read, and the answers appear in the same
+   buffer positions the commands occupied.
+
+   +--------+-----------------------------------------------------------+
+   | Length | What it means                                             |
+   +========+===========================================================+
+   |      0 | Succeeds having done nothing.                             |
+   |      1 | READ ONLY: one byte, the live adapter count. This is the  |
+   |        | ONE request allowed when no adapter is present, so a      |
+   |        | client can poll for arrival.                              |
+   |   0x40 | A command block.                                          |
+   | other  | A read in 2..0x3F succeeds having written nothing and     |
+   |        | still reports that many bytes. A write of any length      |
+   |        | other than 0x40 is STATUS_INVALID_PARAMETER.              |
+   | > 0x40 | STATUS_INVALID_PARAMETER.                                 |
+   +--------+-----------------------------------------------------------+
+
+   With no live adapter, everything except the one-byte read answers
+   STATUS_NO_SUCH_DEVICE.
+
+
+2.  The Block Format
+
+   A block is a sequence of variable-length entries, walked from byte 0
+   and bounded at byte 0x3F. Byte 0x3F itself is not part of any entry: it
+   is the GO FLAG.
+
+       +------+------+--------------------+--------------------+
+       | 0x00 | 0x01 | 0x02 .. 0x01+CMD   | .. + REPLY         |
+       +======+======+====================+====================+
+       | CMD  | RPLY | the command bytes  | space for the      |
+       | len  | len  | to put on the bus  | controller's reply |
+       +------+------+--------------------+--------------------+
+
+   The next entry begins at CMD + RPLY + 2 bytes further on.
+
+   THREE VALUES OF THE FIRST BYTE ARE NOT LENGTHS:
+
+       0x00   padding. Skip one byte AND ADVANCE THE DEVICE INDEX.
+       0xFE   end of block. Stop.
+       0xFF   skip one byte, device index unchanged.
+
+   THE DEVICE INDEX IS POSITIONAL. Each real entry addresses the Nth
+   adapter on the driver-wide device list, N being the number of entries
+   seen so far. That is why 0x00 and 0xFF differ: padding is how a client
+   addresses adapter 2 without sending anything to 0 and 1, while 0xFF is
+   alignment filler that does not consume an adapter.
+
+   At most five entries are accepted; a sixth is rejected.
+
+   The reply-length byte carries a flag in its top bit, so the length is
+   the low six bits and 0x80 means "this entry failed". Both lengths are
+   bounded at 0x26.
+
+
+3.  The Two Passes
+
+   drv_ProcessCommandBlock takes a pass number, and the two directions run
+   different passes over the same block:
+
+       WRITE  ->  pass 0
+       READ   ->  pass 1
+
+   Pass 1 owns the two entries the driver can answer without a round trip
+   to the controller. Pass 0 owns everything else.
+
+   +-------------------------+------+---------------------------------+
+   | Entry                   | Pass | What happens                    |
+   +=========================+======+=================================+
+   | CMD 1, RPLY 4, cmd 0x01 |    1 | Answered from the last          |
+   |                         |      | interrupt packet. NO USB.       |
+   | CMD 1, RPLY 3, cmd 0x00 |    1 | The joybus identify. Runs for   |
+   | or 0xFF                 |      | real, and the driver KEEPS the  |
+   |                         |      | answer - see section 4.         |
+   | anything else           |    0 | The wire path, section 5.       |
+   +-------------------------+------+---------------------------------+
+
+   THE CACHED READ IS THE WHOLE POINT OF THE DESIGN. Joybus command 0x01
+   with a four-byte reply means "give me the controller state", and the
+   driver already has that: the interrupt pipe is being polled anyway to
+   produce HID reports. The four bytes are taken from the cached raw packet
+   and reordered:
+
+       raw packet   X       Y       status  btn-hi  btn-lo
+       byte         [0]     [1]     [2]     [3]     [4]
+
+       reply        btn-hi  btn-lo  X       Y
+       from         raw[4]  raw[3]  raw[0]  raw[1]
+
+   THE GO FLAG IS CLEARED IN THE COPY, NOT IN THE DRIVER'S BLOCK. A read
+   copies the block out, runs pass 1 over the copy, and zeroes byte 0x3F of
+   the copy - the driver's own block keeps its flag set. So a client can
+   read repeatedly and get a fresh controller state every time, without
+   writing the block again. That is how a 60Hz poll costs one read call.
+
+
+4.  The Emulated Controller Pak
+
+   Two joybus addresses are answered by the driver itself and never reach
+   the controller.
+
+   Joybus addresses are eleven bits with a five-bit CRC in the low five,
+   so the address WORD in the command is the address plus its CRC-5:
+
+       0x8001   ->  address 0x8000, the Rumble Pak identify region
+       0xC01B   ->  address 0xC000, the Rumble Pak motor register
+
+   WHY EMULATE THEM. The real motor belongs to the driver's effect engine,
+   which is running its own schedule of pulses; an SDK client writing the
+   motor register directly would fight it. Emulating the pair lets a client
+   run the standard Rumble Pak identify sequence, get the answer it
+   expects, and have its motor writes routed into the effect engine's
+   enable path instead of onto the bus.
+
+4.1.  The Write, Command 0x03
+
+   CMD 0x23, RPLY 1: one command byte, two address bytes, thirty-two data
+   bytes, and a one-byte CRC-8 reply.
+
+   The first data byte is remembered - for BOTH addresses, which is what
+   makes the identify sequence work. The reply is a constant, chosen by
+   that byte:
+
+       +-------+-------+---------------------------------------------+
+       | value | reply | what it is                                  |
+       +=======+=======+=============================================+
+       | 0x00  | 0x00  | CRC-8 of thirty-two 0x00 bytes              |
+       | 0x01  | 0xEB  | CRC-8 of thirty-two 0x01 bytes              |
+       | 0x80  | 0xB8  | CRC-8 of thirty-two 0x80 bytes              |
+       | 0xFE  | 0xE1  | CRC-8 of thirty-two 0xFE bytes              |
+       +-------+-------+---------------------------------------------+
+
+   These are constants in the binary; no CRC is computed on this path.
+   That they ARE the CRCs is established by running drv_N64PakDataCrc8's
+   algorithm over thirty-two identical bytes, which is checked in the
+   replacement's harness rather than asserted here.
+
+   Any other value leaves the reply byte untouched. See known-defects.txt
+   section 19.
+
+   WITH NO ACCESSORY PRESENT THE REPLY IS INVERTED - the ones' complement
+   of the value above. That is the joybus convention for "no accessory in
+   the port", not an error code of the driver's.
+
+   A write to 0xC000 of 0 or 1, with an accessory present, is passed to
+   drv_SetDeviceEnable as motor off or motor on.
+
+4.2.  The Read, Command 0x02
+
+   CMD 3, RPLY 0x21: one command byte and two address bytes, thirty-two
+   data bytes and a CRC back. Only address 0x8000 is emulated.
+
+       +------------------------+-----------+------+
+       | state                  | 32 bytes  | CRC  |
+       +========================+===========+======+
+       | no accessory           | 0x00      | 0xFF |
+       | last write was 0xFE    | 0x00      | 0x00 |
+       | anything else          | 0x80      | 0xB8 |
+       +------------------------+-----------+------+
+
+   Which is exactly what a Rumble Pak does: write 0x80 to 0x8000 and read
+   it back to confirm one is there; write 0xFE first and read zeroes to
+   confirm the probe worked.
+
+4.3.  The State Is The Channel's Own
+
+   The two fields behind this - EmulatedPakValue at devext+0x42C and
+   EmulatedPakPresent at +0x430 - have seven references in the whole
+   driver, and every one of them is in drv_ProcessCommandBlock,
+   drv_ExecuteRawCommand or drv_ResetAllDeviceState. Neither reaches the
+   effect engine or the HID path.
+
+   EmulatedPakPresent is set from bit 0 of the identify's status byte, and
+   when bits 0 and 1 together are not 01 - meaning the accessory changed -
+   the device's keep-alive timestamp is cleared so the effect engine
+   re-arms the motor.
+
+
+5.  The Wire Path
+
+   Everything else goes out as a vendor control transfer, in one of two
+   forms. The guard that chooses the path is
+
+       cmd_len < 5  OR  reply_len < 4
+
+   and drv_ProcessCommandBlock rejects the complementary case - a command
+   of five or more bytes wanting four or more back - as structurally bad
+   before it gets here, so the fall-through in drv_ExecuteRawCommand is
+   unreachable from its only caller.
+
+5.1.  Short Form, cmd_len < 5
+
+   One device-to-host transfer. The command length is encoded in the
+   request code and the command bytes travel in the setup packet:
+
+       bmRequestType  0xC0
+       bRequest       0x20 + cmd_len
+       wValue         cmd[0] | (cmd[1] << 8)
+       wIndex         cmd[2] | (cmd[3] << 8)
+
+   with bytes the command is too short to supply set to zero. The transfer
+   reads reply_len + 1 bytes; the leading byte is a status and the rest is
+   the reply. A status of zero means the command failed.
+
+5.2.  Long Form, cmd_len >= 5 and reply_len < 4
+
+   Two transfers, which must not be interleaved with anything else:
+
+       write   bmRequestType  0x40
+               bRequest       0x20
+               wValue         reply_len | (cmd[0] << 8)
+               wIndex         cmd[1] | (cmd[2] << 8)
+               data           cmd[3..], cmd_len - 3 bytes
+
+       read    bmRequestType  0xC0
+               bRequest       0x71
+               wValue         0x0030
+               wIndex         0x0000
+               data           reply_len + 1 bytes
+
+   The read's leading status byte is a LENGTH WITH A VALID BIT here, not a
+   flag: bit 7 must be set and the low six bits must equal reply_len.
+
+   THE SLOT IS HELD ACROSS BOTH. The first transfer's completion routine
+   returns non-zero, which tells the vendor engine not to release the
+   vendor slot; the second returns zero and releases it. The two routines -
+   drv_VendorRequestCompleteKeepSlot at 00018d10 and
+   drv_VendorRequestComplete at 00018cf0 - are byte for byte identical
+   except for that return value, and that is the only reason both exist.
+
+5.3.  The Status Byte Lands On A Command Byte
+
+   Both forms read into reply - 1, which is the LAST BYTE OF THE COMMAND.
+   The driver saves that byte before the transfer and puts it back
+   afterwards. It is a neat trick - no bounce buffer is needed - and it is
+   worth knowing about, because a reimplementation that reads into the
+   reply area directly loses the status byte.
+
+5.4.  The Reply Comes Back Reversed
+
+   After the transfer the reply_len bytes of the reply are reversed in
+   place. The adapter returns a joybus reply least-significant byte first;
+   the reversal puts it back into joybus order.
+
+   Worked example, the identify: a controller answers 05 00 <status> on
+   the bus, the adapter delivers <status> 00 05 over USB, and after the
+   reversal the block holds 05 00 <status> - which is why
+   drv_ProcessCommandBlock reads the accessory bit out of the LAST reply
+   byte.
+
+
+6.  Byte Order
+
+   The dword at offset 0x3C selects it. A write whose dword there is 1 is
+   byte-swapped on the way in - every four-byte group reversed - and every
+   subsequent read is byte-swapped on the way out.
+
+   NOTE WHAT THAT WORD BECOMES. Reversing dword 15 moves the 1 from byte
+   0x3C to byte 0x3F, which is the go flag. So for a big-endian client the
+   swap request and the run request are THE SAME BIT, and such a client has
+   no way to write a block without also asking for it to run.
+
+   A little-endian client writes zero there and sets byte 0x3F directly.
+
+
+7.  Failure Reporting
+
+   A failed entry is marked by setting 0x80 in its reply-length byte. There
+   are TWO KINDS of failure and they are distinguishable by what happens to
+   the rest of the block:
+
+   +---------------------------------------+---------------------------+
+   | Condition                             | Effect                    |
+   +=======================================+===========================+
+   | command length above 0x26             | mark and STOP the walk    |
+   | reply length above 0x26               | mark and STOP             |
+   | command above 4 with reply above 3    | mark and STOP             |
+   | entry runs past byte 0x3F             | mark and STOP             |
+   | more than five entries                | mark and STOP             |
+   | no adapter at that index              | mark and CARRY ON         |
+   | reply length exactly 0x26             | mark and CARRY ON         |
+   | vendor slot busy                      | NOT MARKED - defect 18    |
+   +---------------------------------------+---------------------------+
+
+   The 0x26 row is an inconsistency of the original's: the validation
+   accepts a reply length of exactly 0x26 and the execute path then
+   rejects it. A client can observe the difference.
+
+
+8.  Dead Code
+
+   Two loops on this path compute results that are never read, and are
+   recorded so that a reimplementation does not go looking for their
+   purpose.
+
+   -  drv_ExecuteRawCommand, in the emulated Pak write, walks the
+      thirty-two data bytes checking they are all equal to the first. The
+      loop counter and the break are both discarded; the reply is chosen
+      from the first byte alone whether the rest match or not.
+
+   -  drv_ControlDeviceReadWrite, on the write path when the go flag is
+      NOT set, scans the block for the first non-zero dword. The index it
+      finds is discarded.
+
+   Neither affects behaviour. The first looks like the start of a
+   validity check that was never finished.
+
+
+9.  Open Questions
+
+   -  Vendor request 0x71 with wValue 0x0030 is the long form's fixed
+      read. What 0x30 selects is not established; it is the same on every
+      long-form command.
+
+   -  Request codes 0x21 through 0x24 - 0x20 plus the command length -
+      suggest the adapter decodes the length from the request number
+      rather than from a field. Whether 0x25 and above exist in the
+      firmware is unknown; the driver never sends them, because the wire
+      path is only reached with cmd_len below 5.
+
+   -  The block is per control device, not per handle. Two SDK clients
+      with separate handles share one block and will corrupt each other's
+      commands. Whether the SDK documents this is unknown.

@@ -7,12 +7,15 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Fourteen defects have been found during reverse engineering: two
+   Nineteen defects have been found during reverse engineering: two
    arithmetic ones in wishk201.sys, a pair of unbounded string copies also
    in the driver, a race in wishh201.dll, a bounds check in the script
    interpreter that tests the wrong value, four in the script engine's
-   native builtin library, three on the private IOCTL surface, and two
-   remove-lock references that error paths never give back.
+   native builtin library, three on the private IOCTL surface, two
+   remove-lock references that error paths never give back, and five found
+   last on the CONTROL DEVICE and its SDK command-block channel - the
+   surface the vendor SDK's own clients use, as against the one the
+   configurator uses.
 
    THE TWO REMOVE-LOCK DEFECTS, SECTIONS 16 AND 17, ARE THE SAME MISTAKE
    TWICE and are worth reading together. Both are a reference taken and not
@@ -44,7 +47,16 @@ Abstract
    simple remapping profile would hit, which is why the software's
    reputation for robustness survives them.
 
-   None of the fourteen is in the HID report descriptor or the keyboard and
+   THE LAST FIVE, SECTIONS 18 TO 22, SHARE A THEME. All are on the control
+   device, none is on the path the configurator drives, and three of them
+   are the same shape: a failure that is not reported as one. A creation
+   that failed still counts as a success, a command dropped for a busy
+   slot is indistinguishable from one that ran, and a write of an
+   unrecognised value hands the caller its own input back as though it
+   were an answer. The per-device surface is markedly more careful than
+   this one.
+
+   None of the nineteen is in the HID report descriptor or the keyboard and
    mouse report builders.
 
 Table of Contents
@@ -66,7 +78,12 @@ Table of Contents
    15. Defect 13: The Script Fault Snapshot Can Leak
    16. Defect 14: A Remove Lock Is Not Released On One Path
    17. Defect 15: A Rejected Vendor Request Acquires Instead Of Releasing
-   18. What Is Not Affected
+   18. Defect 16: The Control Device Counts A Creation That Failed
+   19. Defect 17: An Emulated Pak Write Can Leave Its Reply Unwritten
+   20. Defect 18: A Busy Vendor Slot Drops An SDK Command Silently
+   21. Defect 19: A Notification Wait Returns A Status It Has Forfeited
+   22. Defect 20: The Control Device's Power IRP Stalls The Power Queue
+   23. What Is Not Affected
 
 1.  Severity Summary
 
@@ -106,6 +123,21 @@ Table of Contents
        rejected vendor request   vendor           yes, reachable
        acquires the remove lock  transport        from user mode
        instead of releasing it
+       control device counts a    control device   no, needs an
+       creation that failed                        allocation failure
+       emulated pak write with    SDK command      yes, reachable
+       an unrecognised value      block            from user mode
+       leaves the reply byte
+       unwritten
+       busy vendor slot drops     SDK command      yes, whenever the
+       an SDK command with no     block            effect engine holds
+       error                                       the slot
+       notification wait marks    control device   no, needs the
+       pending then returns                        request to be
+       cancelled                                   cancelled in the
+                                                   dispatch window
+       control device power IRP   control device   no, nothing sends
+       omits PoStartNextPowerIrp                   one
        (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
@@ -848,7 +880,155 @@ Table of Contents
    restoring the original's call makes that count reach thirteen instead of
    one, which is the two-per-rejection arithmetic showing through.
 
-18. What Is Not Affected
+18. Defect 16: The Control Device Counts A Creation That Failed
+
+   drv_CreateControlDevice, 000103be, increments its reference count
+   OUTSIDE the success test:
+
+       if (drv_g_ControlDeviceObject == NULL) {
+           status = IoCreateDevice(...);
+           if (status >= 0) {
+               status = IoCreateSymbolicLink(...);
+               if (status < 0) IoDeleteDevice(dev);
+               else            /* publish it */ ;
+           }
+       }
+       drv_g_ControlDeviceRefCount++;      <- unconditional
+       return status;
+
+   So an adapter that arrives while creation fails - out of pool, or the
+   symbolic link name already taken - still counts as a user of a device
+   that was never made. The count is one too high from then on.
+
+   WHAT IT COSTS is not the failed arrival, it is every later one. The
+   count never returns to zero, so drv_ControlDeviceClose never takes the
+   branch that deletes the device, and the singleton and its symbolic link
+   outlive the last adapter for the lifetime of the driver.
+
+   Reachable? Only through an allocation failure or a name collision, so in
+   practice no. It is a one-line slip - the increment belongs inside the
+   success test - and worth recording because a reimplementation naturally
+   writes the correct version and would otherwise look like a behaviour
+   change.
+
+   src_drv/wdm.c increments only on success; the harness checks it by
+   failing the creation and then requiring the next successful one to be
+   the first.
+
+
+19. Defect 17: An Emulated Pak Write Can Leave Its Reply Unwritten
+
+   drv_ExecuteRawCommand, 00010e20, answers a write to the emulated
+   Controller Pak with one of four constant CRC-8 values, chosen by the
+   data byte:
+
+       0xFE -> 0xE1      0x80 -> 0xB8      0x01 -> 0xEB      0x00 -> 0x00
+
+   There is NO ELSE. A write of any other value - and the SDK's command
+   block lets a client send any value it likes - falls through all four
+   comparisons and leaves the reply byte exactly as the caller supplied it.
+
+   The byte is in the caller's own buffer, so nothing of the kernel's is
+   disclosed. What the client sees is its own input handed back as though
+   it were a CRC, which is indistinguishable from a device that answered
+   with that value. A client checking the CRC to decide whether a Rumble
+   Pak is present can therefore be made to believe anything it likes by
+   pre-filling the reply byte.
+
+   Only four values are ever legitimate, so the honest answer for the rest
+   is a refusal. src_drv/ioctl.c reproduces the behaviour rather than
+   inventing a fifth answer, and says so at cmd_emulated_crc.
+
+
+20. Defect 18: A Busy Vendor Slot Drops An SDK Command Silently
+
+   The wire path of drv_ExecuteRawCommand claims the vendor slot before it
+   transfers anything:
+
+       claimed = (VendorSlotState == 0);
+       if (claimed) VendorSlotState = 1;
+       ...
+       if (claimed) { /* one or two transfers */ }
+
+   and when the claim fails the function simply ends. The entry's reply
+   length byte is NOT marked with 0x80, the reply space is left as it was,
+   and nothing anywhere records that the command did not run.
+
+   THE CALLER CANNOT TELL. Every other failure on this path sets 0x80 -
+   a length out of range, a missing device, a transport error - so a client
+   reasonably reads the absence of that bit as success. A command dropped
+   for a busy slot is the one case that lies.
+
+   And the slot is busy often: the effect engine holds it for the duration
+   of every motor update, and the keep-alive poke takes it once every three
+   seconds. An SDK client polling the controller while rumble is running is
+   exactly the case this hits.
+
+   Contrast the sibling path: drv_SetDeviceEnable, 00018b00, finds the slot
+   busy and DEFERS the work by setting a claim flag, precisely so that a
+   motor-off cannot be lost. The mechanism to do the right thing is already
+   there and this path does not use it.
+
+
+21. Defect 19: A Notification Wait Returns A Status It Has Forfeited
+
+   drv_IoctlWaitNotification, 000159e0, marks its IRP pending before it
+   has decided whether it will keep it:
+
+       IoMarkIrpPending(Irp);
+       InsertTailList(&CdoExt->WaiterList, &Irp->ListEntry);
+       InterlockedExchange(&Irp->CancelRoutine, drv_CancelNotificationIrp);
+       if (Irp->Cancel) {
+           if (InterlockedExchange(&Irp->CancelRoutine, 0) != 0) {
+               RemoveEntryList(...);
+               status = STATUS_CANCELLED;      <- returned as-is
+           }
+       }
+
+   IoMarkIrpPending sets SL_PENDING_RETURNED, which is the driver's promise
+   to the I/O manager that this dispatch routine will return
+   STATUS_PENDING. On the cancelled path it returns STATUS_CANCELLED
+   instead, having already made that promise.
+
+   The ORDER is what makes it wrong rather than merely untidy: the mark has
+   to come first, because from the moment the cancel routine is installed
+   another thread can complete the request, and a mark after that would
+   touch an IRP that is gone. The correct shape is to keep the order and
+   return STATUS_PENDING regardless - the request has already been
+   completed with STATUS_CANCELLED by then, so the caller still sees the
+   right answer.
+
+   src_drv/wdm.c's AdaptoidWaitNotification marks pending in the same place
+   and returns STATUS_PENDING on every path.
+
+
+22. Defect 20: The Control Device's Power IRP Stalls The Power Queue
+
+   drv_PowerTriage, 00011b70, recognises a power request aimed at the
+   control device and completes it with STATUS_NOT_SUPPORTED. It does not
+   call PoStartNextPowerIrp first.
+
+   Every power IRP must be answered with PoStartNextPowerIrp before it is
+   completed or passed on; that call is what releases the next power
+   request for that device object. Omitting it means no further power IRP
+   for the control device is ever delivered.
+
+   WHAT SAVES IT is that nothing sends power IRPs to the control device in
+   the first place - it is a raw device object with no PDO beneath it and
+   no power policy of its own, so the case the code handles is one the
+   system does not produce. It is a latent bug in a branch that is not
+   taken.
+
+   The contrast is what makes it worth recording: drv_DispatchPower,
+   00016e47, observes the rule on all five of its paths, including the
+   error path where the remove lock could not be taken. The driver knows
+   the rule; this one wrapper forgets it.
+
+   src_drv/wdm.c's AdaptoidPowerTriage calls PoStartNextPowerIrp, with the
+   divergence noted inline.
+
+
+23. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original

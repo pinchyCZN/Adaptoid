@@ -1293,11 +1293,512 @@ u32 core_ctl_dispatch(core_registry *reg, const core_ioctl *req,
 
 		env.cs         = d->cs;
 		env.sched      = d->sched;
-		env.vendor     = 0;
-		env.vendor_ctx = 0;
-		env.enable     = 0;
-		env.enable_ctx = 0;
+		/* The transport comes from the REGISTRY ENTRY, not from this
+		 * caller: a control-device request names its adapter by handle,
+		 * so the only thing that knows how to reach it is the entry. */
+		env.vendor     = d->vendor;
+		env.vendor_ctx = d->os_ctx;
+		env.enable     = d->enable;
+		env.enable_ctx = d->os_ctx;
 		env.now_100ns  = now_100ns;
 		return core_ioctl_dispatch(&env, &fwd, info);
 	}
+}
+
+/* ======================================================================
+ * THE SDK COMMAND-BLOCK CHANNEL
+ *
+ * Ported from drv_ProcessCommandBlock (00010c30), drv_ExecuteRawCommand
+ * (00010e20) and the block half of drv_ControlDeviceReadWrite (000113b0).
+ * ====================================================================== */
+
+void core_cmd_channel_init(core_cmd_channel *ch)
+{
+	u32 i;
+
+	if (ch == 0) {
+		return;
+	}
+	for (i = 0; i < CORE_CMD_BLOCK_BYTES; i++) {
+		ch->block[i] = 0;
+	}
+	ch->swap_bytes = 0;
+}
+
+/* Reverse every four-byte group of the block. */
+static void cmd_swap(u8 *block)
+{
+	u32 i;
+
+	for (i = 0; i < CORE_CMD_BLOCK_BYTES; i += 4) {
+		u8 t;
+
+		t            = block[i + 0];
+		block[i + 0] = block[i + 3];
+		block[i + 3] = t;
+		t            = block[i + 1];
+		block[i + 1] = block[i + 2];
+		block[i + 2] = t;
+	}
+}
+
+/* The Nth adapter on the registry, or null. */
+static core_device_entry *cmd_nth(core_registry *reg, s32 index)
+{
+	core_device_entry *d;
+	s32 n = index;
+
+	for (d = reg->devices.flink; d != &reg->devices; d = d->flink) {
+		if (n < 1) {
+			return d;
+		}
+		n--;
+	}
+	return 0;
+}
+
+/*
+ * The CRC-8 an emulated Controller Pak write of 32 identical bytes answers
+ * with.
+ *
+ * The original carries these four results as CONSTANTS - there is no CRC
+ * computation on this path at all, just a four-way compare on the data byte.
+ * They are reproduced as constants here for the same reason, and checked
+ * against core_pak_data_crc8 in the harness, which is what establishes that
+ * they are CRCs of 32 identical bytes and not magic numbers.
+ *
+ * A value that is none of the four leaves the reply byte UNWRITTEN in the
+ * original, so this returns the caller's existing byte to match. See
+ * known-defects.txt.
+ */
+static u8 cmd_emulated_crc(u32 value, u8 current)
+{
+	switch (value) {
+	case 0xFE: return 0xE1;
+	case 0x80: return 0xB8;
+	case 0x01: return 0xEB;
+	case 0x00: return 0x00;
+	default:   return current;
+	}
+}
+
+/*
+ * Build a USB setup packet. The joybus command bytes go into wValue and
+ * wIndex a byte at a time, LOW BYTE FIRST, and bytes the command is too
+ * short to supply are zero.
+ */
+static void cmd_setup(u8 *setup, u8 request_type, u8 request,
+                      u8 v_lo, u8 v_hi, u8 i_lo, u8 i_hi)
+{
+	setup[0] = request_type;
+	setup[1] = request;
+	setup[2] = v_lo;
+	setup[3] = v_hi;
+	setup[4] = i_lo;
+	setup[5] = i_hi;
+}
+
+void core_cmd_exec(core_device_entry *dev, u8 *entry)
+{
+	core_state *cs;
+	u8 *reply;
+	u32 cmd_len;
+	u32 reply_len;
+	u8  setup[6];
+
+	if (dev == 0 || dev->cs == 0 || entry == 0) {
+		return;
+	}
+	cs        = dev->cs;
+	cmd_len   = entry[0];
+	reply_len = entry[1];
+	reply     = entry + cmd_len + 2;
+
+	/*
+	 * PATH ONE: THE EMULATED PAK WRITE.
+	 *
+	 * Joybus command 0x03 writes 32 bytes to a Controller Pak address, so
+	 * the entry is 1 command byte + 2 address bytes + 32 data = 0x23, and
+	 * the reply is the single CRC-8 byte.
+	 *
+	 * The two addresses handled here are 0x8000 and 0xC000, carried as
+	 * 0x8001 and 0xC01B because the low five bits of a joybus address word
+	 * are its CRC-5. Those are the Rumble Pak's identify region and its
+	 * motor register, and the driver ANSWERS THEM ITSELF rather than
+	 * putting them on the bus - the real motor belongs to the effect
+	 * engine, and letting an SDK client drive it directly would fight it.
+	 *
+	 * WHEN NO ACCESSORY IS PRESENT THE CRC COMES BACK INVERTED. That is
+	 * the joybus convention for it, not an error code of the driver's.
+	 */
+	if (cmd_len == 0x23 && reply_len == 1 && entry[2] == 0x03 &&
+	    ((entry[3] == 0x80 && entry[4] == 0x01) ||
+	     (entry[3] == 0xC0 && entry[4] == 0x1B))) {
+		u32 value = entry[5];
+
+		/*
+		 * Both addresses write this, which is what makes the identify
+		 * sequence work: a client writes 0x80 to 0x8000 and reads it
+		 * back to learn that a Rumble Pak is there.
+		 */
+		cs->emu_pak_value = value;
+		reply[0] = cmd_emulated_crc(value, reply[0]);
+
+		if (!cs->emu_pak_present) {
+			reply[0] = (u8)~reply[0];
+			return;
+		}
+		/* Only the motor register drives anything. */
+		if (entry[3] == 0xC0 && entry[4] == 0x1B &&
+		    (value == 0 || value == 1) && dev->enable != 0) {
+			dev->enable(dev->os_ctx, (int)value);
+		}
+		return;
+	}
+
+	/*
+	 * PATH TWO: THE EMULATED PAK READ.
+	 *
+	 * Joybus command 0x02 reads 32 bytes plus a CRC from an address; only
+	 * 0x8000 is emulated. What comes back is decided by whatever the last
+	 * write put in emu_pak_value, which is how an identify resolves:
+	 *
+	 *     32 x 0x80 -> a Rumble Pak
+	 *     32 x 0x00 -> the client wrote 0xFE first, the Controller Pak probe
+	 *     no pak    -> 32 x 0x00 and an INVERTED CRC, 0xFF
+	 */
+	if (cmd_len == 3 && reply_len == 0x21 && entry[2] == 0x02 &&
+	    entry[3] == 0x80 && entry[4] == 0x01) {
+		u8  fill;
+		u32 i;
+
+		if (!cs->emu_pak_present) {
+			fill = 0x00;
+			reply[0x20] = 0xFF;
+		} else if (cs->emu_pak_value == 0xFE) {
+			fill = 0x00;
+			reply[0x20] = 0x00;
+		} else {
+			fill = 0x80;
+			reply[0x20] = 0xB8;
+		}
+		for (i = 0; i < 0x20; i++) {
+			reply[i] = fill;
+		}
+		return;
+	}
+
+	/*
+	 * PATH THREE: THE WIRE.
+	 *
+	 * THIS GUARD IS UNREACHABLE and is kept only because the original has
+	 * it. core_cmd_process rejects exactly the combination it tests -
+	 * cmd_len > 4 and reply_len > 3 - as a structural error before it ever
+	 * calls here, and that walker is the only caller. Dropping the guard
+	 * would change nothing; keeping it means a future caller cannot fall
+	 * off the end of the function with the entry unmarked.
+	 */
+	if (cmd_len >= 5 && reply_len >= 4) {
+		return;
+	}
+	if (dev->cmd_claim == 0 || dev->cmd_xfer == 0) {
+		return;
+	}
+	/*
+	 * A BUSY SLOT IS ALSO SILENT. The original claims the slot and, when
+	 * it cannot, falls straight out without setting CORE_CMD_FAILED.
+	 */
+	if (!dev->cmd_claim(dev->os_ctx)) {
+		return;
+	}
+
+	{
+		/*
+		 * THE STATUS BYTE LANDS ON THE LAST COMMAND BYTE. Both forms
+		 * read reply_len + 1 bytes into reply - 1, so the extra leading
+		 * byte overwrites the command byte just before the reply space.
+		 * It is saved and put back, which is why this works at all, and
+		 * why no bounce buffer is needed.
+		 */
+		u8 *status_at = reply - 1;
+		u8  saved     = *status_at;
+		u8  status;
+
+		if (cmd_len < 5) {
+			/* Short form: one device-to-host transfer, with the
+			 * command length encoded in bRequest. */
+			cmd_setup(setup, 0xC0, (u8)(0x20 + cmd_len),
+			          entry[2],
+			          (u8)(cmd_len >= 2 ? entry[3] : 0),
+			          (u8)(cmd_len >= 3 ? entry[4] : 0),
+			          (u8)(cmd_len >= 4 ? entry[5] : 0));
+			dev->cmd_xfer(dev->os_ctx, setup, status_at,
+			              reply_len + 1, 0);
+			status = *status_at;
+			*status_at = saved;
+			if (status == 0) {
+				entry[1] |= CORE_CMD_FAILED;
+			}
+		} else {
+			/* Long form: a host-to-device write carrying the
+			 * command, then a fixed read collecting the reply. The
+			 * first transfer KEEPS THE SLOT so nothing can come
+			 * between the two. */
+			cmd_setup(setup, 0x40, 0x20,
+			          (u8)reply_len, entry[2], entry[3], entry[4]);
+			dev->cmd_xfer(dev->os_ctx, setup, entry + 5,
+			              cmd_len - 3, 1);
+
+			cmd_setup(setup, 0xC0, 0x71, 0x30, 0x00, 0x00, 0x00);
+			dev->cmd_xfer(dev->os_ctx, setup, status_at,
+			              reply_len + 1, 0);
+			status = *status_at;
+			*status_at = saved;
+			/*
+			 * Here the status byte is a length with a valid bit,
+			 * not a plain flag: bit 7 must be set and the low six
+			 * bits must be the reply length that was asked for.
+			 */
+			if ((status & 0x80) == 0 ||
+			    (u32)(status & CORE_CMD_LEN_MASK) != reply_len) {
+				entry[1] |= CORE_CMD_FAILED;
+			}
+		}
+
+		/* THE REPLY COMES BACK REVERSED. */
+		{
+			u32 i;
+
+			for (i = 0; i < reply_len / 2; i++) {
+				u8 t = reply[i];
+
+				reply[i] = reply[reply_len - 1 - i];
+				reply[reply_len - 1 - i] = t;
+			}
+		}
+	}
+}
+
+void core_cmd_process(core_registry *reg, u8 *block, int pass, u64 now_100ns)
+{
+	u8 *p;
+	u8 *end;
+	s32 index = 0;
+
+	(void)now_100ns;
+
+	if (reg == 0 || block == 0) {
+		return;
+	}
+	p   = block;
+	end = block + CORE_CMD_GO;
+
+	while (p < end) {
+		core_device_entry *dev;
+		u32 cmd_len;
+		u32 reply_len;
+		u32 span;
+
+		cmd_len = p[0];
+		if (cmd_len == CORE_CMD_PAD) {
+			/* Padding advances the device index, so a client can
+			 * address adapter 2 without sending anything to 0 or
+			 * 1. */
+			p++;
+			index++;
+			continue;
+		}
+		if (cmd_len == CORE_CMD_END) {
+			return;
+		}
+		if (cmd_len == CORE_CMD_SKIP) {
+			p++;
+			continue;
+		}
+
+		/* Structural errors mark the entry and STOP the walk. */
+		reply_len = p[1] & CORE_CMD_LEN_MASK;
+		span      = cmd_len + reply_len;
+		if (cmd_len > CORE_CMD_MAX_LEN ||
+		    index >= CORE_CMD_MAX_DEVICES ||
+		    reply_len > CORE_CMD_MAX_LEN ||
+		    (cmd_len > 4 && reply_len > 3) ||
+		    p + span + 2 >= end) {
+			p[1] |= CORE_CMD_FAILED;
+			return;
+		}
+
+		dev = cmd_nth(reg, index);
+
+		if (cmd_len == 1 && reply_len == 4 && p[2] == 0x01) {
+			/*
+			 * THE CACHED CONTROLLER READ, and the reason this
+			 * channel exists at all. Joybus command 0x01 with a
+			 * four-byte reply means "give me the controller
+			 * state", and it is answered FROM THE LAST INTERRUPT
+			 * PACKET with no USB traffic whatsoever.
+			 *
+			 * The reordering is not arbitrary: the raw packet is
+			 * X, Y, status, buttons-high, buttons-low, and joybus
+			 * wants buttons-high, buttons-low, X, Y.
+			 */
+			if (pass == 1) {
+				if (dev == 0 || dev->cs == 0) {
+					p[1] |= CORE_CMD_FAILED;
+				} else {
+					p[3] = dev->cs->raw[4];
+					p[4] = dev->cs->raw[3];
+					p[5] = dev->cs->raw[0];
+					p[6] = dev->cs->raw[1];
+				}
+			}
+		} else if (cmd_len == 1 && reply_len == 3 &&
+		           (p[2] == 0x00 || p[2] == 0xFF)) {
+			/*
+			 * THE IDENTIFY. This one does go on the wire, but its
+			 * ANSWER is kept: bit 0 of the status byte is "an
+			 * accessory is in the port", and that is what the
+			 * emulated Pak above keys off.
+			 *
+			 * Bits 0 and 1 together being anything but 01 means
+			 * the accessory has changed, so the keep-alive is
+			 * dropped and the effect engine will re-arm the motor.
+			 */
+			if (pass == 1) {
+				if (dev == 0 || dev->cs == 0) {
+					p[1] |= CORE_CMD_FAILED;
+				} else {
+					p[1] = (u8)reply_len;
+					core_cmd_exec(dev, p);
+					dev->cs->emu_pak_present =
+					        (p[5] & 1) == 1;
+					if ((p[5] & 3) != 1) {
+						dev->cs->keepalive_time = 0;
+					}
+				}
+			}
+		} else {
+			/*
+			 * Everything else, on pass 0. A missing device or a
+			 * maximum-length reply marks the entry and CARRIES ON -
+			 * and note that 0x26 passed the structural check above
+			 * and is rejected here, an inconsistency of the
+			 * original's that a client can observe.
+			 */
+			if (pass == 0) {
+				if (reply_len < CORE_CMD_MAX_LEN && dev != 0) {
+					p[1] = (u8)reply_len;
+					core_cmd_exec(dev, p);
+				} else {
+					p[1] |= CORE_CMD_FAILED;
+				}
+			}
+		}
+
+		p += span + 2;
+		index++;
+	}
+}
+
+u32 core_cmd_read(core_registry *reg, core_cmd_channel *ch, u8 *buf, u32 len,
+                  u64 now_100ns, u32 *info)
+{
+	u32 scratch = 0;
+
+	if (info == 0) {
+		info = &scratch;
+	}
+	*info = 0;
+	if (reg == 0 || ch == 0) {
+		return CORE_ST_INVALID_PARAM;
+	}
+	/*
+	 * THE ONE-BYTE READ IS THE EXCEPTION that lets a client poll for an
+	 * adapter before one exists. Everything else needs a live device.
+	 */
+	if (reg->live_count == 0 && len != 1) {
+		return CORE_ST_NO_SUCH_DEVICE;
+	}
+	if (len == 0) {
+		return CORE_ST_SUCCESS;
+	}
+	if (len > CORE_CMD_BLOCK_BYTES || buf == 0) {
+		return CORE_ST_INVALID_PARAM;
+	}
+
+	if (len == 1) {
+		buf[0] = (u8)reg->live_count;
+	} else if (len == CORE_CMD_BLOCK_BYTES) {
+		u32 i;
+
+		for (i = 0; i < CORE_CMD_BLOCK_BYTES; i++) {
+			buf[i] = ch->block[i];
+		}
+		if (buf[CORE_CMD_GO] == 1) {
+			core_cmd_process(reg, buf, 1, now_100ns);
+			/*
+			 * CLEARED IN THE COPY ONLY. ch->block keeps its go
+			 * flag, so every read re-runs pass 1 and a client
+			 * polling the controller gets a fresh answer each time
+			 * without writing the block again.
+			 */
+			buf[CORE_CMD_GO] = 0;
+		}
+		if (ch->swap_bytes) {
+			cmd_swap(buf);
+		}
+	}
+	/*
+	 * Any other length in 2..0x3F succeeds having written nothing, and
+	 * still reports len bytes transferred. The original's own behaviour.
+	 */
+	*info = len;
+	return CORE_ST_SUCCESS;
+}
+
+u32 core_cmd_write(core_registry *reg, core_cmd_channel *ch, u8 *buf, u32 len,
+                   u64 now_100ns, u32 *info)
+{
+	u32 scratch = 0;
+	u32 i;
+
+	if (info == 0) {
+		info = &scratch;
+	}
+	*info = 0;
+	if (reg == 0 || ch == 0) {
+		return CORE_ST_INVALID_PARAM;
+	}
+	if (reg->live_count == 0) {
+		return CORE_ST_NO_SUCH_DEVICE;
+	}
+	if (len == 0) {
+		return CORE_ST_SUCCESS;
+	}
+	*info = len;
+	if (len != CORE_CMD_BLOCK_BYTES || buf == 0) {
+		return CORE_ST_INVALID_PARAM;
+	}
+
+	/*
+	 * THE BYTE-ORDER WORD IS ALSO THE GO FLAG. A dword of 1 at 0x3C says
+	 * the client is big-endian; swapping dword 15 moves that 1 from byte
+	 * 0x3C to byte 0x3F, which is exactly where the go flag is read from
+	 * below. So for such a client the swap request and the run request are
+	 * the same bit, and it has no way to write a block without running it.
+	 */
+	if (rd32(buf + CORE_CMD_SWAP_AT) == 1) {
+		cmd_swap(buf);
+		ch->swap_bytes = 1;
+	} else {
+		ch->swap_bytes = 0;
+	}
+
+	for (i = 0; i < CORE_CMD_BLOCK_BYTES; i++) {
+		ch->block[i] = buf[i];
+	}
+	if (buf[CORE_CMD_GO] == 1) {
+		core_cmd_process(reg, ch->block, 0, now_100ns);
+	}
+	return CORE_ST_SUCCESS;
 }

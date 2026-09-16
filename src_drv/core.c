@@ -1234,6 +1234,16 @@ static int core_effect_send_update(core_state *cs, u8 sub)
 	return core_effect_send_bitmap(cs, sub, payload, CORE_FX_NEXT_NONE);
 }
 
+int core_effect_send_idle(core_state *cs)
+{
+	if (cs == 0) {
+		return 0;
+	}
+	cs->claim_idle_command = 0;
+	return core_effect_issue(cs, CORE_FX_CMD_STOP, CORE_FX_IDLE_VALUE,
+	                         CORE_FX_IDLE_INDEX, CORE_FX_NEXT_NONE);
+}
+
 static int core_effect_on_pak_insert(core_state *cs)
 {
 	cs->claim_pak_insert = 0;
@@ -1307,6 +1317,13 @@ int core_effect_run_deferred(core_state *cs, u64 now_100ns)
 		return 0;
 	}
 	while (guard++ < CORE_EFFECT_SLOTS) {
+		/* Highest priority, per drv_NextDeferredWork. */
+		if (cs->claim_idle_command) {
+			if (core_effect_send_idle(cs)) {
+				return 1;
+			}
+			continue;
+		}
 		if (cs->claim_effect_tick) {
 			if (core_effect_tick(cs, now_100ns)) {
 				return 1;

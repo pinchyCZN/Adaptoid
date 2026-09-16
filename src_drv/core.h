@@ -386,6 +386,15 @@ typedef struct core_effect_slot {
  * into wValue and wIndex rather than a data stage.
  */
 #define CORE_FX_CMD_STOP        0x32    /* motor off, idle path       */
+
+/*
+ * The idle command's wValue and wIndex, from drv_SendIdleCommand (00018ca0).
+ * Note they are NOT the same as the enable kick's 0x0002 / 0xFE80 that
+ * drv_SetDeviceEnable sends on the same request code - the low byte of
+ * wValue distinguishes them, and 0xFF against 0x80 in wIndex does too.
+ */
+#define CORE_FX_IDLE_VALUE      0x0200
+#define CORE_FX_IDLE_INDEX      0xFEFF
 #define CORE_FX_CMD_PERIODIC    0x35    /* continuation window        */
 #define CORE_FX_CMD_TICK        0x36    /* re-armed window            */
 #define CORE_FX_CMD_KEEPALIVE   0x72    /* the register poke          */
@@ -491,6 +500,14 @@ typedef struct core_state {
 	 * vendor slot was busy"; core_effect_run_deferred drains them in the
 	 * original's fixed priority order.
 	 */
+	/*
+	 * THE IDLE COMMAND IS THE HIGHEST PRIORITY of the four, per
+	 * drv_NextDeferredWork (00019620). It is the "motor off" that
+	 * core_set_enable could not send because the slot was busy, and
+	 * losing it would leave a motor running - which is why it is
+	 * deferred at all when the enable-on case is simply refused.
+	 */
+	int             claim_idle_command;
 	int             claim_effect_tick;
 	int             claim_pak_insert;
 	int             claim_pak_remove;
@@ -583,6 +600,26 @@ typedef struct core_state {
 	u32             devices_mask;
 
 	u32             reports_emitted;
+
+	/*
+	 * THE EMULATED CONTROLLER PAK, which belongs to the SDK command-block
+	 * channel and to nothing else.
+	 *
+	 * Two joybus addresses are answered by the driver itself instead of
+	 * being put on the wire: 0x8000, where a Rumble Pak identifies itself,
+	 * and 0xC000, the motor register. emu_pak_value is the last byte
+	 * written to either, emu_pak_present is whether the last identify saw
+	 * an accessory at all. See core_cmd_exec.
+	 *
+	 * They are here rather than beside the effect engine because they are
+	 * genuinely separate state: in the original they are devext+0x42C and
+	 * +0x430, and between them they have seven references, every one of
+	 * them in drv_ProcessCommandBlock, drv_ExecuteRawCommand or the reset
+	 * that zeroes them. The real motor is driven by the effect engine and
+	 * never looks at either.
+	 */
+	u32             emu_pak_value;
+	int             emu_pak_present;
 } core_state;
 
 #define CORE_DEVICE_JOYSTICK    0x1u
@@ -731,6 +768,14 @@ int core_tune_update(core_state *cs, u8 buttons_hi, u8 buttons_lo,
 int  core_effect_run(core_state *cs, u64 now_100ns);
 int  core_effect_kick(core_state *cs, u64 now_100ns);
 int  core_effect_run_deferred(core_state *cs, u64 now_100ns);
+
+/*
+ * Send the idle command - "motor off", vendor request 0x32 with wValue
+ * 0x0200 and wIndex 0xFEFF - and clear the claim. Exposed because the OS
+ * layer sends it directly when the slot was free, and the deferred drain
+ * sends it when it was not; one function, two callers, one wire format.
+ */
+int  core_effect_send_idle(core_state *cs);
 void core_effect_update_complete(core_state *cs);
 
 void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx);
