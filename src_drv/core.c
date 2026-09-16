@@ -4,9 +4,13 @@
  * See core.h for the rule this file obeys: no Windows or DDK headers, no
  * kernel calls, no Windows types. Everything arrives through the seams.
  *
- * SKELETON. The bodies here are stubs with correct signatures and correct
- * seams. The script interpreter, report builders and effect engine land on
- * top of this in later work; ../docs/script-bytecode.txt is the specification.
+ * COMPLETE. The packet decode, the joystick report, the accessory probe,
+ * the Controller Pak CRCs, the effect engine and its ring, the raw N64
+ * transaction, the keyboard and mouse report state machines and the three
+ * HID report descriptors are all here, and all have test groups.
+ *
+ * The specifications are ../docs/hid-descriptor.txt for the descriptors and
+ * report layouts and ../docs/usb-transport.txt for the protocol.
  */
 
 #include "core.h"
@@ -65,17 +69,66 @@ void core_init(core_state *cs, core_report_fn sink, void *sink_ctx)
 	}
 }
 
+/*
+ * Put the engine state back to defaults WITHOUT UNPLUGGING ANYTHING.
+ *
+ * The difference matters: a PnP stop resets a device that may be started
+ * again, and core_init on its own would clear every seam the OS layer
+ * installed - transport, clock, script hook - leaving a device that polls
+ * and can never act on what it reads. Identity survives too, because the
+ * instance number and the HID personality are per ARRIVAL, not per start.
+ */
 void core_reset(core_state *cs)
 {
-	core_report_fn sink;
-	void          *ctx;
+	core_report_fn       sink;
+	void                *sink_ctx;
+	core_vendor_fn       vendor;
+	void                *vendor_ctx;
+	core_vendor_claim_fn vendor_claim;
+	core_vendor_sync_fn  vendor_sync;
+	core_input_hook_fn   input_hook;
+	void                *input_ctx;
+	core_tick_hook_fn    tick_hook;
+	void                *tick_ctx;
+	u32                  devices_mask;
+	s32                  instance_id;
+	u8                   button_map[CORE_RAW_BUTTON_BITS];
+	u32                  i;
 
 	if (cs == 0) {
 		return;
 	}
-	sink = cs->sink;
-	ctx  = cs->sink_ctx;
-	core_init(cs, sink, ctx);
+	sink         = cs->sink;
+	sink_ctx     = cs->sink_ctx;
+	vendor       = cs->vendor;
+	vendor_ctx   = cs->vendor_ctx;
+	vendor_claim = cs->vendor_claim;
+	vendor_sync  = cs->vendor_sync;
+	input_hook   = cs->input_hook;
+	input_ctx    = cs->input_ctx;
+	tick_hook    = cs->tick_hook;
+	tick_ctx     = cs->tick_ctx;
+	devices_mask = cs->devices_mask;
+	instance_id  = cs->instance_id;
+	for (i = 0; i < CORE_RAW_BUTTON_BITS; i++) {
+		button_map[i] = cs->button_map[i];
+	}
+
+	core_init(cs, sink, sink_ctx);
+
+	cs->vendor       = vendor;
+	cs->vendor_ctx   = vendor_ctx;
+	cs->vendor_claim = vendor_claim;
+	cs->vendor_sync  = vendor_sync;
+	cs->input_hook   = input_hook;
+	cs->input_ctx    = input_ctx;
+	cs->tick_hook    = tick_hook;
+	cs->tick_ctx     = tick_ctx;
+	cs->devices_mask = devices_mask;
+	cs->instance_id  = instance_id;
+	for (i = 0; i < CORE_RAW_BUTTON_BITS; i++) {
+		cs->button_map[i] = button_map[i];
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -205,11 +258,14 @@ int core_decode(core_state *cs, const u8 *raw)
 	cs->status = raw[CORE_RAW_STATUS];
 	if ((cs->status & CORE_STATUS_MASK) != CORE_STATUS_VALID) {
 		/*
-		 * The original answers this by resetting the controller and then
-		 * submitting the raw bytes unpacked, which puts garbage on the
-		 * wire. Here the packet is simply rejected; the reset belongs to
-		 * the transport layer and is a TODO for wdm.c.
+		 * THE RESET IS SENT, THE GARBAGE IS NOT. The original answers
+		 * an invalid status byte by resetting the controller AND then
+		 * submitting the raw bytes unpacked, which puts a malformed
+		 * report on the wire. Half of that is right: the reset is how
+		 * a controller that has lost sync recovers, so it is kept.
+		 * Emitting the bad packet is not, so it is dropped.
 		 */
+		core_controller_reset(cs);
 		return 0;
 	}
 
@@ -351,9 +407,27 @@ void core_on_raw_packet(core_state *cs, const u8 *raw)
 	}
 
 	/*
-	 * TODO: the script override, which lets a loaded script drive the
-	 * stick instead of the hardware. See ../docs/hid-descriptor.txt 8.
+	 * THE SCRIPT RUNS HERE, between the decode and the pack, which is
+	 * where drv_BuildJoystickReport calls drv_ScriptDispatchInput. A
+	 * script's _stick and _button builtins write the decoded state
+	 * directly, so anything it does now lands in this report.
 	 */
+	if (cs->input_hook != 0) {
+		s16 decoded_x = cs->stick_x;
+		s16 decoded_y = cs->stick_y;
+
+		cs->input_hook(cs->input_ctx, raw, cs->now_100ns);
+
+		/*
+		 * AND ONLY A SCRIPT THAT OWNS THE STICK KEEPS IT. Without the
+		 * gate the hardware would win back the axes on the very next
+		 * packet and _stick would appear to do nothing.
+		 */
+		if (!cs->script_owns_stick) {
+			cs->stick_x = decoded_x;
+			cs->stick_y = decoded_y;
+		}
+	}
 
 	core_zero(report, (u32)sizeof(report));
 	core_pack_joystick(cs, report);
@@ -364,6 +438,34 @@ void core_on_raw_packet(core_state *cs, const u8 *raw)
 /* Time                                                                */
 /* ------------------------------------------------------------------ */
 
+void core_set_input_hook(core_state *cs, core_input_hook_fn fn, void *ctx)
+{
+	if (cs != 0) {
+		cs->input_hook = fn;
+		cs->input_ctx  = ctx;
+	}
+}
+
+void core_set_tick_hook(core_state *cs, core_tick_hook_fn fn, void *ctx)
+{
+	if (cs != 0) {
+		cs->tick_hook = fn;
+		cs->tick_ctx  = ctx;
+	}
+}
+
+/*
+ * Advance both engines.
+ *
+ * THE EFFECT ENGINE IS DRIVEN DIRECTLY and the scheduler through a hook,
+ * because the effect engine is core.c's own and the scheduler is sched.c's -
+ * which depends on core.c and so cannot be called from it.
+ *
+ * The original's time base is 1/64 second with a 100000-instruction budget
+ * per quantum; see ../docs/script-bytecode.txt section 6.1. Driving both
+ * from a caller-supplied clock is what makes them deterministic under the
+ * harness, and it is why this takes the time rather than reading a clock.
+ */
 void core_tick(core_state *cs, u64 now_100ns)
 {
 	if (cs == 0) {
@@ -371,13 +473,49 @@ void core_tick(core_state *cs, u64 now_100ns)
 	}
 	cs->now_100ns = now_100ns;
 
-	/*
-	 * TODO: run the script scheduler and the effect engine from here.
-	 * The original's time base is 1/64 second with a 100000-instruction budget
-	 * per quantum; see ../docs/script-bytecode.txt section 6.1. Driving both
-	 * from a caller-supplied clock is what makes them deterministic under the
-	 * harness.
-	 */
+	core_effect_tick(cs, now_100ns);
+
+	if (cs->tick_hook != 0) {
+		cs->tick_hook(cs->tick_ctx, now_100ns);
+	}
+}
+
+/*
+ * Route a finished transfer back to whichever chain issued it.
+ *
+ * ROUTING BY OWNER RATHER THAN BY GUESSWORK is the point. The probe and the
+ * effect engine both issue through the same seam, and a completion handed
+ * to the wrong one either stalls the probe or desynchronises the motor.
+ */
+int core_vendor_completed(core_state *cs, int ok, const u8 *reply, u32 len,
+                          u64 now_100ns)
+{
+	u8 owner;
+
+	if (cs == 0) {
+		return 0;
+	}
+	owner = cs->vendor_owner;
+	cs->vendor_owner = CORE_VENDOR_OWNER_NONE;
+
+	switch (owner) {
+	case CORE_VENDOR_OWNER_PROBE:
+		core_probe_complete(cs, ok, reply, len);
+		/* The probe re-arms itself through the same seam, so whether
+		 * it issued again is visible in the owner it just set. */
+		return cs->vendor_owner != CORE_VENDOR_OWNER_NONE;
+
+	case CORE_VENDOR_OWNER_EFFECT:
+		if (!ok) {
+			return 0;
+		}
+		return core_effect_complete(cs, now_100ns);
+
+	default:
+		/* Fire and forget, or a completion for a transfer this layer
+		 * did not make. Nothing is waiting. */
+		return 0;
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1093,7 +1231,8 @@ static int core_effect_issue(core_state *cs, u8 request, u16 value,
 	req.wValue        = value;
 	req.wIndex        = index;
 
-	cs->effect_next = next;
+	cs->effect_next  = next;
+	cs->vendor_owner = CORE_VENDOR_OWNER_EFFECT;
 	return cs->vendor(cs->vendor_ctx, &req) ? 1 : 0;
 }
 
@@ -1175,9 +1314,14 @@ int core_effect_tick(core_state *cs, u64 now_100ns)
 		cs->next_tick    = tick + CORE_EFFECT_WINDOW;
 		cs->effect_state = CORE_FX_STATE_TICK;
 		/*
-		 * TODO: the original also clears its pending pak-insert and
-		 * pak-remove claims here, which this layer does not own yet.
+		 * A TICK SUPERSEDES A PENDING PAK CHANGE. The window about to
+		 * go out already reflects whatever the accessory now is, so a
+		 * deferred insert or remove would send a second, redundant
+		 * update behind it. drv_EffectTick clears both for the same
+		 * reason.
 		 */
+		cs->claim_pak_insert = 0;
+		cs->claim_pak_remove = 0;
 		return core_effect_send_bitmap(cs, CORE_FX_CMD_TICK, payload,
 		                               CORE_FX_NEXT_KEEPALIVE);
 	}
@@ -1229,9 +1373,9 @@ static int core_effect_send_update(core_state *cs, u8 sub)
 	if (cs->effect_idle_ticks > 4) {
 		core_effect_ring_reset(cs);
 		return core_effect_issue(cs, CORE_FX_CMD_STOP, 0, 0,
-		                         CORE_FX_NEXT_NONE);
+		                         CORE_FX_NEXT_UPDATE);
 	}
-	return core_effect_send_bitmap(cs, sub, payload, CORE_FX_NEXT_NONE);
+	return core_effect_send_bitmap(cs, sub, payload, CORE_FX_NEXT_UPDATE);
 }
 
 int core_effect_send_idle(core_state *cs)
@@ -1362,6 +1506,10 @@ int core_effect_complete(core_state *cs, u64 now_100ns)
 		return core_effect_keepalive(cs, now_100ns);
 	case CORE_FX_NEXT_PERIODIC:
 		return core_effect_send_periodic(cs, now_100ns);
+	case CORE_FX_NEXT_UPDATE:
+		/* Back to ticking. Issues nothing, so the chain ends here. */
+		core_effect_update_complete(cs);
+		return 0;
 	default:
 		return 0;
 	}
@@ -1842,6 +1990,8 @@ int core_controller_reset(core_state *cs)
 	req.wValue        = 0x0F20;
 	req.wIndex        = 0;
 	req.wLength       = 0;
+	/* Nothing waits for this one - see CORE_VENDOR_OWNER_LOOSE. */
+	cs->vendor_owner  = CORE_VENDOR_OWNER_LOOSE;
 	return cs->vendor(cs->vendor_ctx, &req) ? 1 : 0;
 }
 
@@ -1895,11 +2045,13 @@ static int core_probe_issue(core_state *cs)
 		return 0;
 	}
 
+	cs->vendor_owner = CORE_VENDOR_OWNER_PROBE;
 	if (cs->vendor == 0 || !cs->vendor(cs->vendor_ctx, &req)) {
 		/*
 		 * The transport refused, which in the original means its single
 		 * vendor slot is already in flight. Retried from a later poll.
 		 */
+		cs->vendor_owner = CORE_VENDOR_OWNER_NONE;
 		core_probe_abandon(cs);
 		return 0;
 	}
@@ -2004,6 +2156,9 @@ void core_probe_complete(core_state *cs, int ok, const u8 *reply, u32 len)
 			req.bmRequestType = (u8)CORE_VENDOR_OUT;
 			req.bRequest      = (u8)CORE_VENDOR_RESELECT;
 			req.wValue        = 0x00A6;
+			/* The probe is finished after this one; the transfer
+			 * goes out but nothing is waiting for it. */
+			cs->vendor_owner  = CORE_VENDOR_OWNER_LOOSE;
 			cs->vendor(cs->vendor_ctx, &req);
 		}
 		cs->probe_step = CORE_PROBE_STEP_DONE;

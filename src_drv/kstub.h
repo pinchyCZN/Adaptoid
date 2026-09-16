@@ -122,6 +122,16 @@ typedef ULONG KSPIN_LOCK, *PKSPIN_LOCK;
 typedef ULONG KIRQL;
 
 typedef struct _KEVENT  { LONG Signalled; } KEVENT,  *PKEVENT;
+/*
+ * Shaped like the DDK's, because KeSetTimer takes one BY VALUE and a
+ * LONGLONG in its place compiles in the harness and then fails against the
+ * real header - which is how this was found.
+ */
+typedef union _LARGE_INTEGER {
+	struct { ULONG LowPart; LONG HighPart; } u;
+	LONGLONG QuadPart;
+} LARGE_INTEGER, *PLARGE_INTEGER;
+
 typedef struct _KTIMER  { ULONGLONG Due;  } KTIMER,  *PKTIMER;
 
 struct _KDPC;
@@ -470,10 +480,13 @@ void IoSetCompletionRoutine(PIRP Irp, PIO_COMPLETION_ROUTINE Routine,
                             PVOID Context, BOOLEAN OnSuccess,
                             BOOLEAN OnError, BOOLEAN OnCancel);
 
+/* Pool types. The driver only ever asks for non-paged. */
+typedef enum _POOL_TYPE { NonPagedPool = 0, PagedPool = 1 } POOL_TYPE;
+
 /* Timers and DPCs, for the script scheduler. */
 void    KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context);
 void    KeInitializeTimer(PKTIMER Timer);
-BOOLEAN KeSetTimer(PKTIMER Timer, LONGLONG DueTime, PKDPC Dpc);
+BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc);
 BOOLEAN KeCancelTimer(PKTIMER Timer);
 
 /* The control device object. */
@@ -483,9 +496,13 @@ void     ExReleaseFastMutex(PFAST_MUTEX Mutex);
 
 #define FILE_DEVICE_UNKNOWN 0x00000022
 #define DO_BUFFERED_IO      0x00000004
+#define DO_POWER_PAGABLE    0x00002000
 #define DO_DEVICE_INITIALIZING 0x00000080
 
 void     RtlInitUnicodeString(PUNICODE_STRING Target, PCWSTR Source);
+void     RtlZeroMemory(PVOID Destination, ULONG_PTR Length);
+void     RtlCopyMemory(PVOID Destination, const void *Source,
+                       ULONG_PTR Length);
 NTSTATUS IoCreateDevice(PDRIVER_OBJECT DriverObject, ULONG ExtensionSize,
                         PUNICODE_STRING Name, ULONG DeviceType,
                         ULONG Characteristics, BOOLEAN Exclusive,

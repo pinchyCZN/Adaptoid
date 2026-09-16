@@ -5620,13 +5620,18 @@ void KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context)
 	Dpc->Queued  = 0;
 }
 
+static LONGLONG g_timer_due;
+static int      g_timer_arms;
+
 void KeInitializeTimer(PKTIMER Timer) { Timer->Due = 0; }
 
-BOOLEAN KeSetTimer(PKTIMER Timer, LONGLONG DueTime, PKDPC Dpc)
+BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)
 {
 	BOOLEAN was = (BOOLEAN)(Timer->Due != 0);
 
-	Timer->Due = (ULONGLONG)DueTime;
+	Timer->Due = (ULONGLONG)DueTime.QuadPart;
+	g_timer_due = DueTime.QuadPart;
+	g_timer_arms++;
 	if (Dpc != NULL) {
 		Dpc->Queued = 1;
 	}
@@ -5750,6 +5755,65 @@ NTSTATUS AdaptoidRequestPowerIrp(PADAPTOID_DEVEXT DevExt, ULONG State,
 	ps.DeviceState = (DEVICE_POWER_STATE)State;
 	return PoRequestPowerIrp(DevExt->PhysicalDeviceObject, IRP_MN_SET_POWER,
 	                         ps, Complete, DevExt, NULL);
+}
+
+/* ---- the wiring's OS edges ---------------------------------------- */
+
+/* Whether DriverEntry installed AddDevice, and what it installed. */
+static ADAPTOID_ADD_DEVICE g_add_device;
+static int                 g_workitems;
+
+void AdaptoidSetAddDevice(PDRIVER_OBJECT DriverObject,
+                          ADAPTOID_ADD_DEVICE AddDevice)
+{
+	(void)DriverObject;
+	g_add_device = AddDevice;
+}
+
+PVOID AdaptoidAllocateWorkItem(PDEVICE_OBJECT DeviceObject)
+{
+	static int slot;
+
+	(void)DeviceObject;
+	g_workitems++;
+	slot++;
+	return &slot;           /* a non-null token; nothing dereferences it */
+}
+
+void AdaptoidFreeWorkItem(PVOID WorkItem)
+{
+	if (WorkItem != NULL) {
+		g_workitems--;
+	}
+}
+
+/* The registry value AddDevice reads. Absent means "use the default". */
+static int  g_reg_present;
+static ULONG g_reg_value;
+
+ULONG AdaptoidRegQueryDword(PCWSTR Name, ULONG Default)
+{
+	(void)Name;
+	return g_reg_present ? g_reg_value : Default;
+}
+
+static int g_interfaces_registered;
+
+NTSTATUS AdaptoidRegisterDeviceInterface(PADAPTOID_DEVEXT DevExt)
+{
+	(void)DevExt;
+	g_interfaces_registered++;
+	return STATUS_SUCCESS;
+}
+
+void RtlZeroMemory(PVOID Destination, ULONG_PTR Length)
+{
+	memset(Destination, 0, (size_t)Length);
+}
+
+void RtlCopyMemory(PVOID Destination, const void *Source, ULONG_PTR Length)
+{
+	memcpy(Destination, Source, (size_t)Length);
 }
 
 /* Which handler a triaged request reached. */
@@ -9007,6 +9071,309 @@ static int test_hid_contract(void)
 	return bad;
 }
 
+/* ======================================================================
+ * THE WIRING
+ *
+ * Every subsystem below this driver was tested on its own long before any
+ * of them were joined up, and for a while the joins were simply missing:
+ * AddDevice was never installed, the clock never ran, and a script's key
+ * events went nowhere. Unit tests cannot catch that - each part passed.
+ *
+ * So these check the JOINS. A seam that is null, a clock that does not
+ * advance, an event that reaches no state machine.
+ * ====================================================================== */
+
+/*
+ * A device extension of this group's own. AddDevice is NOT idempotent - it
+ * pushes a registry row and takes a control-device reference - so every
+ * scenario gets a fresh start and gives it back.
+ */
+static ADAPTOID_DEVEXT g_wire_ext;
+
+static PADAPTOID_DEVEXT wire_add(PDRIVER_OBJECT drv, PDEVICE_OBJECT fdo)
+{
+	AdaptoidAddDevice(drv, fdo);
+	g_pnp_devext = &g_wire_ext;
+	return &g_wire_ext;
+}
+
+static int test_wiring(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	DRIVER_OBJECT        drv;
+	UNICODE_STRING       regpath;
+	DEVICE_OBJECT        fdo, pdo, lower;
+	HID_DEVICE_EXTENSION hidext;
+	PADAPTOID_DEVEXT     dx;
+	ULONG                seen_before = g_reports_seen;
+
+	/* ---- 1. DriverEntry installs AddDevice ------------------------- */
+	{
+		memset(&drv, 0, sizeof(drv));
+		memset(&regpath, 0, sizeof(regpath));
+		g_add_device = NULL;
+
+		DriverEntry(&drv, &regpath);
+		/*
+		 * WITHOUT THIS THE DRIVER NEVER ENUMERATES. It loads, sits
+		 * there, and no device is ever created - which looks exactly
+		 * like a hardware problem from outside.
+		 */
+		sched_expect(g_add_device == AdaptoidAddDevice,
+		             "DriverEntry installs AddDevice", 1, 1, &bad);
+		sched_expect(drv.DriverUnload != NULL,
+		             "and a DriverUnload, so the driver may unload at all",
+		             1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 2. AddDevice fills in every seam --------------------------- */
+	{
+		memset(&fdo, 0, sizeof(fdo));
+		memset(&pdo, 0, sizeof(pdo));
+		memset(&lower, 0, sizeof(lower));
+		memset(&hidext, 0, sizeof(hidext));
+		hidext.PhysicalDeviceObject = &pdo;
+		hidext.NextDeviceObject     = &lower;
+		hidext.MiniDeviceExtension  = &g_wire_ext;
+		fdo.DeviceExtension         = &hidext;
+		g_workitems             = 0;
+		g_interfaces_registered = 0;
+
+		sched_expect(NT_SUCCESS(AdaptoidAddDevice(&drv, &fdo)),
+		             "AddDevice succeeds", 1, 1, &bad);
+		dx = &g_wire_ext;
+		g_pnp_devext = dx;
+
+		sched_expect(dx->Core.vendor != 0 && dx->Core.vendor_claim != 0 &&
+		             dx->Core.vendor_sync != 0,
+		             "THE TRANSPORT IS INSTALLED, all three shapes", 1,
+		             1, &bad);
+		sched_expect(dx->Core.input_hook != 0 && dx->Core.tick_hook != 0,
+		             "the packet and the clock reach the script engine",
+		             1, 1, &bad);
+		sched_expect(dx->Sched.cs == &dx->Core && dx->Sched.arm != 0 &&
+		             dx->Sched.emit != 0,
+		             "and the scheduler is joined to the core", 1, 1,
+		             &bad);
+		sched_expect(dx->Registration.cs == &dx->Core &&
+		             dx->Registration.vendor != 0 &&
+		             dx->Registration.cmd_xfer != 0,
+		             "the registry row carries this device's seams", 1,
+		             1, &bad);
+		sched_expect(dx->ScriptDpc.Routine != 0 &&
+		             dx->ScriptDepth == -1,
+		             "the scheduler DPC is armed and latched at -1",
+		             dx->ScriptDepth, -1, &bad);
+		sched_expect(g_workitems == 1 && dx->PollWorkItem != NULL,
+		             "a work item exists for the restart ladder",
+		             g_workitems, 1, &bad);
+		sched_expect(g_interfaces_registered == 1,
+		             "and the device interface is published",
+		             g_interfaces_registered, 1, &bad);
+
+		/*
+		 * POLLING STARTS STOPPED. A read submitted before PnP says
+		 * start would go to a device the bus has not configured.
+		 */
+		sched_expect((dx->PollStopMask & ADAPTOID_STOP_REASON_PNP) != 0,
+		             "polling is held until PnP starts the device", 1,
+		             1, &bad);
+		sched_expect(dx->Core.instance_id >= 50 &&
+		             dx->Core.instance_id < 1150,
+		             "the instance number is inside the stick range",
+		             dx->Core.instance_id, 50, &bad);
+		groups++;
+	}
+
+	/* ---- 3. the registry decides the HID personality ---------------- */
+	{
+		sched_expect(dx->Core.devices_mask == CORE_DEVICE_DEFAULT,
+		             "absent means all three collections",
+		             (long)dx->Core.devices_mask, CORE_DEVICE_DEFAULT,
+		             &bad);
+
+		AdaptoidUnwireDevice(dx);
+		g_reg_present = 1;
+		g_reg_value   = 1;
+		wire_add(&drv, &fdo);
+		sched_expect(dx->Core.devices_mask == 1 &&
+		             core_hid_descriptor(dx->Core.devices_mask, 0) ==
+		             core_hid_descriptor(7, 0) + CORE_HID_DESC_JOY_AT,
+		             "and a value of 1 makes it a joystick alone",
+		             (long)dx->Core.devices_mask, 1, &bad);
+		g_reg_present = 0;
+		AdaptoidUnwireDevice(dx);
+		groups++;
+	}
+
+	/* ---- 4. the clock actually advances both engines ---------------- */
+	{
+		wire_add(&drv, &fdo);
+		dx->Started      = 1;
+		dx->PollStopMask = 0;
+		core_init(&dx->Core, harness_sink, dx);
+		AdaptoidWireDevice(dx);
+		dx->Core.sink     = harness_sink;
+		dx->Core.sink_ctx = dx;
+
+		/*
+		 * core_tick used to store the clock and do nothing else, so
+		 * the effect ring and the scheduler never ran. Driving it must
+		 * reach at least the effect engine, which is observable
+		 * through next_tick.
+		 */
+		{
+			s32 before = dx->Core.next_tick;
+
+			clock_advance_ms(1000);
+			dx->Core.effect_state = CORE_FX_STATE_TICK;
+			core_tick(&dx->Core, KeQueryInterruptTime());
+			sched_expect(dx->Core.now_100ns == KeQueryInterruptTime(),
+			             "the clock reaches the core", 1, 1, &bad);
+			sched_expect(dx->Core.next_tick != before ||
+			             dx->Core.effect_state != CORE_FX_STATE_TICK,
+			             "AND THE EFFECT ENGINE IS DRIVEN BY IT", 1,
+			             1, &bad);
+		}
+		AdaptoidUnwireDevice(dx);
+		groups++;
+	}
+
+	/* ---- 5. a script's key event becomes a real HID report ---------- */
+	{
+		wire_add(&drv, &fdo);
+		core_init(&dx->Core, harness_sink, dx);
+		AdaptoidWireDevice(dx);
+		dx->Core.sink     = harness_sink;
+		dx->Core.sink_ctx = dx;
+		dx->Core.devices_mask = CORE_DEVICE_DEFAULT;
+
+		g_reports_seen = 0;
+		/*
+		 * THE POINT OF THE WHOLE DRIVER. The event goes in at the
+		 * scheduler's event sink and has to come out of the keyboard
+		 * report state machine - not through a user-mode injection
+		 * API that applications can ignore.
+		 */
+		dx->Sched.emit(dx->Sched.emit_ctx, CORE_EVENT_KEY, 0x04, 1);
+		sched_expect(dx->Core.key_down_count == 1 &&
+		             dx->Core.keys_down[0] == 0x04,
+		             "a script _key lands in the keyboard report",
+		             dx->Core.key_down_count, 1, &bad);
+		sched_expect(g_reports_seen > 0,
+		             "and a report actually went out", (long)g_reports_seen,
+		             1, &bad);
+
+		dx->Sched.emit(dx->Sched.emit_ctx, CORE_EVENT_KEY, 0x04, 0);
+		sched_expect(dx->Core.key_down_count == 0,
+		             "and the release closes the gap",
+		             dx->Core.key_down_count, 0, &bad);
+
+		dx->Sched.emit(dx->Sched.emit_ctx, CORE_EVENT_MOUSE_BUTTON, 1, 1);
+		sched_expect(dx->Core.mouse_buttons != 0,
+		             "a mouse button does the same",
+		             dx->Core.mouse_buttons, 1, &bad);
+		AdaptoidUnwireDevice(dx);
+		groups++;
+	}
+
+	/* ---- 6. a script takes the stick, but only when it may ---------- */
+	{
+		static const u8 centre[CORE_RAW_PACKET_BYTES] =
+		        { 0x20, 0x20, 0x80, 0x00, 0x00 };
+
+		wire_add(&drv, &fdo);
+		core_init(&dx->Core, harness_sink, dx);
+		AdaptoidWireDevice(dx);
+		dx->Core.sink     = harness_sink;
+		dx->Core.sink_ctx = dx;
+		dx->Core.accessory_state = CORE_ACC_FOUND_1;
+
+		/*
+		 * WITHOUT THE GATE the hardware wins the axes back on the very
+		 * next packet and _stick appears to do nothing at all.
+		 */
+		dx->Core.script_owns_stick = 0;
+		core_on_raw_packet(&dx->Core, centre);
+		{
+			s16 hardware_x = dx->Core.stick_x;
+
+			dx->Core.script_owns_stick = 1;
+			dx->Sched.cs->stick_x = 999;
+			core_on_raw_packet(&dx->Core, centre);
+			sched_expect(dx->Core.stick_x == hardware_x,
+			             "a packet decodes over a stale script value",
+			             dx->Core.stick_x, hardware_x, &bad);
+		}
+		AdaptoidUnwireDevice(dx);
+		groups++;
+	}
+
+	/* ---- 7. teardown puts back everything AddDevice took ------------ */
+	{
+		PADAPTOID_CDO_EXT cx;
+
+		wire_add(&drv, &fdo);
+		cx = AdaptoidControlDeviceExt();
+		sched_expect(cx != NULL && cx->Registry.count > 0,
+		             "the adapter is on the driver-wide registry",
+		             cx ? cx->Registry.count : -1, 1, &bad);
+
+		g_workitems = 1;
+		AdaptoidUnwireDevice(dx);
+		sched_expect(g_workitems == 0 && dx->PollWorkItem == NULL,
+		             "teardown returns the work item", g_workitems, 0,
+		             &bad);
+		sched_expect(AdaptoidControlDeviceExt() == NULL ||
+		             AdaptoidControlDeviceExt()->Registry.count == 0,
+		             "and takes the adapter off the registry", 1, 1,
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 8. a stop resets the engine WITHOUT unplugging it ---------- */
+	{
+		wire_add(&drv, &fdo);
+		core_init(&dx->Core, harness_sink, dx);
+		AdaptoidWireDevice(dx);
+		dx->Core.devices_mask = 6;
+		dx->Core.instance_id  = 321;
+		dx->Core.stick_clip   = 99;
+
+		core_reset(&dx->Core);
+
+		/*
+		 * THE SEAMS MUST SURVIVE. A stop is not a remove - the device
+		 * can be started again, and a core_reset that cleared the
+		 * transport would leave it polling with nowhere to send.
+		 */
+		sched_expect(dx->Core.vendor != 0 && dx->Core.vendor_sync != 0 &&
+		             dx->Core.input_hook != 0 && dx->Core.tick_hook != 0,
+		             "a reset keeps every seam", 1, 1, &bad);
+		sched_expect(dx->Core.devices_mask == 6 &&
+		             dx->Core.instance_id == 321,
+		             "and the identity, which is per arrival",
+		             dx->Core.instance_id, 321, &bad);
+		sched_expect(dx->Core.stick_clip == CORE_STICK_CLIP_DEFAULT,
+		             "but engine state goes back to defaults",
+		             dx->Core.stick_clip, CORE_STICK_CLIP_DEFAULT, &bad);
+		AdaptoidUnwireDevice(dx);
+		groups++;
+	}
+
+	/*
+	 * The reports this group emitted are its own, not the ones main()
+	 * counts through the single device it drives. Put the tally back.
+	 */
+	g_reports_seen = seen_before;
+
+	hlog("Subsystem wiring       : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
 int main(int argc, char **argv)
 {
 	DRIVER_OBJECT        driver;
@@ -9090,6 +9457,7 @@ int main(int argc, char **argv)
 	bad += test_command_block();
 	bad += test_power_and_control();
 	bad += test_hid_contract();
+	bad += test_wiring();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

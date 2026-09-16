@@ -219,6 +219,45 @@ typedef struct core_vendor_req {
 typedef int (*core_vendor_fn)(void *ctx, const core_vendor_req *req);
 
 /*
+ * WHICH OF THE CORE'S CHAINS OWNS THE TRANSFER IN FLIGHT.
+ *
+ * The core issues transfers from two places - the accessory probe and the
+ * effect engine - and the completion has to go back to the right one. The
+ * original routes by the callback pointer it stored with the request; this
+ * records the same thing as a value, which is testable and needs no
+ * function pointer to survive a suspend.
+ */
+#define CORE_VENDOR_OWNER_NONE   0
+#define CORE_VENDOR_OWNER_PROBE  1
+#define CORE_VENDOR_OWNER_EFFECT 2
+/* Fire and forget: nothing is waiting for it. */
+#define CORE_VENDOR_OWNER_LOOSE  3
+
+
+/*
+ * THE SCRIPT INPUT HOOK.
+ *
+ * Called from core_on_raw_packet after the packet is decoded and before the
+ * report is packed, which is the exact point drv_BuildJoystickReport hands
+ * the packet to drv_ScriptDispatchInput. A script's _stick and _button
+ * builtins write the decoded state directly, so running here is what lets
+ * a script take the stick over.
+ *
+ * A seam rather than a direct call because sched.c depends on core.c and
+ * not the other way round.
+ */
+typedef void (*core_input_hook_fn)(void *ctx, const u8 *raw, u64 now_100ns);
+
+
+/*
+ * THE TICK HOOK, the same arrangement for the clock: core_tick drives the
+ * effect engine itself and calls this for the script scheduler.
+ */
+typedef void (*core_tick_hook_fn)(void *ctx, u64 now_100ns);
+
+
+
+/*
  * THE VENDOR SLOT.
  *
  * There is exactly one control transfer in flight at a time, and the
@@ -451,6 +490,14 @@ typedef struct core_effect_slot {
 #define CORE_FX_NEXT_NONE       0
 #define CORE_FX_NEXT_KEEPALIVE  1
 #define CORE_FX_NEXT_PERIODIC   2
+/*
+ * The pak insert/remove update's completion, which puts the engine back
+ * into its ticking state. Without it the state machine stalls in
+ * CORE_FX_STATE_PAK and the motor never runs again after an accessory
+ * change - drv_EffectSendUpdate passes drv_EffectUpdateComplete for
+ * exactly this reason.
+ */
+#define CORE_FX_NEXT_UPDATE     3
 
 typedef struct core_effect_ring_entry {
 	s32 pulse;              /* the bit that ships          */
@@ -661,6 +708,26 @@ typedef struct core_state {
 	 * that zeroes them. The real motor is driven by the effect engine and
 	 * never looks at either.
 	 */
+	/*
+	 * Which chain owns the transfer in flight; see
+	 * CORE_VENDOR_OWNER_*. Set at every issue site.
+	 */
+	u8              vendor_owner;
+
+	/*
+	 * NON-ZERO WHILE A SCRIPT OWNS THE STICK. The original gates this on
+	 * ScriptState >= 0, a counter that starts latched at -1 - so a script
+	 * cannot take the stick until something lifts it. When set, the values
+	 * a script's _stick left behind survive into the report instead of
+	 * being overwritten by the next packet's decode.
+	 */
+	int             script_owns_stick;
+
+	core_input_hook_fn input_hook;
+	void              *input_ctx;
+	core_tick_hook_fn  tick_hook;
+	void              *tick_ctx;
+
 	u32             emu_pak_value;
 	int             emu_pak_present;
 } core_state;
@@ -751,6 +818,12 @@ int  core_effect_evaluate(core_state *cs, int lookahead, s32 tick,
                           u8 *payload);
 
 /* Compute one fresh window, discarding the ring. Convenience for tests. */
+/*
+ * Compute one window of the effect ring. EXPOSED FOR TESTING ONLY - the
+ * engine reaches it through core_effect_evaluate, and nothing in the driver
+ * calls it directly. Worth having reachable: it is the densest arithmetic
+ * in the port and the easiest place for a transcription slip to hide.
+ */
 void core_effect_window(core_state *cs, s32 start_tick, u8 *payload);
 
 /* Drop every precomputed tick, as the idle motor-stop path does. */
@@ -820,6 +893,21 @@ int  core_effect_run_deferred(core_state *cs, u64 now_100ns);
  */
 int  core_effect_send_idle(core_state *cs);
 void core_effect_update_complete(core_state *cs);
+
+/*
+ * One transfer the core issued has finished. Routes to whichever of the
+ * core's chains owns it and returns non-zero if that chain issued another.
+ *
+ * THE OS LAYER MUST CALL THIS, and calling it is what makes the accessory
+ * probe and the rumble engine run at all - without it both stall after
+ * their first transfer.
+ */
+int core_vendor_completed(core_state *cs, int ok, const u8 *reply, u32 len,
+                          u64 now_100ns);
+
+/* Install the script input hook and the tick hook; see their typedefs. */
+void core_set_input_hook(core_state *cs, core_input_hook_fn fn, void *ctx);
+void core_set_tick_hook(core_state *cs, core_tick_hook_fn fn, void *ctx);
 
 void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx);
 

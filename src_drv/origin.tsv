@@ -69,6 +69,8 @@ core_probe_issue	core.c	part	wishk201.sys	00018fd0	drv_AccessoryProbeRead2
 core_probe_start	core.c	port	wishk201.sys	00018d30	drv_AccessoryProbeStart
 core_reset	core.c	new	-	-	-
 core_ring_index	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_set_input_hook	core.c	new	-	-	-
+core_set_tick_hook	core.c	new	-	-	-
 core_set_vendor	core.c	new	-	-	-
 core_set_vendor_claim	core.c	new	-	-	-
 core_set_vendor_sync	core.c	new	-	-	-
@@ -78,6 +80,7 @@ core_tick	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
 core_tick	core.c	part	wishk201.sys	00017980	drv_ScriptScheduler
 core_tune_strength_for	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
 core_tune_update	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
+core_vendor_completed	core.c	part	wishk201.sys	00019747	drv_VendorUrbComplete
 core_zero	core.c	new	-	-	-
 ExAcquireFastMutex	harness.c	new	-	-	-
 ExAllocatePoolWithTag	harness.c	new	-	-	-
@@ -114,7 +117,9 @@ KfReleaseSpinLock	harness.c	new	-	-	-
 PoCallDriver	harness.c	new	-	-	-
 PoRequestPowerIrp	harness.c	new	-	-	-
 PoStartNextPowerIrp	harness.c	new	-	-	-
+RtlCopyMemory	harness.c	new	-	-	-
 RtlInitUnicodeString	harness.c	new	-	-	-
+RtlZeroMemory	harness.c	new	-	-	-
 bind_all	harness.c	new	-	-	-
 bind_build_code	harness.c	new	-	-	-
 bind_raw	harness.c	new	-	-	-
@@ -202,6 +207,7 @@ test_script	harness.c	new	-	-	-
 test_triage_pnp	harness.c	new	-	-	-
 test_tune_mode	harness.c	new	-	-	-
 test_wdm_transport	harness.c	new	-	-	-
+test_wiring	harness.c	new	-	-	-
 topo_child	harness.c	new	-	-	-
 topo_hub	harness.c	new	-	-	-
 topo_index	harness.c	new	-	-	-
@@ -215,6 +221,7 @@ triage_setup	harness.c	new	-	-	-
 usage	harness.c	new	-	-	-
 wdm_reset	harness.c	new	-	-	-
 wdm_test_callback	harness.c	new	-	-	-
+wire_add	harness.c	new	-	-	-
 wr32_test	harness.c	new	-	-	-
 cmd_emulated_crc	ioctl.c	part	wishk201.sys	00010e20	drv_ExecuteRawCommand
 cmd_nth	ioctl.c	part	wishk201.sys	00010c30	drv_ProcessCommandBlock
@@ -305,6 +312,7 @@ core_script_set_native	script.c	new	-	-	-
 core_script_var_index	script.c	port	wishk201.sys	00018640	drv_ScriptCheckVarIndex
 AdaptoidAbortPipes	wdm.c	port	wishk201.sys	00016890	drv_AbortPipes
 AdaptoidAddDevice	wdm.c	port	wishk201.sys	0001236e	drv_AddDevice
+AdaptoidAllocateWorkItem	wdm.c	new	-	-	-
 AdaptoidBuildLocationName	wdm.c	port	wishk201.sys	00011f5e	drv_BuildDeviceLocationName
 AdaptoidCancelIrp	wdm.c	new	-	-	-
 AdaptoidCancelNotifications	wdm.c	port	wishk201.sys	00015ce0	drv_CancelNotificationIrps
@@ -316,6 +324,8 @@ AdaptoidChannelIoctl	wdm.c	port	wishk201.sys	00012710	drv_IoctlViaHidHandle
 AdaptoidClaimIrp	wdm.c	part	wishk201.sys	00014f28	drv_CancelReadReportIrp
 AdaptoidCleanup	wdm.c	port	wishk201.sys	00011880	drv_CleanupTriage
 AdaptoidClose	wdm.c	port	wishk201.sys	00011910	drv_CloseTriage
+AdaptoidCmdClaim	wdm.c	part	wishk201.sys	00010e20	drv_ExecuteRawCommand
+AdaptoidCmdXfer	wdm.c	part	wishk201.sys	00010e20	drv_ExecuteRawCommand
 AdaptoidCompleteIrp	wdm.c	port	wishk201.sys	000193a0	drv_CompleteIrp
 AdaptoidCompleteRead	wdm.c	port	wishk201.sys	00014ec0	drv_CompleteReadReport
 AdaptoidControlCleanup	wdm.c	port	wishk201.sys	00011300	drv_ControlDeviceCleanup
@@ -328,6 +338,10 @@ AdaptoidControlMaybeDelete	wdm.c	part	wishk201.sys	000104fa	drv_DeleteControlSym
 AdaptoidControlMaybeDelete	wdm.c	part	wishk201.sys	00010540	drv_DeleteControlDevice
 AdaptoidControlMaybeDelete	wdm.c	part	wishk201.sys	00010570	drv_FreeControlDeviceLists
 AdaptoidControlReadWrite	wdm.c	port	wishk201.sys	000113b0	drv_ControlDeviceReadWrite
+AdaptoidCoreVendor	wdm.c	part	wishk201.sys	000193df	drv_SendVendorRequest
+AdaptoidCoreVendorClaim	wdm.c	part	wishk201.sys	00019670	drv_TryClaimVendorSlot
+AdaptoidCoreVendorComplete	wdm.c	part	wishk201.sys	00019747	drv_VendorUrbComplete
+AdaptoidCoreVendorSync	wdm.c	part	wishk201.sys	000193df	drv_SendVendorRequest
 AdaptoidCreate	wdm.c	port	wishk201.sys	000117f0	drv_CreateTriage
 AdaptoidCreateControlDevice	wdm.c	port	wishk201.sys	000103be	drv_CreateControlDevice
 AdaptoidDequeueRead	wdm.c	port	wishk201.sys	00014fa0	drv_DequeuePendingRead
@@ -340,8 +354,12 @@ AdaptoidFetchDeviceDescriptor	wdm.c	port	wishk201.sys	00016550	drv_StartDevice
 AdaptoidFetchDeviceDescriptor	wdm.c	part	wishk201.sys	00016620	drv_GetConfigDescriptor
 AdaptoidFreeDeviceResources	wdm.c	port	wishk201.sys	00016820	drv_FreeDeviceResources
 AdaptoidFreePollIrp	wdm.c	part	wishk201.sys	00016b00	drv_PollStop
+AdaptoidFreeWorkItem	wdm.c	new	-	-	-
 AdaptoidIdlePowerComplete	wdm.c	port	wishk201.sys	000172e0	drv_RequestPowerComplete
+AdaptoidInputHook	wdm.c	part	wishk201.sys	00017550	drv_ScriptDispatchInput
 AdaptoidIntDeviceControl	wdm.c	port	wishk201.sys	000128d2	drv_DispatchInternalDeviceControl
+AdaptoidIoctlEnable	wdm.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand
+AdaptoidIoctlVendor	wdm.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand
 AdaptoidIsDeviceReady	wdm.c	port	wishk201.sys	00015f00	drv_IsDeviceReady
 AdaptoidLockAcquire	wdm.c	port	wishk201.sys	00015930	drv_LockAcquire
 AdaptoidLockInit	wdm.c	port	wishk201.sys	000158e0	drv_LockInitialize
@@ -379,17 +397,24 @@ AdaptoidReportSink	wdm.c	part	wishk201.sys	00014de8	drv_SubmitHidReport
 AdaptoidRequestDevicePower	wdm.c	part	wishk201.sys	00017250	drv_RequestDevicePower
 AdaptoidRequestPowerIrp	wdm.c	part	wishk201.sys	00017250	drv_RequestDevicePower
 AdaptoidRouteOf	wdm.c	part	wishk201.sys	000117f0	drv_CreateTriage
+AdaptoidSchedAlloc	wdm.c	new	-	-	-
+AdaptoidSchedFree	wdm.c	new	-	-	-
+AdaptoidScriptArm	wdm.c	part	wishk201.sys	00017860	drv_ScriptThreadQueue
 AdaptoidScriptDpc	wdm.c	port	wishk201.sys	00017910	drv_ScriptSchedulerDpc
+AdaptoidScriptEvent	wdm.c	port	wishk201.sys	00015e70	drv_DispatchEvents
 AdaptoidSelectConfiguration	wdm.c	port	wishk201.sys	000166f0	drv_SelectConfiguration
 AdaptoidSendIdleCommand	wdm.c	part	wishk201.sys	00018ca0	drv_SendIdleCommand
+AdaptoidSetAddDevice	wdm.c	part	wishk201.sys	000115f0	drv_DriverEntry
 AdaptoidSetCompletionRoutine	wdm.c	port	wishk201.sys	00015f30	drv_SignalEventComplete
 AdaptoidSetCompletionRoutine	wdm.c	part	wishk201.sys	00015f30	drv_SignalEventComplete
 AdaptoidSetDeviceEnable	wdm.c	port	wishk201.sys	00018b00	drv_SetDeviceEnable
 AdaptoidSetDeviceName	wdm.c	port	wishk201.sys	00011e02	drv_SetDeviceNameAndSort
 AdaptoidStartDevice	wdm.c	port	wishk201.sys	00016550	drv_StartDevice
 AdaptoidSystemPowerComplete	wdm.c	port	wishk201.sys	00017157	drv_SystemPowerRequestComplete
+AdaptoidTickHook	wdm.c	part	wishk201.sys	00017980	drv_ScriptScheduler
 AdaptoidUnconfigureDevice	wdm.c	port	wishk201.sys	000167c0	drv_UnconfigureDevice
 AdaptoidUnload	wdm.c	port	wishk201.sys	000117e0	drv_Unload
+AdaptoidUnwireDevice	wdm.c	part	wishk201.sys	0001236e	drv_AddDevice
 AdaptoidUpdateIdlePower	wdm.c	port	wishk201.sys	000171c0	drv_UpdateIdlePowerState
 AdaptoidUsbCyclePort	wdm.c	port	wishk201.sys	00016080	drv_UsbCyclePort
 AdaptoidUsbGetPortStatus	wdm.c	port	wishk201.sys	00015f90	drv_UsbGetPortStatus
@@ -402,6 +427,7 @@ AdaptoidVendorSend	wdm.c	port	wishk201.sys	000193df	drv_SendVendorRequest
 AdaptoidVendorSubmitUrb	wdm.c	port	wishk201.sys	00019527	drv_SubmitVendorUrb
 AdaptoidVendorTryClaim	wdm.c	port	wishk201.sys	00019670	drv_TryClaimVendorSlot
 AdaptoidWaitNotification	wdm.c	port	wishk201.sys	000159e0	drv_IoctlWaitNotification
+AdaptoidWireDevice	wdm.c	part	wishk201.sys	0001236e	drv_AddDevice
 AdaptoidWrite	wdm.c	port	wishk201.sys	00011a10	drv_WriteTriage
 DriverEntry	wdm.c	port	wishk201.sys	000115f0	drv_DriverEntry
 EnableSecondStage	wdm.c	port	wishk201.sys	00018c50	drv_SetDeviceEnableWork

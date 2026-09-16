@@ -128,6 +128,15 @@ Table of Contents
    drv_CompleteReadReport AT 00014ec0 is the other half of that delivery and
    is therefore a second row for AdaptoidReportSink.
 
+   SIX FUNCTIONS HAVE TWO DEFINITIONS AND ONE ROW, all for the same reason:
+   they are OS edges that wdm.c defines for the driver build and harness.c
+   defines for the harness, selected by ADAPTOID_USERMODE. Only one is
+   compiled at a time, so the checker sees one definition per build and is
+   satisfied either way, and the single row names wdm.c. Besides
+   AdaptoidVendorSubmitUrb below they are AdaptoidSetAddDevice,
+   AdaptoidAllocateWorkItem, AdaptoidFreeWorkItem, AdaptoidRegQueryDword and
+   AdaptoidRegisterDeviceInterface.
+
    AdaptoidVendorSubmitUrb HAS TWO DEFINITIONS AND ONE ROW. It is the OS
    edge of the vendor transport: wdm.c defines it for the driver build and
    harness.c defines it for the harness, selected by ADAPTOID_USERMODE. Only

@@ -1,0 +1,101 @@
+;
+; adaptoid.inf - install wishk300.sys as a HID minidriver for the Adaptoid.
+;
+; THE DEVICE IS CLAIMED AS HIDClass, NOT AS A RAW USB DEVICE. That is the
+; whole arrangement: hidclass.sys owns the device object and this driver
+; sits under it as a minidriver, which is what lets one USB endpoint appear
+; as a keyboard, a mouse and a game controller at once. Installing it as
+; anything else loses the property the driver exists for.
+;
+; The hardware ID is the adapter's own, read out of the original's
+; descriptors: vendor 0x06F7, product 0x0001.
+;
+; UNSIGNED. 64-bit Windows will not load this without test signing enabled:
+;
+;     bcdedit /set testsigning on        (then reboot)
+;
+; and the driver must carry a test certificate. See README.txt section 7.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745A17A0-74D3-11D0-B6FE-00A0C90F57DA}
+Provider    = %ProviderName%
+DriverVer   = 01/01/2026,3.0.0.0
+CatalogFile = adaptoid.cat
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+wishk300.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12          ; %windir%\system32\drivers
+
+[Manufacturer]
+%ProviderName% = Adaptoid, NTamd64, NTx86
+
+; ---------------------------------------------------------------------
+; The device. USB\VID_06F7&PID_0001 is the Adaptoid.
+; ---------------------------------------------------------------------
+
+[Adaptoid.NTamd64]
+%DeviceName% = Adaptoid_Install, USB\VID_06F7&PID_0001
+
+[Adaptoid.NTx86]
+%DeviceName% = Adaptoid_Install, USB\VID_06F7&PID_0001
+
+[Adaptoid_Install.NT]
+CopyFiles = Adaptoid_CopyFiles
+; HIDCLASS.CopyFiles brings in hidclass.sys and hidparse.sys, which this
+; driver registers with and cannot work without.
+Include   = input.inf
+Needs     = HIDCLASS.CopyFiles
+
+[Adaptoid_CopyFiles]
+wishk300.sys
+
+[Adaptoid_Install.NT.Services]
+AddService = wishk300, 0x00000002, Adaptoid_Service
+Include    = input.inf
+Needs      = HIDCLASS.Services
+
+[Adaptoid_Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1                    ; SERVICE_KERNEL_DRIVER
+StartType     = 3                    ; SERVICE_DEMAND_START
+ErrorControl  = 1                    ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\wishk300.sys
+LoadOrderGroup = Base
+
+; ---------------------------------------------------------------------
+; The one setting the driver reads.
+;
+; VirtualDevices selects which HID collections the device presents, and the
+; driver reads it ONCE PER ARRIVAL - changing it needs a replug, not just a
+; restart of the service. The low three bits index an eight-entry table of
+; which only two entries differ from the first:
+;
+;     0..5   joystick only
+;     6      mouse + keyboard
+;     7      all three          (the default)
+;
+; NOTE THE PATH. The driver does not read its own service key; it reads a
+; fixed absolute path, which is the original's behaviour and is why this
+; section writes there rather than under Parameters.
+; ---------------------------------------------------------------------
+
+[Adaptoid_Install.NT.HW]
+AddReg = Adaptoid_Settings
+
+[Adaptoid_Settings]
+HKLM,"Software\Wish Technologies\Adaptoid","VirtualDevices",0x00010001,7
+
+[Strings]
+ProviderName = "Adaptoid clean-room replacement"
+DiskName     = "Adaptoid Driver Disk"
+DeviceName   = "Adaptoid N64 Controller Adapter"
+ServiceName  = "Adaptoid HID minidriver"

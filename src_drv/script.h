@@ -146,6 +146,12 @@ typedef struct core_script {
  * Point the machine at some code and storage. vars must have room for
  * var_count + CORE_SCRIPT_LOCALS words; only the globals need initialising.
  */
+/*
+ * NOT CALLED BY THE DRIVER. core_sched_init initialises the interpreter
+ * field by field as part of bringing a scheduler up, so this is the entry
+ * point for a caller that wants a bare interpreter with no threads around
+ * it - which is exactly what the interpreter's own tests want.
+ */
 void core_script_init(core_script *vm, const u32 *code, s32 code_count,
                       u32 *vars, s32 var_count);
 

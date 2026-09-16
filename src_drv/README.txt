@@ -30,6 +30,8 @@ Table of Contents
    6.  The File Plan
    6.1.  What Is Left
    6.2.  Specifications For What Remains
+   7.  Installing It
+   8.  Out Of Scope
 
 1.  Layout
 
@@ -344,6 +346,19 @@ Table of Contents
    first of which checks the assembled descriptor against the original's
    185 bytes.
 
+   THE WIRING came last, and was the largest single gap in the tree. Every
+   subsystem had been ported and unit-tested on its own, and almost none of
+   them were joined up: AddDevice was never installed into the driver
+   extension, so nothing ever enumerated; core_tick stored the clock and did
+   nothing with it, so the effect ring and the script scheduler never ran; a
+   script's _key event reached no state machine; and the accessory probe
+   stalled after its first transfer because no completion was routed back.
+
+   A sweep for functions that nothing in the driver sources referenced found
+   twenty-nine of them. Unit tests could not have caught this - every part
+   passed on its own - so there is now a test group for the JOINS, and six
+   deliberate breaks against it.
+
    THE USB LAYER is the one part that is not. Descriptor fetch, select
    configuration, the two asynchronous transfer types, abort and the port
    IOCTLs are all URB marshalling against a bus that does not exist in the
@@ -375,6 +390,7 @@ Table of Contents
    | the scheduler DPC        |   1 | wdm.c                           |
    | the USB layer            |  13 | wdm.c, COMPILED ONLY            |
    | HID minidriver contract  |   3 | core.c + ioctl.c, 9 groups      |
+   | the wiring               |  18 | wdm.c + core.c, 8 groups        |
    | registry and interface   |   3 | wdm.c, driver build only        |
    +--------------------------+-----+---------------------------------+
 
@@ -750,6 +766,36 @@ Table of Contents
    whole of PnP and power, the USB layer, and the entire script engine -
    interpreter, scheduler, input binding and builtin library, specified in
    ../docs/script-bytecode.txt sections 5, 6 and 9.
+
+7.  Installing It
+
+   adaptoid.inf claims USB\VID_06F7&PID_0001 as HIDClass with wishk300.sys
+   as the minidriver service. THE CLASS IS THE POINT: hidclass.sys has to own
+   the device object for the composite descriptor to become a keyboard, a
+   mouse and a game controller, so installing it as a raw USB device loses
+   the property the driver exists for.
+
+   It also writes the one setting the driver reads. Note where:
+
+       HKLM\Software\Wish Technologies\Adaptoid    VirtualDevices
+
+   which is a FIXED ABSOLUTE PATH, not the service key - drv_RegQueryDword
+   hardcodes it and takes only a value name, so the replacement does too.
+   The value is read ONCE PER DEVICE ARRIVAL, so changing it needs a replug
+   rather than a service restart.
+
+   ON A TEST MACHINE the driver is unsigned, so 64-bit Windows refuses to
+   load it until test signing is on and the binary carries a test
+   certificate:
+
+       bcdedit /set testsigning on         (then reboot)
+       makecert / signtool, or an equivalent
+
+   None of that has been done here and none of it has been tried. What the
+   four clean builds establish is that the code compiles and links as a
+   kernel driver, not that it loads.
+
+8.  Out Of Scope
 
    Loading the driver is out of scope here. It is unsigned, and x64 Windows
    will not load an unsigned driver without test-signing mode; see

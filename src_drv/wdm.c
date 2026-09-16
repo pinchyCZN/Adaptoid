@@ -1,15 +1,18 @@
 /*
  * wdm.c - the OS-facing layer of wishk300.
  *
- * SKELETON. Every entry point below has the signature the kernel will call it
- * with and a body that is a stub. The shape is the deliverable of this pass,
- * not the behaviour.
+ * COMPLETE except for one thing, said plainly: THE USB LAYER HAS NEVER
+ * TALKED TO A DEVICE. Descriptor fetch, select configuration, the two
+ * asynchronous transfer types, abort and the port IOCTLs are written from a
+ * specification and checked only by compiling in all four configurations.
+ * Everything else here has a test group behind it.
  *
- * Reference for what each of these must eventually do:
+ * The references each part was written from:
  *   ../docs/driver-lifecycle.txt   DriverEntry, AddDevice, PnP, power
  *   ../docs/ioctl-surface.txt      the private IOCTL surface
  *   ../docs/usb-transport.txt      the vendor protocol and the poll engine
- *   ../docs/hid-descriptor.txt     what GET_REPORT_DESCRIPTOR must return
+ *   ../docs/hid-descriptor.txt     the minidriver contract and descriptors
+ *   ../docs/command-block.txt      the SDK's read/write channel
  */
 
 #include "wdm.h"
@@ -93,6 +96,13 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	mj[IRP_MJ_PNP]                     = AdaptoidPnp;
 	mj[IRP_MJ_POWER]                   = AdaptoidPower;
 	DriverObject->DriverUnload         = AdaptoidUnload;
+	/*
+	 * WITHOUT THIS NOTHING EVER ENUMERATES. hidclass calls AddDevice
+	 * through the driver extension, and a null there means the driver
+	 * loads and never sees a device.
+	 */
+	AdaptoidSetAddDevice(DriverObject, AdaptoidAddDevice);
+
 
 	reg.Revision            = HID_REVISION;
 	reg.DriverObject        = DriverObject;
@@ -157,38 +167,162 @@ void NTAPI AdaptoidUnload(PDRIVER_OBJECT DriverObject)
 	UNREFERENCED_PARAMETER(DriverObject);
 }
 
+/*
+ * The per-adapter instance number, and the stick position virtual mode
+ * reports. drv_AddDevice assigns it as (Interlocked++ % 1100) + 50, which
+ * keeps it inside the +/-1200 stick range on purpose - see core.h.
+ */
+static LONG g_InstanceCounter;
+
+#define ADAPTOID_INSTANCE_SPAN  1100
+#define ADAPTOID_INSTANCE_BASE  50
+
+/*
+ * One adapter has arrived.
+ *
+ * hidclass has already created the device object and allocated our
+ * extension; what is left is to make that extension usable, join the
+ * subsystems to each other, and publish the device.
+ *
+ * POLLING STARTS STOPPED. PollStopMask is seeded with the PnP reason, so
+ * nothing is submitted until IRP_MN_START_DEVICE clears it - a read against
+ * a device the bus has not started yet is a bugcheck waiting to happen.
+ */
 NTSTATUS NTAPI AdaptoidAddDevice(PDRIVER_OBJECT DriverObject,
                                  PDEVICE_OBJECT FunctionalDeviceObject)
 {
 	PHID_DEVICE_EXTENSION hidext;
 	PADAPTOID_DEVEXT      devext;
+	PADAPTOID_CDO_EXT     cdo;
+	NTSTATUS              status;
+	ULONG                 i;
 
-	(void)DriverObject;
-
-	if (FunctionalDeviceObject == 0) {
+	if (FunctionalDeviceObject == NULL) {
 		return STATUS_INVALID_PARAMETER;
 	}
 
 	/* The two-level hop: hidclass owns DeviceExtension, we own
 	 * MiniDeviceExtension. Confusing the two makes every offset wrong. */
 	hidext = (PHID_DEVICE_EXTENSION)FunctionalDeviceObject->DeviceExtension;
-	if (hidext == 0) {
+	if (hidext == NULL) {
 		return STATUS_UNSUCCESSFUL;
 	}
-
 	devext = (PADAPTOID_DEVEXT)hidext->MiniDeviceExtension;
-	if (devext == 0) {
+	if (devext == NULL) {
 		return STATUS_UNSUCCESSFUL;
 	}
 
+	RtlZeroMemory(devext, sizeof(*devext));
 	devext->Self                 = FunctionalDeviceObject;
 	devext->NextDeviceObject     = hidext->NextDeviceObject;
 	devext->PhysicalDeviceObject = hidext->PhysicalDeviceObject;
 	devext->Started              = 0;
+	devext->DevicePowerState     = ADAPTOID_POWER_D0;
 
-	core_init(&devext->Core, AdaptoidReportSink, devext);
+	/* Every lock, list head and remove lock. */
+	AdaptoidDevExtInit(devext);
 
+	/* Nothing may poll until PnP says start. */
+	devext->PollStopMask = ADAPTOID_STOP_REASON_PNP;
+
+	KeInitializeDpc(&devext->ScriptDpc, AdaptoidScriptDpc, devext);
+	KeInitializeTimer(&devext->ScriptTimer);
+	/* Latched negative: a script cannot own the stick until something
+	 * lifts it. See AdaptoidScriptDpc. */
+	devext->ScriptDepth = -1;
+
+	devext->PollWorkItem = AdaptoidAllocateWorkItem(FunctionalDeviceObject);
+	if (devext->PollWorkItem == NULL) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	/* THE WIRING, and the only reason any of the rest does anything. */
+	AdaptoidWireDevice(devext);
+
+	/*
+	 * The HID personality is a single registry DWORD, read once per
+	 * arrival. Changing it needs a replug; it is not renegotiated.
+	 */
+	devext->Core.devices_mask =
+	        AdaptoidRegQueryDword(L"VirtualDevices", CORE_DEVICE_DEFAULT);
+
+	AdaptoidRegisterDeviceInterface(devext);
+
+	/*
+	 * The capabilities, and the D-state to idle into. The original walks
+	 * DeviceState[2..4] and keeps the LAST entry below D4, which is the
+	 * deepest state the device can still be resumed from.
+	 */
+	devext->Capabilities.SurpriseRemovalOK = 1;
+	devext->WakeIdleDeviceState = 0;
+	for (i = 2; i <= 4 && i < ADAPTOID_SYSTEM_STATE_MAX; i++) {
+		if (devext->Capabilities.DeviceState[i] < ADAPTOID_POWER_D3) {
+			devext->WakeIdleDeviceState =
+			        devext->Capabilities.DeviceState[i];
+		}
+	}
+
+	status = AdaptoidCreateControlDevice(DriverObject);
+	if (!NT_SUCCESS(status)) {
+		AdaptoidFreeWorkItem(devext->PollWorkItem);
+		devext->PollWorkItem = NULL;
+		return status;
+	}
+
+	/*
+	 * THE INSTANCE NUMBER IS ALSO A STICK POSITION. Virtual mode reports
+	 * it as the Y axis, and control-device function 0x822 resolves a
+	 * handle from the same value, so each adapter parks its stick at its
+	 * own identity.
+	 */
+	devext->Core.instance_id =
+	        (InterlockedIncrement(&g_InstanceCounter) %
+	         ADAPTOID_INSTANCE_SPAN) + ADAPTOID_INSTANCE_BASE;
+
+	cdo = AdaptoidControlDeviceExt();
+	if (cdo != NULL) {
+		core_registry_add(&cdo->Registry, &devext->Registration);
+	}
+
+	/*
+	 * DO_POWER_PAGABLE, and DO_DEVICE_INITIALIZING cleared. hidclass
+	 * created the object, so clearing the flag is still ours to do.
+	 */
+	FunctionalDeviceObject->Flags |= DO_POWER_PAGABLE;
+	FunctionalDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
 	return STATUS_SUCCESS;
+}
+
+/*
+ * One adapter is leaving, for good.
+ *
+ * THE ORDER IS THE WHOLE OF IT. Take the device off the registry first so
+ * nothing new can find it; stop the clock; cancel what is outstanding;
+ * release what was allocated; and only then let the control device go,
+ * because the notification posted by the un-registration has to have
+ * somewhere to land.
+ */
+void AdaptoidUnwireDevice(PADAPTOID_DEVEXT DevExt)
+{
+	PADAPTOID_CDO_EXT cdo = AdaptoidControlDeviceExt();
+
+	if (cdo != NULL) {
+		core_registry_set_live(&cdo->Registry, &DevExt->Registration, 0);
+		core_registry_remove(&cdo->Registry, &DevExt->Registration);
+	}
+
+	KeCancelTimer(&DevExt->ScriptTimer);
+	core_sched_unload(&DevExt->Sched);
+
+	AdaptoidCancelVendorRequest(DevExt);
+	AdaptoidCancelPendingReads(DevExt);
+
+	if (DevExt->PollWorkItem != NULL) {
+		AdaptoidFreeWorkItem(DevExt->PollWorkItem);
+		DevExt->PollWorkItem = NULL;
+	}
+	AdaptoidRegistryRemove(DevExt);
+	AdaptoidReleaseControlDevice();
 }
 
 /* ------------------------------------------------------------------ */
@@ -340,6 +474,23 @@ int AdaptoidVendorTryClaim(PADAPTOID_DEVEXT DevExt)
 }
 
 /* The same, but the transfer's result is owed to an IRP. */
+/*
+ * NOT ON THE REPLACEMENT'S PATH, and kept deliberately.
+ *
+ * It claims the vendor slot ON BEHALF OF AN IRP, so the transfer can
+ * complete asynchronously and the IRP be finished from the completion.
+ * The original's raw vendor IOCTL does that and can therefore return
+ * STATUS_PENDING.
+ *
+ * This driver answers the same IOCTL SYNCHRONOUSLY instead - see
+ * AdaptoidIoctlVendor - because core_ioctl_vendor_fn is handed a buffer
+ * and not an IRP, and device-control requests arrive at PASSIVE_LEVEL
+ * where blocking is legal. A caller sees the same bytes; only the status
+ * differs, never STATUS_PENDING.
+ *
+ * The function stays because it is a faithful port of a real original and
+ * because the asynchronous shape is what a future caller would need.
+ */
 int AdaptoidVendorClaimForIrp(PADAPTOID_DEVEXT DevExt, PIRP Irp)
 {
 	PADAPTOID_VENDOR_SLOT slot = &DevExt->Vendor;
@@ -802,6 +953,8 @@ NTSTATUS AdaptoidStartDevice(PADAPTOID_DEVEXT DevExt)
 	AdaptoidSetDeviceName(DevExt);
 	AdaptoidPollStart(DevExt, ADAPTOID_STOP_REASON_PNP);
 	AdaptoidEnableInterface(DevExt);
+	/* And tell any listening client that an adapter has arrived. */
+	AdaptoidNotifyInterfaceChange(DevExt, 1);
 	return STATUS_SUCCESS;
 }
 
@@ -916,6 +1069,14 @@ NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		AdaptoidQuiesceIo(DevExt);
 		AdaptoidUnconfigureDevice(DevExt);
 		DevExt->Started = 0;
+		/*
+		 * A STOP IS NOT A REMOVE: the device may be started again, so
+		 * the engine state is put back to defaults rather than torn
+		 * down. Leaving a half-finished effect chain across a stop
+		 * would resume it against a device that had been reconfigured.
+		 */
+		AdaptoidNotifyInterfaceChange(DevExt, 0);
+		core_reset(&DevExt->Core);
 		Irp->IoStatus.Status = STATUS_SUCCESS;
 		break;
 
@@ -936,6 +1097,9 @@ NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
 		/* Now wait for B, the one this dispatcher itself holds. */
 		AdaptoidLockReleaseAndWait(&DevExt->RemoveLockB);
+
+		/* Unpick the wiring before the memory under it goes. */
+		AdaptoidUnwireDevice(DevExt);
 		AdaptoidFreeDeviceResources(DevExt);
 		return STATUS_SUCCESS;
 
@@ -1533,8 +1697,7 @@ NTSTATUS AdaptoidRegisterDeviceInterface(PADAPTOID_DEVEXT DevExt)
  * refuses to start over a missing optional registry value is worse than one
  * that uses its built-in answer.
  */
-ULONG AdaptoidRegQueryDword(PUNICODE_STRING RegistryPath, PCWSTR Name,
-                            ULONG Default)
+ULONG AdaptoidRegQueryDword(PCWSTR Name, ULONG Default)
 {
 	RTL_QUERY_REGISTRY_TABLE table[2];
 	ULONG                    value = Default;
@@ -1549,11 +1712,35 @@ ULONG AdaptoidRegQueryDword(PUNICODE_STRING RegistryPath, PCWSTR Name,
 	table[0].DefaultLength = sizeof(Default);
 
 	if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE,
-	                                       RegistryPath->Buffer, table,
+	                                       ADAPTOID_SETTINGS_KEY, table,
 	                                       NULL, NULL))) {
 		return Default;
 	}
 	return value;
+}
+
+/*
+ * Installing AddDevice. A one-line write in the DDK, behind a seam because
+ * the harness has no driver extension to write into and wants to record
+ * that the call happened - which is the only way to catch it being missed.
+ */
+void AdaptoidSetAddDevice(PDRIVER_OBJECT DriverObject,
+                          ADAPTOID_ADD_DEVICE AddDevice)
+{
+	DriverObject->DriverExtension->AddDevice =
+	        (PDRIVER_ADD_DEVICE)AddDevice;
+}
+
+PVOID AdaptoidAllocateWorkItem(PDEVICE_OBJECT DeviceObject)
+{
+	return IoAllocateWorkItem(DeviceObject);
+}
+
+void AdaptoidFreeWorkItem(PVOID WorkItem)
+{
+	if (WorkItem != NULL) {
+		IoFreeWorkItem((PIO_WORKITEM)WorkItem);
+	}
 }
 
 NTSTATUS AdaptoidRequestPowerIrp(PADAPTOID_DEVEXT DevExt, ULONG State,
@@ -1782,9 +1969,18 @@ void AdaptoidPollComplete(PADAPTOID_DEVEXT DevExt, ULONG Slot,
 	}
 
 	if (stopmask == 0 && !failed) {
-		/* The whole point: decode, then immediately put the slot back in
-		 * flight so the other one is never alone. */
+		/*
+		 * The whole point: decode, then immediately put the slot back
+		 * in flight so the other one is never alone.
+		 *
+		 * THE CLOCK IS ADVANCED FROM HERE, which makes the interrupt
+		 * pipe the driver's time base - the effect ring and the script
+		 * scheduler both run off packets arriving at roughly 8ms. That
+		 * is the original's arrangement and it has a property worth
+		 * keeping: with no controller attached, nothing ticks.
+		 */
 		core_on_raw_packet(&DevExt->Core, DevExt->PollSlot[Slot].Buffer);
+		core_tick(&DevExt->Core, KeQueryInterruptTime());
 		AdaptoidPollSubmit(DevExt, Slot);
 		return;
 	}
@@ -2638,6 +2834,273 @@ void AdaptoidNotifyInterfaceChange(PADAPTOID_DEVEXT DevExt, int Live)
 		return;
 	}
 	core_registry_set_live(&cx->Registry, &DevExt->Registration, Live);
+}
+
+/* ------------------------------------------------------------------ */
+/* the wiring                                                          */
+/*                                                                     */
+/* Every subsystem below this driver is OS-free and was tested on its  */
+/* own. This is where they are joined to each other and to Windows -   */
+/* the seams filled in, the clocks connected, the events routed. It is */
+/* short, and until it existed the driver polled a controller and did  */
+/* nothing else with it.                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The core issuing a vendor transfer.
+ *
+ * THE SLOT IS ALREADY CLAIMED by the time this runs - core.c takes it
+ * through AdaptoidCoreVendorClaim before it builds the request, exactly as
+ * the original claims before composing its setup packet. So this only
+ * submits, and the completion routes the answer back.
+ */
+static int AdaptoidCoreVendorComplete(PADAPTOID_DEVEXT DevExt)
+{
+	/*
+	 * Returning non-zero holds the slot when the core started more work.
+	 * core_vendor_completed says whether it did.
+	 */
+	return core_vendor_completed(&DevExt->Core,
+	                             NT_SUCCESS(DevExt->Vendor.LastStatus),
+	                             DevExt->CoreVendorReply,
+	                             DevExt->Vendor.LastInformation,
+	                             KeQueryInterruptTime());
+}
+
+static int AdaptoidCoreVendor(void *ctx, const core_vendor_req *req)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+	ADAPTOID_SETUP   setup;
+	ULONG            len = req->wLength;
+
+	if (len > sizeof(dx->CoreVendorReply)) {
+		len = sizeof(dx->CoreVendorReply);
+	}
+	setup.bmRequestType = req->bmRequestType;
+	setup.bRequest      = req->bRequest;
+	setup.wValue        = req->wValue;
+	setup.wIndex        = req->wIndex;
+
+	return NT_SUCCESS(AdaptoidVendorSend(dx, &setup, len,
+	                                     len ? dx->CoreVendorReply : NULL,
+	                                     AdaptoidCoreVendorComplete));
+}
+
+static int AdaptoidCoreVendorClaim(void *ctx)
+{
+	return AdaptoidVendorTryClaim((PADAPTOID_DEVEXT)ctx);
+}
+
+/*
+ * The blocking transport, for the raw N64 transaction alone. PASSIVE_LEVEL
+ * only, which is why nothing else uses it - see core_vendor_sync_fn.
+ */
+static int AdaptoidCoreVendorSync(void *ctx, const core_vendor_req *req,
+                                  u8 *data, u32 len)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+	ADAPTOID_SETUP   setup;
+
+	if (!AdaptoidVendorTryClaim(dx)) {
+		return 0;
+	}
+	setup.bmRequestType = req->bmRequestType;
+	setup.bRequest      = req->bRequest;
+	setup.wValue        = req->wValue;
+	setup.wIndex        = req->wIndex;
+
+	KeInitializeEvent(&dx->Vendor.Done, NotificationEvent, FALSE);
+	if (!NT_SUCCESS(AdaptoidVendorSend(dx, &setup, len, data, NULL))) {
+		return 0;
+	}
+	KeWaitForSingleObject(&dx->Vendor.Done, Executive, KernelMode, FALSE,
+	                      NULL);
+	return NT_SUCCESS(dx->Vendor.LastStatus);
+}
+
+/*
+ * A script's events, on their way to becoming real HID input.
+ *
+ * THIS IS THE POINT OF THE WHOLE DRIVER. A script calls _key, and because
+ * the event lands in the keyboard report state machine rather than in a
+ * user-mode injection API, every application sees a genuine keystroke.
+ *
+ * The three that are not input - a fault, _debug, an interface change - go
+ * to the control device's notification queue for whoever is listening.
+ */
+static void AdaptoidScriptEvent(void *ctx, u32 type, u32 arg1, u32 arg2)
+{
+	PADAPTOID_DEVEXT  dx = (PADAPTOID_DEVEXT)ctx;
+	PADAPTOID_CDO_EXT cx;
+
+	switch (type) {
+	case CORE_EVENT_KEY:
+		core_hid_key_event(&dx->Core, arg1, arg2 != 0);
+		return;
+	case CORE_EVENT_MOUSE_BUTTON:
+		core_hid_mouse_button(&dx->Core, arg1, arg2 != 0);
+		return;
+	case CORE_EVENT_MOUSE_REL:
+		core_hid_mouse_move(&dx->Core, (s32)arg1, (s32)arg2, 0);
+		return;
+	default:
+		break;
+	}
+
+	/*
+	 * Everything else is for user mode. The queue is driver-wide and
+	 * lives on the control device, which may not exist - a script can be
+	 * running with no client listening, and that is not an error.
+	 */
+	cx = AdaptoidControlDeviceExt();
+	if (cx != NULL) {
+		core_notify_post(&cx->Registry.notify, type, arg1, arg2);
+	}
+}
+
+/*
+ * A thread asked to be woken at a particular time.
+ *
+ * RELATIVE, AND NEGATIVE, which is how the kernel spells "this long from
+ * now" as against "at this absolute time". A wake already past arms for the
+ * next instant rather than for a time in the past.
+ */
+static void AdaptoidScriptArm(void *ctx, u64 wake_time)
+{
+	PADAPTOID_DEVEXT dx  = (PADAPTOID_DEVEXT)ctx;
+	ULONGLONG        now = KeQueryInterruptTime();
+	LARGE_INTEGER    due;
+
+	due.QuadPart = (wake_time > now) ? -(LONGLONG)(wake_time - now) : 0;
+	KeSetTimer(&dx->ScriptTimer, due, &dx->ScriptDpc);
+}
+
+/* Script thread stacks. Pool, because their size comes from the script. */
+static void *AdaptoidSchedAlloc(void *ctx, u32 bytes)
+{
+	UNREFERENCED_PARAMETER(ctx);
+	return ExAllocatePoolWithTag(NonPagedPool, bytes, ADAPTOID_POOL_TAG);
+}
+
+static void AdaptoidSchedFree(void *ctx, void *block)
+{
+	UNREFERENCED_PARAMETER(ctx);
+	if (block != NULL) {
+		ExFreePool(block);
+	}
+}
+
+/* The packet, on its way to any script that wants it. */
+static void AdaptoidInputHook(void *ctx, const u8 *raw, u64 now)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+
+	core_sched_on_input(&dx->Sched, raw, now);
+}
+
+/* And the clock. */
+static void AdaptoidTickHook(void *ctx, u64 now)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+
+	core_sched_run(&dx->Sched, now);
+}
+
+/* The two per-device IOCTL seams the control device forwards through. */
+static u32 AdaptoidIoctlVendor(void *ctx, const u8 *setup, u8 *data,
+                               u32 data_len)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+	core_vendor_req  req;
+
+	req.bmRequestType = setup[0];
+	req.bRequest      = setup[1];
+	req.wValue        = (u16)(setup[2] | ((u16)setup[3] << 8));
+	req.wIndex        = (u16)(setup[4] | ((u16)setup[5] << 8));
+	req.wLength       = (u16)data_len;
+
+	return AdaptoidCoreVendorSync(dx, &req, data, data_len)
+	       ? CORE_ST_SUCCESS : CORE_ST_DEVICE_BUSY;
+}
+
+static void AdaptoidIoctlEnable(void *ctx, int on)
+{
+	AdaptoidSetDeviceEnable((PADAPTOID_DEVEXT)ctx, on);
+}
+
+/* And the two the SDK command block uses. */
+static int AdaptoidCmdClaim(void *ctx)
+{
+	return AdaptoidVendorTryClaim((PADAPTOID_DEVEXT)ctx);
+}
+
+static u32 AdaptoidCmdXfer(void *ctx, const u8 *setup, u8 *data, u32 len,
+                           int keep)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+	ADAPTOID_SETUP   s;
+
+	s.bmRequestType = setup[0];
+	s.bRequest      = setup[1];
+	s.wValue        = (USHORT)(setup[2] | ((USHORT)setup[3] << 8));
+	s.wIndex        = (USHORT)(setup[4] | ((USHORT)setup[5] << 8));
+
+	KeInitializeEvent(&dx->Vendor.Done, NotificationEvent, FALSE);
+	AdaptoidVendorSend(dx, &s, len, data, NULL);
+	KeWaitForSingleObject(&dx->Vendor.Done, Executive, KernelMode, FALSE,
+	                      NULL);
+
+	/*
+	 * keep says another transfer follows and the slot must survive into
+	 * it. The completion has already released it, so it is taken again -
+	 * which is not the original's mechanism but has the same effect and
+	 * cannot deadlock if the caller never sends the second half.
+	 */
+	if (keep) {
+		AdaptoidVendorTryClaim(dx);
+	}
+	return NT_SUCCESS(dx->Vendor.LastStatus) ? CORE_ST_SUCCESS
+	                                         : CORE_ST_DEVICE_BUSY;
+}
+
+/*
+ * Join one adapter to everything.
+ *
+ * ORDER MATTERS in two places. The core has to exist before anything is
+ * installed into it, and the registry entry has to be filled before it is
+ * published - the moment it is on the list, a control-device request can
+ * find it.
+ */
+void AdaptoidWireDevice(PADAPTOID_DEVEXT DevExt)
+{
+	core_init(&DevExt->Core, AdaptoidReportSink, DevExt);
+
+	/* The transport, in its three shapes. */
+	core_set_vendor(&DevExt->Core, AdaptoidCoreVendor, DevExt);
+	core_set_vendor_claim(&DevExt->Core, AdaptoidCoreVendorClaim);
+	core_set_vendor_sync(&DevExt->Core, AdaptoidCoreVendorSync);
+
+	/* The clock and the packet. */
+	core_set_input_hook(&DevExt->Core, AdaptoidInputHook, DevExt);
+	core_set_tick_hook(&DevExt->Core, AdaptoidTickHook, DevExt);
+
+	/* The script engine. */
+	core_sched_init(&DevExt->Sched, AdaptoidSchedAlloc, AdaptoidSchedFree,
+	                DevExt);
+	core_sched_set_core(&DevExt->Sched, &DevExt->Core);
+	core_sched_set_arm(&DevExt->Sched, AdaptoidScriptArm, DevExt);
+	core_sched_set_event_sink(&DevExt->Sched, AdaptoidScriptEvent, DevExt);
+
+	/* This adapter's row in the driver-wide registry. */
+	DevExt->Registration.handle    = (u32)(ULONG_PTR)DevExt->Self;
+	DevExt->Registration.cs        = &DevExt->Core;
+	DevExt->Registration.sched     = &DevExt->Sched;
+	DevExt->Registration.live      = 0;
+	DevExt->Registration.vendor    = AdaptoidIoctlVendor;
+	DevExt->Registration.enable    = AdaptoidIoctlEnable;
+	DevExt->Registration.cmd_claim = AdaptoidCmdClaim;
+	DevExt->Registration.cmd_xfer  = AdaptoidCmdXfer;
+	DevExt->Registration.os_ctx    = DevExt;
 }
 
 /* ------------------------------------------------------------------ */

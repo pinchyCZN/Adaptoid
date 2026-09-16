@@ -37,10 +37,10 @@
  * registration block, and hands it back as MiniDeviceExtension - see
  * ../docs/driver-structures.txt section 1 for the two-level hop.
  *
- * SKELETON: the 2001 driver's equivalent is 0x1800 bytes across 124 fields.
- * Only the members the skeleton needs are present. Note that none of the
- * original's offsets carry over to 64-bit; the portable content is field order
- * and meaning, which is why this is a struct and not an offset table.
+ * The 2001 driver's equivalent is 0x1800 bytes across 124 fields. NONE OF
+ * ITS OFFSETS CARRY OVER TO 64-BIT - every pointer widens and the packing
+ * changes - so what is portable is field ORDER AND MEANING, which is why
+ * this is a struct and not an offset table.
  */
 /* ======================================================================
  * THE REMOVE LOCK
@@ -553,9 +553,20 @@ NTSTATUS NTAPI AdaptoidPassThroughDeviceControl(PDEVICE_OBJECT DeviceObject,
                                                 PIRP Irp);
 /* Publish this adapter's device interface; AddDevice's last step. */
 NTSTATUS AdaptoidRegisterDeviceInterface(struct _ADAPTOID_DEVEXT *DevExt);
-/* One DWORD out of the driver's service key, or Default if it is absent. */
-ULONG    AdaptoidRegQueryDword(PUNICODE_STRING RegistryPath,
-                               PCWSTR Name, ULONG Default);
+/*
+ * One DWORD out of the driver's settings key, or Default if it is absent.
+ *
+ * THE PATH IS FIXED AND ABSOLUTE, not the service key DriverEntry was
+ * handed - drv_RegQueryDword hardcodes
+ * \REGISTRY\Machine\Software\Wish Technologies\Adaptoid, and takes only a
+ * value name. Worth knowing, because it means the driver needs nothing
+ * from DriverEntry's RegistryPath and therefore never has to copy it - the
+ * I/O manager frees that string once DriverEntry returns.
+ */
+#define ADAPTOID_SETTINGS_KEY \
+    L"\\REGISTRY\\Machine\\Software\\Wish Technologies\\Adaptoid"
+
+ULONG    AdaptoidRegQueryDword(PCWSTR Name, ULONG Default);
 void     AdaptoidSendIdleCommand(struct _ADAPTOID_DEVEXT *DevExt);
 
 /* ======================================================================
@@ -665,6 +676,13 @@ typedef struct _ADAPTOID_DEVEXT {
 	ADAPTOID_POLL_SLOT  PollSlot[ADAPTOID_POLL_SLOTS];
 	ADAPTOID_POLL_CONTEXT PollContext[ADAPTOID_POLL_SLOTS];
 	PVOID               PollWorkItem;   /* PIO_WORKITEM */
+
+	/*
+	 * Where a transfer the CORE issued puts its reply. One buffer per
+	 * device, which is safe because the vendor slot admits exactly one
+	 * transfer at a time - the same invariant the slot exists to keep.
+	 */
+	UCHAR               CoreVendorReply[CORE_N64_RX_MAX + 1];
 	ULONG               PollStopMask;
 	ULONG               PollRestartPending;
 
@@ -833,6 +851,27 @@ NTSTATUS AdaptoidVendorSubmitUrb(struct _ADAPTOID_DEVEXT *DevExt,
     ((u32)(ULONG_PTR)(sl)->Parameters.DeviceIoControl.Type3InputBuffer)
 
 void     AdaptoidDevExtInit(struct _ADAPTOID_DEVEXT *DevExt);
+
+/*
+ * THE WIRING. AdaptoidWireDevice fills in every seam between the OS-free
+ * subsystems and Windows; AdaptoidUnwireDevice takes it all apart in the
+ * order that cannot lose an event. Between them they are why the driver
+ * does anything at all.
+ */
+void     AdaptoidWireDevice(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidUnwireDevice(struct _ADAPTOID_DEVEXT *DevExt);
+
+/*
+ * The OS edges the wiring needs. Installing AddDevice is a driver-extension
+ * write in the DDK and a recorded call in the harness; the work item pair
+ * is pool in one and a counter in the other.
+ */
+typedef NTSTATUS (NTAPI *ADAPTOID_ADD_DEVICE)(PDRIVER_OBJECT,
+                                              PDEVICE_OBJECT);
+void     AdaptoidSetAddDevice(PDRIVER_OBJECT DriverObject,
+                              ADAPTOID_ADD_DEVICE AddDevice);
+PVOID    AdaptoidAllocateWorkItem(PDEVICE_OBJECT DeviceObject);
+void     AdaptoidFreeWorkItem(PVOID WorkItem);
 NTSTATUS AdaptoidStartDevice(struct _ADAPTOID_DEVEXT *DevExt);
 NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
