@@ -1404,6 +1404,234 @@ static const struct {
 };
 
 /* ------------------------------------------------------------------ */
+/* the keyboard and mouse report state machines                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Build and emit keyboard report 2 from the current state.
+ *
+ *     [0]     modifier bitmask
+ *     [1]     0, reserved, as the HID boot keyboard layout requires
+ *     [2..11] up to ten keycodes, zero padded
+ *
+ * TEN-KEY ROLLOVER: if more than ten keys are held, all ten slots are filled
+ * with 0x01 instead. The driver keeps tracking every one of them internally;
+ * only the report saturates, so releasing back down to ten restores the real
+ * list rather than needing a fresh press.
+ */
+static void core_hid_key_report(core_state *cs)
+{
+	u8 payload[2 + CORE_HID_KEYS_REPORTED];
+	s32 i;
+
+	payload[0] = cs->key_modifiers;
+	payload[1] = 0;
+	for (i = 0; i < CORE_HID_KEYS_REPORTED; i++) {
+		payload[2 + i] = 0;
+	}
+
+	if (cs->key_down_count > CORE_HID_KEYS_REPORTED) {
+		for (i = 0; i < CORE_HID_KEYS_REPORTED; i++) {
+			payload[2 + i] = CORE_HID_ROLLOVER;
+		}
+	} else {
+		/* Bounded by the PAYLOAD, not by trusting the rollover test above
+		 * to agree with it. The two are the same number here and in the
+		 * original, but coupling the copy to that agreement is how a
+		 * later edit to one of them becomes a stack overflow. */
+		for (i = 0; i < cs->key_down_count &&
+		            i < CORE_HID_KEYS_REPORTED; i++) {
+			payload[2 + i] = cs->keys_down[i];
+		}
+	}
+	core_emit(cs, CORE_REPORT_KEYBOARD, payload, sizeof(payload));
+}
+
+/*
+ * One key event. usage is a HID keyboard usage, down is non-zero for a press.
+ *
+ * Three disjoint ranges are handled and everything else is ignored:
+ *
+ *     0xE0..0xE7  modifiers, kept as a bitmask, bit = usage - 0xE0
+ *     0x04..0xA4  ordinary keys, kept in the dense array
+ *     0           release everything
+ *
+ * A report goes out ONLY when the state actually changed, so a held key does
+ * not generate repeats and a release of something that was not down is
+ * silent.
+ */
+void core_hid_key_event(core_state *cs, u32 usage, int down)
+{
+	int changed = 0;
+
+	if (cs == 0) {
+		return;
+	}
+
+	if (usage >= CORE_HID_MOD_FIRST && usage <= CORE_HID_MOD_LAST) {
+		u8 bit = (u8)(1u << (usage - CORE_HID_MOD_FIRST));
+
+		if (down) {
+			changed = (cs->key_modifiers & bit) == 0;
+			cs->key_modifiers = (u8)(cs->key_modifiers | bit);
+		} else {
+			changed = (cs->key_modifiers & bit) != 0;
+			cs->key_modifiers = (u8)(cs->key_modifiers & (u8)~bit);
+		}
+	} else if (usage >= CORE_HID_KEY_FIRST && usage <= CORE_HID_KEY_LAST) {
+		s32 at = 0;
+		s32 n  = cs->key_down_count;
+
+		while (at < n && cs->keys_down[at] != (u8)usage) {
+			at++;
+		}
+		if (down) {
+			if (at == n) {
+				/* Not already held. The array cannot overflow: see
+				 * CORE_HID_KEYS_MAX. */
+				if (n < CORE_HID_KEYS_MAX) {
+					cs->keys_down[n] = (u8)usage;
+					cs->key_down_count = n + 1;
+					changed = 1;
+				}
+			}
+			/* Already held: nothing changes, and no report. */
+		} else if (at < n) {
+			/* Close the gap so the array stays dense and in press
+			 * order - which is what makes the ten reported slots the
+			 * ten OLDEST keys rather than an arbitrary ten. */
+			for (; at < n - 1; at++) {
+				cs->keys_down[at] = cs->keys_down[at + 1];
+			}
+			cs->key_down_count = n - 1;
+			changed = 1;
+		}
+	} else if (usage == 0) {
+		changed = (cs->key_modifiers != 0) || (cs->key_down_count != 0);
+		cs->key_modifiers  = 0;
+		cs->key_down_count = 0;
+	}
+
+	if (changed) {
+		core_hid_key_report(cs);
+	}
+}
+
+/*
+ * One mouse button event, buttons 1..3. Emits mouse report 3 with zero
+ * movement, and only when the button state actually changed.
+ *
+ *     [0] button bitmask   [1] dx   [2] dy   [3] wheel
+ */
+void core_hid_mouse_button(core_state *cs, u32 button, int down)
+{
+	u8 payload[4];
+	u8 bit, before;
+
+	if (cs == 0 || button < 1 || button > CORE_HID_MOUSE_BUTTONS) {
+		return;
+	}
+	bit    = (u8)(1u << (button - 1));
+	before = cs->mouse_buttons;
+	if (down) {
+		cs->mouse_buttons = (u8)(before | bit);
+	} else {
+		cs->mouse_buttons = (u8)(before & (u8)~bit);
+	}
+	if (cs->mouse_buttons == before) {
+		return;
+	}
+
+	payload[0] = cs->mouse_buttons;
+	payload[1] = 0;
+	payload[2] = 0;
+	payload[3] = 0;
+	core_emit(cs, CORE_REPORT_MOUSE, payload, sizeof(payload));
+}
+
+/*
+ * One mouse movement. The report carries the DELTAS, not the totals; the
+ * totals are accumulated separately and nothing in the original ever reads
+ * them back.
+ *
+ * Unlike the button path this has no change test: a call with all-zero
+ * deltas still emits a report.
+ *
+ * THE WHEEL CANNOT BE DRIVEN FROM A SCRIPT. drv_DispatchEvents calls this
+ * with the wheel hard-wired to zero and _mouse_relative only carries two
+ * arguments, so mouse_total_wheel can only ever be written with 0. The
+ * parameter is kept because the report field is real.
+ */
+void core_hid_mouse_move(core_state *cs, s32 dx, s32 dy, s32 wheel)
+{
+	u8 payload[4];
+
+	if (cs == 0) {
+		return;
+	}
+	cs->mouse_total_x     += dx;
+	cs->mouse_total_y     += dy;
+	cs->mouse_total_wheel += wheel;
+
+	payload[0] = cs->mouse_buttons;
+	payload[1] = (u8)dx;
+	payload[2] = (u8)dy;
+	payload[3] = (u8)wheel;
+	core_emit(cs, CORE_REPORT_MOUSE, payload, sizeof(payload));
+}
+
+/*
+ * Submit joystick report 1, or replay the last one.
+ *
+ * report is the five packed bytes from core_pack_joystick, or NULL meaning
+ * "send again whatever was last sent". A NULL submit also RE-EVALUATES the
+ * virtual mode from reports_enabled, which is the only place that happens -
+ * so the switch takes effect on the next idle resubmit rather than
+ * immediately.
+ *
+ * VIRTUAL MODE replaces the controller entirely: real reports are dropped,
+ * and a NULL submit synthesises one from virtual_stick, which drv_AddDevice
+ * sets once and nothing ever changes. The synthesised report is X = 1 with
+ * Y = virtual_stick and no buttons, so it is a fixed deflection - a
+ * diagnostic, not an input source.
+ */
+void core_submit_joystick(core_state *cs, const u8 *report)
+{
+	u8 payload[CORE_JOY_REPORT_BYTES];
+	s32 i;
+
+	if (cs == 0) {
+		return;
+	}
+
+	if (report == 0) {
+		cs->virtual_mode = cs->reports_enabled ? 3 : 0;
+	} else {
+		for (i = 0; i < CORE_JOY_REPORT_BYTES; i++) {
+			cs->last_report[i] = report[i];
+		}
+	}
+
+	if (cs->virtual_mode == 0) {
+		const u8 *src = (report != 0) ? report : cs->last_report;
+
+		for (i = 0; i < CORE_JOY_REPORT_BYTES; i++) {
+			payload[i] = src[i];
+		}
+	} else {
+		if (report != 0) {
+			return;         /* virtual mode ignores the controller */
+		}
+		payload[0] = 1;
+		payload[1] = (u8)((u32)cs->virtual_stick << 4);
+		payload[2] = (u8)(cs->virtual_stick >> 4);
+		payload[3] = 0;
+		payload[4] = 0;
+	}
+	core_emit(cs, CORE_REPORT_JOYSTICK, payload, CORE_JOY_REPORT_BYTES);
+}
+
+/* ------------------------------------------------------------------ */
 /* the raw N64 controller-bus transaction                              */
 /* ------------------------------------------------------------------ */
 

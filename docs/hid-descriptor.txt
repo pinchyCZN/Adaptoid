@@ -30,6 +30,8 @@ Table of Contents
    3.  Descriptor Selection
    4.  Descriptor A: Mouse + Keyboard + Joystick
    5.  Report Layouts
+   5.1.  How The Report State Is Kept
+   5.2.  The Virtual Joystick Mode
    6.  Device Identity
    7.  Minidriver IOCTL Surface
    8.  The Controller Poll
@@ -319,10 +321,80 @@ Table of Contents
    including the ten-slot key array and its ErrorRollOver overflow behaviour.
    See script-bytecode.txt section 7.
 
-   The layouts for reports 2 and 3 ARE confirmed. drv_HidKeyEvent and
-   drv_HidMouseButtonEvent in wishk201.sys assemble them byte for byte
-   as described above, including the ten-slot key array and its
-   ErrorRollOver overflow behaviour. See script-bytecode.txt section 7.
+5.1.  How The Report State Is Kept
+
+   The layouts above are what goes out. What decides WHEN, and what the
+   bytes contain, is three small state machines - drv_HidKeyEvent
+   (00014ad0), drv_HidMouseButtonEvent (00014c80) and drv_HidMouseMoveEvent
+   (00014d10). A script never builds a report; its _key and _mouse_*
+   builtins post events, and drv_DispatchEvents turns each one into a call
+   to one of these.
+
+   THE KEYBOARD. Three disjoint keycode ranges are accepted and everything
+   else is ignored outright:
+
+       0xE0..0xE7   modifiers, a bitmask, bit = keycode - 0xE0
+       0x04..0xA4   ordinary keys, a dense array in press order
+       0            release everything
+
+   The array is kept DENSE AND ORDERED BY PRESS TIME: a press appends, and a
+   release shifts the tail down over the gap rather than swapping the last
+   entry into it. That ordering is not cosmetic - it is what makes the ten
+   reported slots the ten OLDEST keys held rather than an arbitrary ten.
+
+   THE ARRAY IS SIZED TO THE KEYCODE RANGE, NOT TO THE REPORT. devext
+   reserves 0xA5 bytes at +0x1725 for 0xA1 possible keycodes, and a keycode
+   already present is never appended twice, so the count cannot exceed the
+   number of distinct accepted codes and the array cannot overflow. The
+   sizing is deliberate, and a port that sizes the array to the ten report
+   slots instead would be wrong.
+
+   TEN-KEY ROLLOVER. Above ten keys held, all ten report slots are filled
+   with 0x01 - HID ErrorRollOver - but the driver keeps tracking every key
+   internally. Releasing back down to ten restores the real list without
+   needing a fresh press.
+
+   A REPORT GOES OUT ONLY ON A CHANGE. A press of a key already held, a
+   release of one that is not, a modifier that is already set, or a
+   release-everything when nothing is held all produce no report at all. The
+   mouse BUTTON path tests the same way.
+
+   THE MOUSE MOVEMENT PATH DOES NOT. drv_HidMouseMoveEvent has no change
+   test and emits on every call, including one with all-zero deltas. It also
+   accumulates running totals at devext+0x1718, +0x171C and +0x1720 which
+   the report does not carry and which nothing in the driver ever reads
+   back; the report carries the DELTAS.
+
+5.2.  The Virtual Joystick Mode
+
+   drv_SubmitJoystickReport (00014a00) is the joystick half, and it has a
+   mode the other two do not.
+
+   A submit with a NULL report means "send the last one again", and it is
+   also the ONLY place the mode is re-evaluated:
+
+       VirtualDeviceMode = ReportsEnabled ? 3 : 0
+
+   so toggling the switch takes effect on the next idle resubmit rather than
+   immediately. ReportsEnabled is a driver-wide global at 00019d70, written
+   in exactly one place - drv_IoctlControlDevice - which makes it a
+   control-device setting rather than a per-device one.
+
+   With the mode non-zero the controller is bypassed entirely: a real report
+   is DROPPED, and a NULL submit synthesises one instead from
+   VirtualStickValue at devext+0x3F8:
+
+       byte 0    1
+       byte 1    (VirtualStickValue & 0x0F) << 4
+       byte 2    VirtualStickValue >> 4
+       byte 3    0
+       byte 4    0
+
+   Read through the 12-bit packing in section 5, that is X = 1 and
+   Y = VirtualStickValue with no buttons - a FIXED deflection, not a sweep.
+   VirtualStickValue is written only by drv_AddDevice and never changes
+   afterwards, so this is a diagnostic that parks the stick at a known
+   position, not an input source.
 
 6.  Device Identity
 

@@ -210,8 +210,8 @@ Table of Contents
    +-----------+----------+---------+---------------------------------------+
    | File      | Now      | Planned | Holds                                 |
    +===========+==========+=========+=======================================+
-   | core.c    |     1658 |   ~2100 | decode, effects, Pak CRCs, the N64    |
-   |           |          |         | transaction, HID report state         |
+   | core.c    |     2088 |    2088 | decode, effects, Pak CRCs, the N64    |
+   |           |          |         | transaction, HID report state; done   |
    +-----------+----------+---------+---------------------------------------+
    | script.c  |      382 |     382 | the bytecode interpreter, and only    |
    |           |          |         | that; it is finished                  |
@@ -246,8 +246,8 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 55 of the 146 functions in
-   wishk201.sys are ported, 17691 of 38690 bytes, so 46 percent by code
+   Measured against the Ghidra database: 59 of the 146 functions in
+   wishk201.sys are ported, 18603 of 38690 bytes, so 48 percent by code
    size. The 3109 lines written so far cover those 16331 bytes, which is 5.3
    bytes of original per line of replacement and is the ratio the estimates
    below use.
@@ -263,7 +263,7 @@ Table of Contents
    | IOCTL surface            |   9 |  7045 |     1174 | ioctl.c   |
    | PnP, start and stop      |  14 |  2577 |      429 | wdm.c     |
    | device naming            |   6 |  1808 |      301 | wdm.c     |
-   | HID report plumbing      |  10 |  1680 |      280 | core+wdm  |
+   | HID report IRP plumbing  |   6 |   768 |      128 | wdm.c     |
    | vendor transport         |   8 |  1522 |      253 | wdm.c     |
    | control device           |  10 |  1473 |      245 | ioctl.c   |
    | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
@@ -273,7 +273,7 @@ Table of Contents
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  91 | 20999 |     3499 |           |
+   | TOTAL REMAINING          |  87 | 20087 |     3347 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
@@ -291,14 +291,14 @@ Table of Contents
    +-------------------------+-------------------------------------------+
    | Piece                   | Specification                             |
    +=========================+===========================================+
-   | Report descriptor       | ../docs/hid-descriptor.txt section 4      |
    | PnP, power, URB plumbing| ../docs/driver-lifecycle.txt              |
    | Private IOCTL surface   | ../docs/ioctl-surface.txt                 |
    +-------------------------+-------------------------------------------+
 
    Already ported: the raw packet decode, the joystick report, the accessory
    probe, the Controller Pak CRCs, the effect engine and its ring, the raw
-   N64 transaction, and the entire script engine - interpreter, scheduler,
+   N64 transaction, the keyboard and mouse report state machines, and the
+   entire script engine - interpreter, scheduler,
    input binding and builtin library, specified in
    ../docs/script-bytecode.txt sections 5, 6 and 9.
 

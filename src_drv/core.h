@@ -111,6 +111,41 @@ typedef signed   long long s64;
 #define CORE_REPORT_MAX_BYTES   16
 
 /*
+ * THE KEYBOARD AND MOUSE STATE MACHINES.
+ *
+ * A script's _key and _mouse_* builtins do not build reports; they post
+ * events, and drv_DispatchEvents turns each one into a call below. These
+ * three functions own the state those reports are built from, which is why
+ * the state lives here rather than in the event queue.
+ */
+
+/* Keycode ranges drv_HidKeyEvent accepts. Anything else is ignored. */
+#define CORE_HID_MOD_FIRST      0xE0u   /* 0xE0..0xE7 are the modifiers   */
+#define CORE_HID_MOD_LAST       0xE7u
+#define CORE_HID_KEY_FIRST      0x04u   /* 0x04..0xA4 are ordinary keys   */
+#define CORE_HID_KEY_LAST       0xA4u
+
+/*
+ * The pressed-key array is sized to the ACCEPTED KEYCODE RANGE, not to the
+ * ten slots the report carries: 0xA5 entries for 0xA1 possible keycodes.
+ * A key already in the array is never appended twice, so the count cannot
+ * exceed the number of distinct accepted codes and the array cannot
+ * overflow. The original's devext reserves exactly these 0xA5 bytes, which
+ * is how we know the bound was deliberate.
+ */
+#define CORE_HID_KEYS_MAX       0xA5
+
+/* How many fit in one report, and what is sent when more are held. */
+#define CORE_HID_KEYS_REPORTED  10
+#define CORE_HID_ROLLOVER       0x01u   /* HID ErrorRollOver */
+
+/* Mouse buttons 1..3, as bits 0..2. */
+#define CORE_HID_MOUSE_BUTTONS  3
+
+/* The joystick report payload, after the report ID. */
+#define CORE_JOY_REPORT_BYTES   5
+
+/*
  * THE OUTPUT SEAM.
  *
  * Corresponds to drv_SubmitHidReport in the original. The driver's sink copies
@@ -477,6 +512,33 @@ typedef struct core_state {
 	u8              probe_step;
 	u8              probe_reply[CORE_PROBE_REPLY_BYTES];
 
+	/*
+	 * Keyboard state. keys_down is dense and ordered by press time: a
+	 * press appends, a release closes the gap. See core_hid_key_event.
+	 */
+	u8              key_modifiers;
+	u8              keys_down[CORE_HID_KEYS_MAX];
+	s32             key_down_count;
+
+	/* Mouse state. The totals are accumulated and, in the original, never
+	 * read back by anything; they are kept for parity. */
+	u8              mouse_buttons;
+	s32             mouse_total_x;
+	s32             mouse_total_y;
+	s32             mouse_total_wheel;
+
+	/*
+	 * Virtual joystick mode. When on, joystick reports are synthesised
+	 * from virtual_stick instead of coming from the controller, and real
+	 * reports are dropped. reports_enabled selects it; in the original
+	 * that is a driver-wide global written only by the control device's
+	 * IOCTL surface, so the OS layer mirrors it into each device.
+	 */
+	s32             virtual_mode;
+	s32             virtual_stick;
+	int             reports_enabled;
+	u8              last_report[CORE_JOY_REPORT_BYTES];
+
 	/* Which virtual devices are live. Mirrors drv_VirtualDevicesMask: bit 0
 	 * joystick, bit 1 keyboard, bit 2 mouse. The 2001 driver defaults this to
 	 * 7 in DriverEntry and lets a registry value override it. */
@@ -644,6 +706,17 @@ void core_set_vendor_sync(core_state *cs, core_vendor_sync_fn fn);
  */
 int  core_n64_transaction(core_state *cs, const u8 *tx, s32 tx_len,
                           u8 *rx, s32 rx_len, s32 *actual);
+
+/*
+ * The keyboard and mouse report state machines. A script's _key and
+ * _mouse_* builtins reach these through the event queue.
+ */
+void core_hid_key_event(core_state *cs, u32 usage, int down);
+void core_hid_mouse_button(core_state *cs, u32 button, int down);
+void core_hid_mouse_move(core_state *cs, s32 dx, s32 dy, s32 wheel);
+
+/* Submit joystick report 1, or NULL to replay the last one. */
+void core_submit_joystick(core_state *cs, const u8 *report);
 
 /* Ask the controller to reset. Fire and forget. */
 int  core_controller_reset(core_state *cs);

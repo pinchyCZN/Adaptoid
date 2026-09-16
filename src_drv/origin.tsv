@@ -42,6 +42,10 @@ core_effect_wave	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
 core_effect_window	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
 core_effect_window	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
 core_emit	core.c	part	wishk201.sys	00014de8	drv_SubmitHidReport
+core_hid_key_event	core.c	port	wishk201.sys	00014ad0	drv_HidKeyEvent
+core_hid_key_report	core.c	part	wishk201.sys	00014ad0	drv_HidKeyEvent
+core_hid_mouse_button	core.c	port	wishk201.sys	00014c80	drv_HidMouseButtonEvent
+core_hid_mouse_move	core.c	port	wishk201.sys	00014d10	drv_HidMouseMoveEvent
 core_init	core.c	new	-	-	-
 core_n64_transaction	core.c	port	wishk201.sys	000137c0	drv_N64Transaction
 core_on_raw_packet	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
@@ -67,6 +71,7 @@ core_set_vendor	core.c	new	-	-	-
 core_set_vendor_claim	core.c	new	-	-	-
 core_set_vendor_sync	core.c	new	-	-	-
 core_sine_lerp	core.c	port	wishk201.sys	000149a0	drv_SineLerp
+core_submit_joystick	core.c	port	wishk201.sys	00014a00	drv_SubmitJoystickReport
 core_tick	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
 core_tick	core.c	part	wishk201.sys	00017980	drv_ScriptScheduler
 core_tune_strength_for	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
@@ -96,6 +101,8 @@ harness_claim	harness.c	new	-	-	-
 harness_pump	harness.c	new	-	-	-
 harness_sink	harness.c	new	-	-	-
 harness_vendor	harness.c	new	-	-	-
+hid_keys_match	harness.c	new	-	-	-
+hid_sink	harness.c	new	-	-	-
 hlog	harness.c	new	-	-	-
 htrace	harness.c	new	-	-	-
 hverbose	harness.c	new	-	-	-
@@ -123,6 +130,7 @@ simulate_add_device	harness.c	new	-	-	-
 test_accessory_probe	harness.c	new	-	-	-
 test_effect_chain	harness.c	new	-	-	-
 test_effect_engine	harness.c	new	-	-	-
+test_hid_reports	harness.c	new	-	-	-
 test_input_bind	harness.c	new	-	-	-
 test_joystick_report	harness.c	new	-	-	-
 test_n64_transaction	harness.c	new	-	-	-

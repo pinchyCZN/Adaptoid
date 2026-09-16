@@ -3426,6 +3426,358 @@ static int test_n64_transaction(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the keyboard and mouse report state machines                        */
+/* ------------------------------------------------------------------ */
+
+#define HIDLOG 64
+
+static struct {
+	u8  id;
+	u8  data[CORE_REPORT_MAX_BYTES];
+	u32 len;
+} g_hidlog[HIDLOG];
+static int g_hidcount;
+
+static void hid_sink(void *ctx, u8 report_id, const u8 *data, u32 len)
+{
+	u32 i;
+
+	(void)ctx;
+	if (g_hidcount < HIDLOG) {
+		g_hidlog[g_hidcount].id  = report_id;
+		g_hidlog[g_hidcount].len = len;
+		for (i = 0; i < len && i < CORE_REPORT_MAX_BYTES; i++) {
+			g_hidlog[g_hidcount].data[i] = data[i];
+		}
+	}
+	g_hidcount++;
+}
+
+/* The keycodes in the last keyboard report, as a printable digest. */
+static int hid_keys_match(int at, const u8 *want, int n)
+{
+	int i;
+
+	for (i = 0; i < CORE_HID_KEYS_REPORTED; i++) {
+		u8 got = g_hidlog[at].data[2 + i];
+		u8 exp = (i < n) ? want[i] : 0;
+
+		if (got != exp) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static int test_hid_reports(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_state cs;
+
+	/* ---- 1. modifiers are a bitmask, and only changes report ------- */
+	{
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+
+		core_hid_key_event(&cs, 0xE0, 1);          /* LeftControl */
+		sched_expect(g_hidcount == 1, "press emits one report", g_hidcount,
+		             1, &bad);
+		sched_expect(g_hidlog[0].id == CORE_REPORT_KEYBOARD,
+		             "report ID 2", g_hidlog[0].id, CORE_REPORT_KEYBOARD,
+		             &bad);
+		sched_expect(g_hidlog[0].len == 12, "twelve payload bytes",
+		             (long)g_hidlog[0].len, 12, &bad);
+		sched_expect(g_hidlog[0].data[0] == 0x01, "bit 0 for 0xE0",
+		             g_hidlog[0].data[0], 0x01, &bad);
+		sched_expect(g_hidlog[0].data[1] == 0, "reserved byte is zero",
+		             g_hidlog[0].data[1], 0, &bad);
+
+		core_hid_key_event(&cs, 0xE0, 1);          /* held */
+		sched_expect(g_hidcount == 1, "a held modifier does not repeat",
+		             g_hidcount, 1, &bad);
+
+		core_hid_key_event(&cs, 0xE7, 1);          /* RightGUI */
+		sched_expect(g_hidlog[1].data[0] == 0x81, "bit 7 for 0xE7",
+		             g_hidlog[1].data[0], 0x81, &bad);
+
+		core_hid_key_event(&cs, 0xE0, 0);
+		sched_expect(g_hidlog[2].data[0] == 0x80, "release clears its bit",
+		             g_hidlog[2].data[0], 0x80, &bad);
+
+		core_hid_key_event(&cs, 0xE0, 0);          /* already up */
+		sched_expect(g_hidcount == 3, "releasing an unheld key is silent",
+		             g_hidcount, 3, &bad);
+		groups++;
+	}
+
+	/* ---- 2. ordinary keys stay dense and in press order ------------ */
+	{
+		/*
+		 * FOUR keys, not three. Removing the middle of three gives the
+		 * same answer whether the tail is shifted down or the last entry
+		 * is swapped into the hole; with four, only shifting preserves
+		 * press order.
+		 */
+		static const u8 WANT4[] = {0x04, 0x05, 0x06, 0x07};
+		static const u8 WANT3[] = {0x04, 0x06, 0x07};
+
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+
+		core_hid_key_event(&cs, 0x04, 1);
+		core_hid_key_event(&cs, 0x05, 1);
+		core_hid_key_event(&cs, 0x06, 1);
+		core_hid_key_event(&cs, 0x07, 1);
+		sched_expect(g_hidcount == 4, "four presses, four reports",
+		             g_hidcount, 4, &bad);
+		sched_expect(hid_keys_match(3, WANT4, 4), "in press order",
+		             g_hidlog[3].data[2], 0x04, &bad);
+
+		core_hid_key_event(&cs, 0x05, 0);          /* the second one */
+		sched_expect(hid_keys_match(4, WANT3, 3),
+		             "release closes the gap, keeping order",
+		             g_hidlog[4].data[3], 0x06, &bad);
+		sched_expect(g_hidlog[4].data[5] == 0, "and zero-pads the tail",
+		             g_hidlog[4].data[5], 0, &bad);
+
+		core_hid_key_event(&cs, 0x04, 1);          /* already down */
+		sched_expect(g_hidcount == 5, "a held key does not repeat",
+		             g_hidcount, 5, &bad);
+		groups++;
+	}
+
+	/* ---- 3. ten-key rollover, and recovery from it ------------------ */
+	{
+		int k;
+		int roll_ok = 1;
+
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+
+		for (k = 0; k < 10; k++) {
+			core_hid_key_event(&cs, (u32)(0x04 + k), 1);
+		}
+		sched_expect(g_hidlog[9].data[2 + 9] == 0x0D,
+		             "ten keys all fit", g_hidlog[9].data[11], 0x0D, &bad);
+
+		core_hid_key_event(&cs, 0x0E, 1);          /* the eleventh */
+		for (k = 0; k < CORE_HID_KEYS_REPORTED; k++) {
+			if (g_hidlog[10].data[2 + k] != CORE_HID_ROLLOVER) {
+				roll_ok = 0;
+			}
+		}
+		sched_expect(roll_ok, "the eleventh fills all ten with 0x01",
+		             g_hidlog[10].data[2], CORE_HID_ROLLOVER, &bad);
+
+		/* releasing back to ten restores the real list */
+		core_hid_key_event(&cs, 0x0E, 0);
+		sched_expect(g_hidlog[11].data[2] == 0x04,
+		             "dropping back to ten restores them",
+		             g_hidlog[11].data[2], 0x04, &bad);
+		sched_expect(g_hidlog[11].data[11] == 0x0D, "all ten of them",
+		             g_hidlog[11].data[11], 0x0D, &bad);
+		groups++;
+	}
+
+	/* ---- 4. usage 0 releases everything ----------------------------- */
+	{
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+
+		core_hid_key_event(&cs, 0xE1, 1);
+		core_hid_key_event(&cs, 0x07, 1);
+		g_hidcount = 0;
+
+		core_hid_key_event(&cs, 0, 0);
+		sched_expect(g_hidcount == 1, "one report", g_hidcount, 1, &bad);
+		sched_expect(g_hidlog[0].data[0] == 0, "modifiers cleared",
+		             g_hidlog[0].data[0], 0, &bad);
+		sched_expect(g_hidlog[0].data[2] == 0, "and the key list",
+		             g_hidlog[0].data[2], 0, &bad);
+
+		core_hid_key_event(&cs, 0, 0);
+		sched_expect(g_hidcount == 1, "clearing nothing is silent",
+		             g_hidcount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 5. keycodes outside the accepted ranges are ignored -------- */
+	{
+		/* NOT named OUT: the DDK headers define that as an annotation
+		 * macro, and kstub.h mirrors them. */
+		static const u32 REJECT[] = {0x01, 0x02, 0x03, 0xA5,
+			                         0xDF, 0xE8, 0xFF};
+		int k;
+
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+		for (k = 0; k < (int)(sizeof(REJECT) / sizeof(REJECT[0])); k++) {
+			core_hid_key_event(&cs, REJECT[k], 1);
+		}
+		sched_expect(g_hidcount == 0, "seven out-of-range codes ignored",
+		             g_hidcount, 0, &bad);
+
+		/* the boundaries themselves ARE accepted */
+		core_hid_key_event(&cs, 0x04, 1);
+		core_hid_key_event(&cs, 0xA4, 1);
+		core_hid_key_event(&cs, 0xE0, 1);
+		core_hid_key_event(&cs, 0xE7, 1);
+		sched_expect(g_hidcount == 4, "all four boundaries accepted",
+		             g_hidcount, 4, &bad);
+		groups++;
+	}
+
+	/* ---- 6. mouse buttons ------------------------------------------- */
+	{
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+
+		core_hid_mouse_button(&cs, 1, 1);
+		sched_expect(g_hidlog[0].id == CORE_REPORT_MOUSE, "report ID 3",
+		             g_hidlog[0].id, CORE_REPORT_MOUSE, &bad);
+		sched_expect(g_hidlog[0].len == 4, "four payload bytes",
+		             (long)g_hidlog[0].len, 4, &bad);
+		sched_expect(g_hidlog[0].data[0] == 0x01, "button 1 is bit 0",
+		             g_hidlog[0].data[0], 0x01, &bad);
+		sched_expect(g_hidlog[0].data[1] == 0 && g_hidlog[0].data[2] == 0 &&
+		             g_hidlog[0].data[3] == 0, "with no movement",
+		             g_hidlog[0].data[1], 0, &bad);
+
+		core_hid_mouse_button(&cs, 3, 1);
+		sched_expect(g_hidlog[1].data[0] == 0x05, "button 3 is bit 2",
+		             g_hidlog[1].data[0], 0x05, &bad);
+
+		core_hid_mouse_button(&cs, 1, 1);
+		sched_expect(g_hidcount == 2, "a held button does not repeat",
+		             g_hidcount, 2, &bad);
+
+		core_hid_mouse_button(&cs, 4, 1);
+		core_hid_mouse_button(&cs, 0, 1);
+		sched_expect(g_hidcount == 2, "buttons 0 and 4 are ignored",
+		             g_hidcount, 2, &bad);
+
+		core_hid_mouse_button(&cs, 3, 0);
+		sched_expect(g_hidlog[2].data[0] == 0x01, "release clears its bit",
+		             g_hidlog[2].data[0], 0x01, &bad);
+		groups++;
+	}
+
+	/* ---- 7. mouse movement carries deltas and accumulates totals ---- */
+	{
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+		core_hid_mouse_button(&cs, 2, 1);
+		g_hidcount = 0;
+
+		core_hid_mouse_move(&cs, 10, -20, 0);
+		sched_expect(g_hidlog[0].data[0] == 0x02,
+		             "movement carries the held button",
+		             g_hidlog[0].data[0], 0x02, &bad);
+		sched_expect((s8)g_hidlog[0].data[1] == 10, "dx",
+		             (s8)g_hidlog[0].data[1], 10, &bad);
+		sched_expect((s8)g_hidlog[0].data[2] == -20, "dy",
+		             (s8)g_hidlog[0].data[2], -20, &bad);
+
+		core_hid_mouse_move(&cs, 5, 5, 0);
+		sched_expect(cs.mouse_total_x == 15, "totals accumulate",
+		             cs.mouse_total_x, 15, &bad);
+		sched_expect(cs.mouse_total_y == -15, "on both axes",
+		             cs.mouse_total_y, -15, &bad);
+		sched_expect((s8)g_hidlog[1].data[1] == 5,
+		             "but the report carries the delta, not the total",
+		             (s8)g_hidlog[1].data[1], 5, &bad);
+
+		core_hid_mouse_move(&cs, 0, 0, 0);
+		sched_expect(g_hidcount == 3, "a zero move still reports",
+		             g_hidcount, 3, &bad);
+		groups++;
+	}
+
+	/* ---- 8. the joystick submit, replay and virtual mode ------------ */
+	{
+		static const u8 R1[] = {0x11, 0x22, 0x33, 0x44, 0x55};
+		int k;
+		int same = 1;
+
+		core_init(&cs, hid_sink, 0);
+		g_hidcount = 0;
+
+		core_submit_joystick(&cs, R1);
+		sched_expect(g_hidlog[0].id == CORE_REPORT_JOYSTICK, "report ID 1",
+		             g_hidlog[0].id, CORE_REPORT_JOYSTICK, &bad);
+		sched_expect(g_hidlog[0].len == CORE_JOY_REPORT_BYTES,
+		             "five payload bytes", (long)g_hidlog[0].len,
+		             CORE_JOY_REPORT_BYTES, &bad);
+		for (k = 0; k < CORE_JOY_REPORT_BYTES; k++) {
+			if (g_hidlog[0].data[k] != R1[k]) {
+				same = 0;
+			}
+		}
+		sched_expect(same, "passed through unchanged", g_hidlog[0].data[0],
+		             0x11, &bad);
+
+		/* NULL replays the last one */
+		core_submit_joystick(&cs, 0);
+		same = 1;
+		for (k = 0; k < CORE_JOY_REPORT_BYTES; k++) {
+			if (g_hidlog[1].data[k] != R1[k]) {
+				same = 0;
+			}
+		}
+		sched_expect(same, "NULL replays the last report",
+		             g_hidlog[1].data[0], 0x11, &bad);
+
+		/* turning the switch on does not take effect until a NULL submit */
+		cs.reports_enabled = 1;
+		cs.virtual_stick   = 0x123;
+		core_submit_joystick(&cs, R1);
+		sched_expect(g_hidlog[2].data[0] == 0x11,
+		             "the switch is not read on a real submit",
+		             g_hidlog[2].data[0], 0x11, &bad);
+
+		core_submit_joystick(&cs, 0);
+		sched_expect(cs.virtual_mode == 3, "a NULL submit selects it",
+		             cs.virtual_mode, 3, &bad);
+		sched_expect(g_hidlog[3].data[0] == 1, "X low byte is 1",
+		             g_hidlog[3].data[0], 1, &bad);
+		sched_expect(g_hidlog[3].data[1] == 0x30,
+		             "Y low nibble in the high half",
+		             g_hidlog[3].data[1], 0x30, &bad);
+		sched_expect(g_hidlog[3].data[2] == 0x12, "Y high bits",
+		             g_hidlog[3].data[2], 0x12, &bad);
+		sched_expect(g_hidlog[3].data[3] == 0 && g_hidlog[3].data[4] == 0,
+		             "and no buttons", g_hidlog[3].data[3], 0, &bad);
+
+		/* in virtual mode a real report is dropped entirely */
+		g_hidcount = 0;
+		core_submit_joystick(&cs, R1);
+		sched_expect(g_hidcount == 0, "virtual mode drops real reports",
+		             g_hidcount, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 9. the device mask gates each report independently -------- */
+	{
+		core_init(&cs, hid_sink, 0);
+		cs.devices_mask = CORE_DEVICE_MOUSE;      /* keyboard off */
+		g_hidcount = 0;
+
+		core_hid_key_event(&cs, 0x04, 1);
+		sched_expect(g_hidcount == 0, "keyboard report suppressed",
+		             g_hidcount, 0, &bad);
+		core_hid_mouse_button(&cs, 1, 1);
+		sched_expect(g_hidcount == 1, "mouse report still goes out",
+		             g_hidcount, 1, &bad);
+		groups++;
+	}
+
+	hlog("HID report builders    : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -3503,6 +3855,7 @@ int main(int argc, char **argv)
 	bad += test_input_bind();
 	bad += test_natives();
 	bad += test_n64_transaction();
+	bad += test_hid_reports();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);
