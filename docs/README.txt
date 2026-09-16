@@ -32,7 +32,8 @@ Table of Contents
    indented three spaces and wrapped at 80 columns; tables may run to 120
    including their indent. No markdown syntax appears in a .txt file.
 
-   Two checkers live in tools/:
+   tools/ holds the checkers these documents are held to, the ones the
+   replacement source is held to, and the driver-signing pair:
 
    +----------------------------------+------------------------------------+
    | Command                          | Purpose                            |
@@ -40,9 +41,15 @@ Table of Contents
    | python tools/asciify.py --check  | ASCII, width, table alignment      |
    | python tools/asciify.py --fix    | transliterate and rewrap in place  |
    | python tools/rfcfmt.py --fix P   | render a draft as RFC text         |
+   | python tools/retab.py --check    | tabs for indent, spaces to align   |
+   | python tools/originmap.py --check| every function maps to an original |
+   | tools/mktestcert.cmd             | make the test certificate, ONCE    |
+   | tools/signdriver.cmd             | sign a build for a test machine    |
    +----------------------------------+------------------------------------+
 
-   Run asciify.py --check before treating any document as finished.
+   Run asciify.py --check before treating any document as finished. The two
+   .cmd files are documented in src_drv/README.txt section 7.1; note that
+   mktestcert.cmd writes a PRIVATE KEY, into the gitignored build tree.
 
 2.  Planned Documents
 

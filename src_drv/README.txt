@@ -31,6 +31,7 @@ Table of Contents
    6.1.  What Is Left
    6.2.  Specifications For What Remains
    7.  Installing It
+   7.1.  Signing
    8.  Out Of Scope
 
 1.  Layout
@@ -784,16 +785,63 @@ Table of Contents
    The value is read ONCE PER DEVICE ARRIVAL, so changing it needs a replug
    rather than a service restart.
 
-   ON A TEST MACHINE the driver is unsigned, so 64-bit Windows refuses to
-   load it until test signing is on and the binary carries a test
-   certificate:
+7.1.  Signing
 
-       bcdedit /set testsigning on         (then reboot)
-       makecert / signtool, or an equivalent
+   64-bit Windows will not load an unsigned kernel driver. Two scripts take
+   care of it; the first is run ONCE and the second after every build.
 
-   None of that has been done here and none of it has been tried. What the
-   four clean builds establish is that the code compiles and links as a
-   kernel driver, not that it loads.
+       tools\mktestcert.cmd                  make the certificate
+       tools\signdriver.cmd [plat] [config]  sign a build
+
+   mktestcert.cmd writes two files into src_drv\build\sign\, which is
+   inside the gitignored build tree BECAUSE ONE OF THEM IS A PRIVATE KEY:
+
+       adaptoid-test.pfx   the key, used by signdriver.cmd
+       adaptoid-test.cer   the public half, to carry to the test machine
+
+   It uses PowerShell's New-SelfSignedCertificate rather than the WDK's
+   makecert.exe, which is deprecated and whose 2009 build defaults to SHA-1
+   - and Windows 10 does not accept SHA-1 on a kernel-mode signature.
+
+   signdriver.cmd does two separate things, and they answer two different
+   questions:
+
+       the .sys is EMBEDDED-SIGNED   so the kernel will LOAD it
+       adaptoid.cat is built+signed  so PnP will INSTALL the package
+
+   Signing one and not the other half-works in a way that is confusing: an
+   unsigned catalog still installs, with a warning, and an unsigned .sys
+   fails at load with nothing useful in the log.
+
+   It picks the Windows 10 SDK's signtool deliberately - the WDK 7.1 one
+   cannot produce a SHA-256 signature. Both files come out sha256RSA; that
+   has been run and checked.
+
+   ON THE TEST MACHINE, all three steps, and the second is the one people
+   miss:
+
+       certutil -addstore -f Root             adaptoid-test.cer
+       certutil -addstore -f TrustedPublisher adaptoid-test.cer
+       bcdedit /set testsigning on            (then REBOOT)
+
+   Root alone gets the driver loading; PnP checks TrustedPublisher, so
+   without it the INF install still prompts.
+
+   THE CATALOG'S OS ATTRIBUTE IS THE ONE UNCERTAINTY. The only Inf2Cat on
+   this machine is WDK 7.1's, whose newest /os value is 7_X64 - it predates
+   Windows 8 and cannot write a Windows 10 attribute. The catalog it
+   produces is correctly signed but claims the wrong platform. Whether a
+   given Windows 10 build accepts that has NOT been tested here. If the
+   install refuses the package, the options in order of preference are: get
+   a modern Inf2Cat from a current WDK; install with
+   "pnputil /add-driver adaptoid.inf /install" and accept the warning; or
+   fall back to loading the .sys as a service by hand, which skips PnP
+   entirely and therefore skips the catalog.
+
+   WHAT ALL OF THIS ESTABLISHES is that the package is signed and
+   installable in principle. It has not been installed. The four clean
+   builds say the code compiles and links as a kernel driver; nothing here
+   says it runs.
 
 8.  Out Of Scope
 

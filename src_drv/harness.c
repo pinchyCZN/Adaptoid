@@ -8554,11 +8554,16 @@ static int test_power_and_control(void)
  * the device's identity. Everything a user has bound, every game's saved
  * configuration and the device's name in Control Panel follow from it.
  *
- * The vector below is the 185 bytes at 00019b40, which are also the
- * contents of the shipped RPD1.bin. The descriptor in core.c was written
- * out item by item from docs/hid-descriptor.txt section 4, so this is a
- * conformance check of one against the other and not a copy compared with
- * itself.
+ * The vector below is the 185 bytes at 00019b40, read out of the Ghidra
+ * database. The descriptor in core.c was written out item by item from
+ * docs/hid-descriptor.txt section 4, so this is a conformance check of one
+ * against the other and not a copy compared with itself.
+ *
+ * THAT IS THE ONLY SOURCE FOR THESE BYTES. There is no second copy shipped
+ * anywhere to check them against, which is why group 2 parses the result
+ * structurally as well - a transcription slip that still parsed as three
+ * balanced collections with the right report IDs would have to be a
+ * deliberate one.
  * ====================================================================== */
 
 static const u8 HID_DESC_ORIGINAL[185] = {

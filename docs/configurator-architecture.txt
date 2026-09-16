@@ -31,6 +31,8 @@ Table of Contents
    5.  Device Discovery
    6.  The User-Mode Event Loop
    7.  Driver Installation
+   7.1.  What The Installer Lays Down
+   7.2.  How It Installs
    8.  Game Launch Detection And wishh201.dll
    9.  Process And Thread Structure
    10. Consequences For The Replacement
@@ -273,6 +275,32 @@ Table of Contents
    message 0x40B, which calls cfg_CompleteDeviceRescan.
 
 7.  Driver Installation
+
+7.1.  What The Installer Lays Down
+
+   Seven entries, and the driver is not among them:
+
+       scripts\              sample scripts; see script-language.txt
+       _readme.txt          product notes
+       script.db            the script database
+       unins000.dat         the uninstaller's manifest
+       unins000.exe         the uninstaller
+       wishd201.exe         the configurator, which is also the installer
+       wishna1.inf          the driver's INF
+
+   THE .SYS IS NOT IN THE INSTALL DIRECTORY, and neither is the hook DLL.
+   wishk201.sys reaches the system through wishna1.inf, which the
+   configurator publishes with SetupCopyOEMInfA - see below - so the binary
+   is copied into the driver store and then into system32\drivers by the
+   PnP installer rather than being placed by the installer directly.
+
+   wishna1.inf IS THE AUTHORITATIVE RECORD of the hardware ID, the setup
+   class, the service name and the registry values the driver expects. It is
+   not in decomp/ and has not been read; a replacement's own INF is
+   reconstructed from the driver's behaviour instead, which is weaker
+   evidence. See src_drv/README.txt section 7.
+
+7.2.  How It Installs
 
    The configurator is also the installer. The -i switch installs and -u
    uninstalls; both run from cfg_WinMain before any window is created.

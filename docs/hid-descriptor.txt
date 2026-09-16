@@ -101,13 +101,24 @@ Table of Contents
    cross-references Ghidra reports against 00019b40 are PE section-table
    fields at 000100f0 and 000101ec, not code.
 
-      CORROBORATION. The install directory ships three files, RPD1.bin, RPD2.bin
-   and RPD3.bin, of 185, 64 and 128 bytes. Their contents are byte-for-byte
-   the three descriptors above: RPD1 is the 185-byte Mouse + Keyboard +
-   Joystick, RPD2 the 64-byte Joystick-only, and RPD3 the Mouse + Keyboard,
-   whose 121 descriptor bytes are padded with seven trailing zeroes to 128.
-   They are an independent check on the reading above and on the lengths in
-   the selection table.
+   RETRACTED: THERE IS NO SECOND SOURCE FOR THESE BYTES. An earlier revision
+   of this section claimed the installer ships three files, RPD1.bin,
+   RPD2.bin and RPD3.bin, whose contents corroborate the three descriptors.
+   IT DOES NOT. Those files were placed in the install directory by hand
+   during research and are not part of the product. The installer lays down
+   only scripts\, _readme.txt, script.db, unins000.dat, unins000.exe,
+   wishd201.exe and wishna1.inf.
+
+   So the descriptors have ONE source: the bytes in the image, read out of
+   the Ghidra database at the three addresses above. That is sound evidence
+   - it is the data the driver actually serves - but it is not corroborated,
+   and this note said it was.
+
+   What IS an independent check is structural rather than second-source: the
+   185-byte descriptor parses as three balanced top-level collections with
+   report IDs 3, 2 and 1, and the 121- and 64-byte fragments parse on their
+   own as two collections and one. A transcription slip that still parsed
+   would have to be a deliberate one. src_drv/harness.c performs that parse.
 
 3.  Descriptor Selection
 
