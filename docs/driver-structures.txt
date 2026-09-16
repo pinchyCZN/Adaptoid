@@ -94,7 +94,7 @@ Table of Contents
    | 0x294  | Capabilities             | DEVICE_CAPABILITIES          | 0x40 bytes, IRP_MN_QUERY_CAPABILITIES    |
    | 0x328  | CollectionEnabled        | byte[3]                      | per HID collection; minidriver fn 7/8    |
    | 0x334  | DeviceName               | char[10]                     | display name; see known-defects.txt      |
-   | 0x33E  | FirmwareRevision         | ushort                       | vendor request 0x75                      |
+   | 0x33E  | UsbDeviceAddress         | short                        | from vendor request 0x75; NOT a revision |
    | 0x344  | GlobalDeviceLink         | LIST_ENTRY                   | driver-wide device list                  |
    +--------+--------------------------+------------------------------+------------------------------------------+
 
@@ -395,6 +395,21 @@ Table of Contents
    RingCount is cleared outright on the idle path: drv_EffectSendUpdate drops
    every precomputed tick once EffectIdleTicks passes 4, at the same moment it
    sends the motor-stop command 0x32.
+
+   UsbDeviceAddress, +0x33E, WAS RECORDED AS FirmwareRevision. It is the
+   adapter's own USB bus address, which drv_QueryFirmwareInfo obtains with
+   vendor request 0x75 and keeps the first byte of. What settles it is its
+   single use: drv_FindDeviceOnHub compares it against DeviceAddress at
+   offset 25 of the packed 0x23-byte USB_NODE_CONNECTION_INFORMATION, while
+   walking the hub tree to discover which port this adapter is plugged into.
+
+   The firmware revision the configurator displays is a different value -
+   bcdDevice from the cached device descriptor, returned by IOCTL fn 0x836
+   selector 1. Two numbers, two purposes, one name between them until now.
+
+   It also matters for correctness, not just naming: vendor and product do
+   not distinguish two identical adapters, so without the address match the
+   second one would be given the first one's port path.
 
 3.5.  ADAPTOID_SCRIPT_THREAD, 0x24 header plus stack
 

@@ -234,10 +234,10 @@ Table of Contents
    | ioctl.c   |     1303 |    1303 | both IOCTL surfaces, the registry and |
    |           |          |         | the notify queue; finished            |
    +-----------+----------+---------+---------------------------------------+
-   | wdm.c     |     1372 |   ~2000 | DriverEntry, AddDevice, PnP, power,   |
+   | wdm.c     |     1582 |   ~2100 | DriverEntry, AddDevice, PnP, power,   |
    |           |          |         | polling, URB transport, device naming |
    +-----------+----------+---------+---------------------------------------+
-   | harness.c |     6524 |   ~7000 | main() and every test                 |
+   | harness.c |     6964 |   ~7400 | main() and every test                 |
    +-----------+----------+---------+---------------------------------------+
 
    THE BUILTINS WENT INTO sched.c, NOT script.c as first planned. Eleven of
@@ -273,8 +273,8 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 99 of the 146 functions in
-   wishk201.sys are ported, 30940 of 38690 bytes, so 80 percent by code
+   Measured against the Ghidra database: 105 of the 146 functions in
+   wishk201.sys are ported, 32396 of 38690 bytes, so 84 percent by code
    size.
 
    THE COUNT NOW INCLUDES NAMED-BUT-EMPTY FUNCTIONS. Stage two declared and
@@ -302,32 +302,43 @@ Table of Contents
    core_on_raw_packet and out of a completed HID read - and all of it is
    testable, so all of it is tested.
 
-   Stage four is the rest of what stage two named: the USB descriptor fetch
-   and configuration select, device naming, power, USB port recovery, and
-   the control device object with its command-block read/write channel.
+   Stage four was DEVICE NAMING and USB PORT RECOVERY. Naming is the hub
+   walk that gives a device its display string, and it is where the
+   unbounded string copy of known-defects.txt section 6 lives; recovery is
+   the retry ladder a failed read falls into. Both are testable - the hub
+   walk against a made-up topology, the ladder against a scripted port - and
+   both are tested.
+
+   Stage five is what is left: the USB descriptor fetch and configuration
+   select, power, the control device object with its command-block
+   read/write channel, and the remaining kernel glue.
 
    The 5332 lines of replacement written so far cover 24733 bytes of
    original, which is 4.6 bytes per line and is the ratio the estimates
    below use. It has drifted down as the work moved from dense arithmetic to
    OS plumbing, which is spread thinner.
 
-   THE WHOLE SCRIPT ENGINE IS NOW DONE: the interpreter, the thread
-   scheduler, the input binding and the native builtin library. What is left
-   is the OS-facing half of the driver plus two OS-free pieces, the N64
-   transaction and the HID report state machines.
+   EVERY OS-FREE PIECE IS DONE: core.c, script.c, sched.c and ioctl.c are
+   all finished. What remains is entirely inside wdm.c, and entirely about
+   Windows - device objects, IRP sequencing and USB descriptors. The two
+   division helpers are compiler runtime rather than driver code and are
+   supplied by the toolchain.
 
    +--------------------------+-----+-------+----------+-----------+
    | Subsystem                | fns | bytes | ~C lines | Goes to   |
    +==========================+=====+=======+==========+===========+
-   | IOCTL and CDO plumbing   |  15 |  3009 |      501 | wdm.c     |
-   | PnP and start/stop, rest |   9 |  1526 |      254 | wdm.c     |
-   | device naming            |   6 |  1808 |      301 | wdm.c     |
-   | power                    |   7 |  1225 |      204 | wdm.c     |
-   | kernel glue              |   4 |   401 |       66 | wdm.c     |
-   | USB port recovery        |   6 |   639 |      106 | wdm.c     |
-   | 64-bit division helpers  |   2 |   208 |       34 | not ported|
+   | IOCTL and CDO plumbing   |   5 |  2050 |      341 | wdm.c     |
+   | vendor transport, rest   |   5 |   640 |      106 | wdm.c     |
+   | control device object    |   6 |   609 |      101 | wdm.c     |
+   | power                    |   6 |   608 |      101 | wdm.c     |
+   | PnP and start/stop, rest |   5 |   592 |       98 | wdm.c     |
+   | notification queue IRPs  |   4 |   560 |       93 | wdm.c     |
+   | device naming, rest      |   3 |   420 |       70 | wdm.c     |
+   | kernel glue              |   3 |   384 |       64 | wdm.c     |
+   | USB port recovery, rest  |   2 |   223 |       37 | wdm.c     |
+   | 64-bit division helpers  |   2 |   208 |       34 | compiler  |
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  47 |  7750 |     1291 |           |
+   | TOTAL REMAINING          |  41 |  6294 |     1049 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of

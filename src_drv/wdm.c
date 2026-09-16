@@ -524,6 +524,25 @@ NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
 	return STATUS_SUCCESS;
 }
 
+/* STAGE FIVE: these need usbdi.h and a live bus. */
+NTSTATUS AdaptoidUsbGetPortStatus(PADAPTOID_DEVEXT DevExt, ULONG *Status)
+{
+	UNREFERENCED_PARAMETER(DevExt);
+	*Status = 0;
+	return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS AdaptoidUsbResetPort(PADAPTOID_DEVEXT DevExt)
+{
+	UNREFERENCED_PARAMETER(DevExt);
+	return STATUS_NOT_IMPLEMENTED;
+}
+
+void AdaptoidUsbCyclePort(PADAPTOID_DEVEXT DevExt)
+{
+	UNREFERENCED_PARAMETER(DevExt);
+}
+
 #endif /* !ADAPTOID_USERMODE */
 
 /* ------------------------------------------------------------------ */
@@ -929,8 +948,6 @@ NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
 	return STATUS_SUCCESS;
 }
 
-void AdaptoidSetDeviceName(PADAPTOID_DEVEXT DevExt)
-{ UNREFERENCED_PARAMETER(DevExt); }
 
 
 
@@ -1369,4 +1386,197 @@ void AdaptoidReportSink(void *ctx, u8 report_id, const u8 *data, u32 len)
 	}
 	DevExt->ReportCount++;
 	KeReleaseSpinLock(&DevExt->ReportLock, irql);
+}
+
+/* ------------------------------------------------------------------ */
+/* device naming                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Walk one hub looking for the adapter, and write the port path into Path.
+ *
+ * The path is built OUTERMOST FIRST - this hub's port digit, then whatever
+ * the recursion below found - which is the same order the original produces
+ * by prepending on the way back up, and the readable one: it reads from the
+ * controller inwards.
+ *
+ * Returns the number of digits written, or -1 if the device is not under
+ * this hub. A depth that would not fit is treated as not found rather than
+ * truncated, because half a path names the wrong port.
+ */
+static int FindOnHub(const ADAPTOID_TOPOLOGY *Topo, const WCHAR *HubName,
+                     USHORT UsbAddress, char *Path, ULONG PathBytes)
+{
+	ULONG ports = 0;
+	ULONG port;
+
+	if (PathBytes == 0) {
+		return -1;
+	}
+	if (!NT_SUCCESS(Topo->HubPorts(Topo->Context, HubName, &ports))) {
+		return -1;
+	}
+
+	for (port = 1; port <= ports; port++) {
+		ADAPTOID_PORT_INFO info;
+		int deeper;
+
+		info.Connected     = 0;
+		info.IsHub         = 0;
+		info.VendorId      = 0;
+		info.ProductId     = 0;
+		info.DeviceAddress = 0;
+		info.ChildHubName  = NULL;
+
+		if (!NT_SUCCESS(Topo->PortInfo(Topo->Context, HubName, port,
+		                               &info))) {
+			continue;
+		}
+		if (!info.Connected) {
+			continue;
+		}
+
+		if (!info.IsHub) {
+			/*
+			 * A leaf. It is us only if the vendor, product AND bus
+			 * address all match - the address is what distinguishes two
+			 * identical adapters, and without it both would be given the
+			 * same name.
+			 */
+			if (info.VendorId == ADAPTOID_VENDOR_ID &&
+			    info.ProductId == ADAPTOID_PRODUCT_ID &&
+			    info.DeviceAddress == UsbAddress) {
+				Path[0] = (char)('0' + (port % 10));
+				return 1;
+			}
+			continue;
+		}
+
+		if (info.ChildHubName == NULL) {
+			continue;
+		}
+		deeper = FindOnHub(Topo, info.ChildHubName, UsbAddress,
+		                   Path + 1, PathBytes - 1);
+		if (deeper >= 0) {
+			Path[0] = (char)('0' + (port % 10));
+			return deeper + 1;
+		}
+	}
+	return -1;
+}
+
+int AdaptoidBuildLocationName(const ADAPTOID_TOPOLOGY *Topo,
+                              USHORT UsbAddress, char *Name, ULONG NameBytes)
+{
+	ULONG index;
+
+	/* Every seam, not just the struct: an extension whose topology was
+	 * never installed must be unnameable, not fatal. */
+	if (Topo == NULL || Topo->RootHub == NULL || Topo->HubPorts == NULL ||
+	    Topo->PortInfo == NULL || Name == NULL || NameBytes < 2) {
+		return 0;
+	}
+	Name[0] = 0;
+
+	for (index = 0; index < ADAPTOID_MAX_CONTROLLERS; index++) {
+		const WCHAR *root = NULL;
+		int digits;
+
+		if (!NT_SUCCESS(Topo->RootHub(Topo->Context, index, &root)) ||
+		    root == NULL) {
+			continue;
+		}
+		/* One byte for the controller letter, one for the NUL. */
+		digits = FindOnHub(Topo, root, UsbAddress, Name + 1,
+		                   NameBytes - 2);
+		if (digits >= 0) {
+			Name[0] = (char)('A' + index);
+			Name[1 + digits] = 0;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Set this device's display name, or "?" if it could not be located.
+ *
+ * THE COPY IS BOUNDED. The original builds the name in pool and then writes
+ * it into a ten-byte field with a plain strcpy that has no length parameter
+ * at all - past that field sit the firmware value and then the LIST_ENTRY
+ * threading this device onto the driver-wide list. See known-defects.txt
+ * section 6. Here the name is built straight into the destination, with its
+ * size, so there is no second copy to get wrong.
+ */
+void AdaptoidSetDeviceName(PADAPTOID_DEVEXT DevExt)
+{
+	if (!AdaptoidBuildLocationName(&DevExt->Topology, DevExt->UsbAddress,
+	                               DevExt->Core.device_name,
+	                               CORE_DEVICE_NAME_BYTES)) {
+		DevExt->Core.device_name[0] = '?';
+		DevExt->Core.device_name[1] = 0;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* USB port recovery                                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Try to get the port back.
+ *
+ * A reset is worth attempting only when the device is STILL CONNECTED but
+ * the port has been DISABLED - that is a port the bus driver shut down under
+ * a device that is still there. Anything else, including the device having
+ * been unplugged, is past recovering, so the port is cycled to force a fresh
+ * enumeration and the caller is told not to retry.
+ */
+NTSTATUS AdaptoidRecoverPort(PADAPTOID_DEVEXT DevExt)
+{
+	ULONG status = 0;
+	NTSTATUS st;
+
+	st = AdaptoidUsbGetPortStatus(DevExt, &status);
+	if (NT_SUCCESS(st) &&
+	    (status & ADAPTOID_PORT_ENABLED) == 0 &&
+	    (status & ADAPTOID_PORT_CONNECTED) != 0) {
+		return AdaptoidUsbResetPort(DevExt);
+	}
+
+	AdaptoidUsbCyclePort(DevExt);
+	return ADAPTOID_STATUS_GAVE_UP;
+}
+
+/*
+ * The retry ladder, run on a work item because it blocks.
+ *
+ * Up to three recoveries; the first that succeeds restarts polling and the
+ * ladder stops. ADAPTOID_STATUS_GAVE_UP stops it too, WITHOUT cycling again,
+ * because the recovery already did.
+ *
+ * The remove lock this releases was taken by the completion that queued the
+ * work, so the device is pinned for the whole ladder and not merely while it
+ * was being queued.
+ */
+void AdaptoidPollRestartWorker(PADAPTOID_DEVEXT DevExt)
+{
+	NTSTATUS st = STATUS_SUCCESS;
+	int tries   = ADAPTOID_RECOVER_TRIES;
+	int pending = (DevExt->PollRestartPending != 0);
+
+	DevExt->PollRestartPending = 0;
+
+	while (pending && tries > 0 && st != ADAPTOID_STATUS_GAVE_UP) {
+		st = AdaptoidRecoverPort(DevExt);
+		if (NT_SUCCESS(st)) {
+			AdaptoidPollStart(DevExt, ADAPTOID_STOP_REASON_ERROR);
+			pending = 0;
+		}
+		tries--;
+	}
+
+	if (pending && st != ADAPTOID_STATUS_GAVE_UP) {
+		AdaptoidUsbCyclePort(DevExt);
+	}
+	AdaptoidLockRelease(&DevExt->RemoveLockB);
 }

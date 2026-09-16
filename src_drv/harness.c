@@ -5424,9 +5424,6 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
 { (void)DevExt; pnp_note("selectcfg"); return g_selectcfg_status; }
 
-void AdaptoidSetDeviceName(PADAPTOID_DEVEXT DevExt)
-{ (void)DevExt; pnp_note("name"); }
-
 void AdaptoidQuiesceIo(PADAPTOID_DEVEXT DevExt)
 { (void)DevExt; pnp_note("quiesce"); }
 
@@ -5871,6 +5868,29 @@ static int test_triage_pnp(void)
 	     groups);
 	return bad;
 }
+
+/* ---- the USB port recovery edge ------------------------------------ */
+
+static ULONG    g_port_status     = ADAPTOID_PORT_CONNECTED;
+static NTSTATUS g_port_status_ret = STATUS_SUCCESS;
+static NTSTATUS g_port_reset_ret  = STATUS_SUCCESS;
+static int      g_port_resets;
+static int      g_port_cycles;
+static int      g_port_queries;
+
+NTSTATUS AdaptoidUsbGetPortStatus(PADAPTOID_DEVEXT DevExt, ULONG *Status)
+{
+	(void)DevExt;
+	g_port_queries++;
+	*Status = g_port_status;
+	return g_port_status_ret;
+}
+
+NTSTATUS AdaptoidUsbResetPort(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; g_port_resets++; return g_port_reset_ret; }
+
+void AdaptoidUsbCyclePort(PADAPTOID_DEVEXT DevExt)
+{ (void)DevExt; g_port_cycles++; }
 
 /* ---- the OS edge of the poll loop and the read queue --------------- */
 
@@ -6355,6 +6375,425 @@ static int test_input_path(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* device naming and port recovery                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A made-up USB topology. Each node is a hub with up to four ports; a port
+ * either holds nothing, a leaf device, or another hub.
+ */
+#define TOPO_NODES 8
+#define TOPO_PORTS 4
+
+static struct {
+	int    used;
+	ULONG  ports;
+	struct {
+		int    connected;
+		int    child;       /* index of the child hub, or -1 for a leaf */
+		USHORT vid, pid, addr;
+	} port[TOPO_PORTS];
+} g_topo[TOPO_NODES];
+
+/* Hub names are just "0".."7", one WCHAR, indexing g_topo. */
+static WCHAR g_topo_name[TOPO_NODES][2];
+static int   g_topo_roots[ADAPTOID_MAX_CONTROLLERS];
+
+static void topo_reset(void)
+{
+	int i, p;
+
+	for (i = 0; i < TOPO_NODES; i++) {
+		g_topo[i].used  = 0;
+		g_topo[i].ports = 0;
+		g_topo_name[i][0] = (WCHAR)('0' + i);
+		g_topo_name[i][1] = 0;
+		for (p = 0; p < TOPO_PORTS; p++) {
+			g_topo[i].port[p].connected = 0;
+			g_topo[i].port[p].child     = -1;
+		}
+	}
+	for (i = 0; i < ADAPTOID_MAX_CONTROLLERS; i++) {
+		g_topo_roots[i] = -1;
+	}
+}
+
+static int topo_index(const WCHAR *name)
+{
+	int i;
+
+	for (i = 0; i < TOPO_NODES; i++) {
+		if (name == g_topo_name[i]) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static NTSTATUS topo_root(void *ctx, ULONG index, const WCHAR **name)
+{
+	(void)ctx;
+	if (index >= ADAPTOID_MAX_CONTROLLERS || g_topo_roots[index] < 0) {
+		return STATUS_NO_SUCH_DEVICE;
+	}
+	*name = g_topo_name[g_topo_roots[index]];
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS topo_ports(void *ctx, const WCHAR *name, ULONG *count)
+{
+	int i = topo_index(name);
+
+	(void)ctx;
+	if (i < 0 || !g_topo[i].used) {
+		return STATUS_NO_SUCH_DEVICE;
+	}
+	*count = g_topo[i].ports;
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS topo_info(void *ctx, const WCHAR *name, ULONG port,
+                          ADAPTOID_PORT_INFO *info)
+{
+	int i = topo_index(name);
+
+	(void)ctx;
+	if (i < 0 || port < 1 || port > TOPO_PORTS) {
+		return STATUS_NO_SUCH_DEVICE;
+	}
+	info->Connected     = g_topo[i].port[port - 1].connected;
+	info->IsHub         = g_topo[i].port[port - 1].child >= 0;
+	info->VendorId      = g_topo[i].port[port - 1].vid;
+	info->ProductId     = g_topo[i].port[port - 1].pid;
+	info->DeviceAddress = g_topo[i].port[port - 1].addr;
+	info->ChildHubName  = info->IsHub
+	                    ? g_topo_name[g_topo[i].port[port - 1].child]
+	                    : NULL;
+	return STATUS_SUCCESS;
+}
+
+static void topo_hub(int node, ULONG ports, int controller)
+{
+	g_topo[node].used  = 1;
+	g_topo[node].ports = ports;
+	if (controller >= 0) {
+		g_topo_roots[controller] = node;
+	}
+}
+
+static void topo_leaf(int node, int port, USHORT vid, USHORT pid, USHORT addr)
+{
+	g_topo[node].port[port - 1].connected = 1;
+	g_topo[node].port[port - 1].child     = -1;
+	g_topo[node].port[port - 1].vid       = vid;
+	g_topo[node].port[port - 1].pid       = pid;
+	g_topo[node].port[port - 1].addr      = addr;
+}
+
+static void topo_child(int node, int port, int child)
+{
+	g_topo[node].port[port - 1].connected = 1;
+	g_topo[node].port[port - 1].child     = child;
+}
+
+static int names_equal(const char *a, const char *b)
+{
+	while (*a != 0 && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+static int test_naming_recovery(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	static ADAPTOID_DEVEXT dx;
+	ADAPTOID_TOPOLOGY topo;
+	char name[CORE_DEVICE_NAME_BYTES];
+
+	topo.RootHub  = topo_root;
+	topo.HubPorts = topo_ports;
+	topo.PortInfo = topo_info;
+	topo.Context  = 0;
+
+	/* ---- 1. a device straight on a root hub ------------------------ */
+	{
+		topo_reset();
+		topo_hub(0, 4, 0);                      /* controller A */
+		topo_leaf(0, 2, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 7);
+
+		sched_expect(AdaptoidBuildLocationName(&topo, 7, name,
+		                                       sizeof(name)) == 1,
+		             "the device is found", 1, 1, &bad);
+		sched_expect(names_equal(name, "A2"), "controller A, port 2",
+		             name[1], '2', &bad);
+		groups++;
+	}
+
+	/* ---- 2. behind hubs, outermost port first ---------------------- */
+	{
+		topo_reset();
+		topo_hub(0, 4, 0);
+		topo_hub(1, 4, -1);
+		topo_hub(2, 4, -1);
+		topo_child(0, 3, 1);                    /* root port 3 -> hub 1 */
+		topo_child(1, 1, 2);                    /* hub 1 port 1 -> hub 2 */
+		topo_leaf(2, 4, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 9);
+
+		sched_expect(AdaptoidBuildLocationName(&topo, 9, name,
+		                                       sizeof(name)) == 1,
+		             "found three tiers down", 1, 1, &bad);
+		sched_expect(names_equal(name, "A314"),
+		             "the path reads outermost first", name[1], '3', &bad);
+		groups++;
+	}
+
+	/* ---- 3. the controller letter follows the index ---------------- */
+	{
+		topo_reset();
+		topo_hub(0, 2, 2);                      /* controller C */
+		topo_leaf(0, 1, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 3);
+
+		AdaptoidBuildLocationName(&topo, 3, name, sizeof(name));
+		sched_expect(names_equal(name, "C1"), "the third controller is C",
+		             name[0], 'C', &bad);
+		groups++;
+	}
+
+	/* ---- 4. THE ADDRESS is what tells two identical adapters apart -- */
+	{
+		topo_reset();
+		topo_hub(0, 4, 0);
+		/* two adapters, same vendor and product, different addresses */
+		topo_leaf(0, 1, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 11);
+		topo_leaf(0, 3, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 12);
+
+		AdaptoidBuildLocationName(&topo, 11, name, sizeof(name));
+		sched_expect(names_equal(name, "A1"), "the first is on port 1",
+		             name[1], '1', &bad);
+		AdaptoidBuildLocationName(&topo, 12, name, sizeof(name));
+		sched_expect(names_equal(name, "A3"),
+		             "and the second on port 3, not the first's port",
+		             name[1], '3', &bad);
+		groups++;
+	}
+
+	/* ---- 5. other devices are not us ------------------------------- */
+	{
+		topo_reset();
+		topo_hub(0, 4, 0);
+		topo_leaf(0, 1, 0x045E, 0x0040, 5);     /* somebody else's mouse */
+		topo_leaf(0, 2, ADAPTOID_VENDOR_ID, 0x0002, 6);  /* our VID, not
+		                                                  * our product */
+		topo_leaf(0, 3, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 99);
+
+		sched_expect(AdaptoidBuildLocationName(&topo, 7, name,
+		                                       sizeof(name)) == 0,
+		             "an address that is not there is not found", 0, 0,
+		             &bad);
+		sched_expect(AdaptoidBuildLocationName(&topo, 5, name,
+		                                       sizeof(name)) == 0,
+		             "nor is another vendor's device at that address", 0,
+		             0, &bad);
+		sched_expect(AdaptoidBuildLocationName(&topo, 6, name,
+		                                       sizeof(name)) == 0,
+		             "nor our vendor's other product", 0, 0, &bad);
+		sched_expect(AdaptoidBuildLocationName(&topo, 99, name,
+		                                       sizeof(name)) == 1,
+		             "but ours is", 1, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 6. a path too deep to name is not truncated ---------------- */
+	{
+		char small[4];       /* letter, one digit, NUL, and a spare */
+
+		topo_reset();
+		topo_hub(0, 4, 0);
+		topo_hub(1, 4, -1);
+		topo_hub(2, 4, -1);
+		topo_child(0, 1, 1);
+		topo_child(1, 2, 2);
+		topo_leaf(2, 3, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 4);
+
+		/* the full name is "A123", which does not fit in four bytes */
+		sched_expect(AdaptoidBuildLocationName(&topo, 4, small,
+		                                       sizeof(small)) == 0,
+		             "a name that does not fit is refused", 0, 0, &bad);
+		sched_expect(small[0] == 0, "and nothing is left behind",
+		             small[0], 0, &bad);
+
+		/* with room it names it */
+		sched_expect(AdaptoidBuildLocationName(&topo, 4, name,
+		                                       sizeof(name)) == 1,
+		             "and with room it succeeds", 1, 1, &bad);
+		sched_expect(names_equal(name, "A123"), "correctly", name[3], '3',
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 7. a missing controller is skipped ------------------------ */
+	{
+		topo_reset();
+		topo_hub(0, 2, 3);                      /* only controller D */
+		topo_leaf(0, 2, ADAPTOID_VENDOR_ID, ADAPTOID_PRODUCT_ID, 8);
+
+		sched_expect(AdaptoidBuildLocationName(&topo, 8, name,
+		                                       sizeof(name)) == 1,
+		             "controllers A to C are absent, D is searched", 1, 1,
+		             &bad);
+		sched_expect(names_equal(name, "D2"), "and names it", name[0], 'D',
+		             &bad);
+		groups++;
+	}
+
+	/* ---- 8. an uninstalled seam is unnameable, not fatal ----------- */
+	{
+		ADAPTOID_TOPOLOGY empty;
+
+		empty.RootHub  = 0;
+		empty.HubPorts = 0;
+		empty.PortInfo = 0;
+		empty.Context  = 0;
+		sched_expect(AdaptoidBuildLocationName(&empty, 1, name,
+		                                       sizeof(name)) == 0,
+		             "an empty topology names nothing", 0, 0, &bad);
+
+		wdm_reset(&dx);
+		AdaptoidSetDeviceName(&dx);
+		sched_expect(dx.Core.device_name[0] == '?',
+		             "and the device is called ?", dx.Core.device_name[0],
+		             '?', &bad);
+		groups++;
+	}
+
+	/* ---- 9. recovery resets only a disabled, connected port -------- */
+	{
+		wdm_reset(&dx);
+		g_port_resets = 0;
+		g_port_cycles = 0;
+
+		/* still connected, port disabled: worth a reset */
+		g_port_status     = ADAPTOID_PORT_CONNECTED;
+		g_port_status_ret = STATUS_SUCCESS;
+		g_port_reset_ret  = STATUS_SUCCESS;
+		sched_expect(AdaptoidRecoverPort(&dx) == STATUS_SUCCESS,
+		             "a disabled but connected port is reset", 1, 1, &bad);
+		sched_expect(g_port_resets == 1, "once", g_port_resets, 1, &bad);
+		sched_expect(g_port_cycles == 0, "without cycling", g_port_cycles,
+		             0, &bad);
+
+		/* unplugged: past recovering */
+		g_port_resets = 0;
+		g_port_status = 0;
+		sched_expect(AdaptoidRecoverPort(&dx) == ADAPTOID_STATUS_GAVE_UP,
+		             "a disconnected port gives up", 1, 1, &bad);
+		sched_expect(g_port_cycles == 1, "after cycling it", g_port_cycles,
+		             1, &bad);
+		sched_expect(g_port_resets == 0, "and never resetting",
+		             g_port_resets, 0, &bad);
+
+		/* still enabled: nothing to recover */
+		g_port_cycles = 0;
+		g_port_status = ADAPTOID_PORT_CONNECTED | ADAPTOID_PORT_ENABLED;
+		sched_expect(AdaptoidRecoverPort(&dx) == ADAPTOID_STATUS_GAVE_UP,
+		             "an enabled port gives up too", 1, 1, &bad);
+
+		/* the status query itself failing */
+		g_port_cycles = 0;
+		g_port_status_ret = STATUS_UNSUCCESSFUL;
+		sched_expect(AdaptoidRecoverPort(&dx) == ADAPTOID_STATUS_GAVE_UP,
+		             "and so does a failed query", 1, 1, &bad);
+		sched_expect(g_port_cycles == 1, "cycling once", g_port_cycles, 1,
+		             &bad);
+		g_port_status_ret = STATUS_SUCCESS;
+		groups++;
+	}
+
+	/* ---- 10. the retry ladder -------------------------------------- */
+	{
+		/* recovers first time */
+		wdm_reset(&dx);
+		AdaptoidLockAcquire(&dx.RemoveLockB);   /* as the completion does */
+		g_port_resets = 0;
+		g_port_cycles = 0;
+		g_poll_submits = 0;
+		dx.PollRestartPending = 1;
+		dx.PollStopMask       = ADAPTOID_STOP_REASON_ERROR;
+		g_port_status = ADAPTOID_PORT_CONNECTED;
+
+		AdaptoidPollRestartWorker(&dx);
+		sched_expect(g_port_resets == 1, "one recovery was enough",
+		             g_port_resets, 1, &bad);
+		sched_expect(g_poll_submits == 2, "and polling restarted",
+		             g_poll_submits, 2, &bad);
+		sched_expect(g_port_cycles == 0, "with no cycle", g_port_cycles, 0,
+		             &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "and the remove lock was released",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+
+		/* three failures then a cycle */
+		wdm_reset(&dx);
+		AdaptoidLockAcquire(&dx.RemoveLockB);
+		g_port_resets = 0;
+		g_port_cycles = 0;
+		g_poll_submits = 0;
+		dx.PollRestartPending = 1;
+		dx.PollStopMask       = ADAPTOID_STOP_REASON_ERROR;
+		g_port_status    = ADAPTOID_PORT_CONNECTED;
+		g_port_reset_ret = STATUS_UNSUCCESSFUL;
+
+		AdaptoidPollRestartWorker(&dx);
+		sched_expect(g_port_resets == ADAPTOID_RECOVER_TRIES,
+		             "it tries three times", g_port_resets,
+		             ADAPTOID_RECOVER_TRIES, &bad);
+		sched_expect(g_port_cycles == 1, "then cycles the port once",
+		             g_port_cycles, 1, &bad);
+		sched_expect(g_poll_submits == 0, "and does not restart polling",
+		             g_poll_submits, 0, &bad);
+		g_port_reset_ret = STATUS_SUCCESS;
+
+		/* a recovery that already cycled stops the ladder AT ONCE */
+		wdm_reset(&dx);
+		AdaptoidLockAcquire(&dx.RemoveLockB);
+		g_port_resets = 0;
+		g_port_cycles = 0;
+		dx.PollRestartPending = 1;
+		g_port_status = 0;                      /* disconnected */
+
+		AdaptoidPollRestartWorker(&dx);
+		sched_expect(g_port_cycles == 1,
+		             "the give-up sentinel stops after ONE cycle",
+		             g_port_cycles, 1, &bad);
+		sched_expect(g_port_resets == 0, "with no resets attempted",
+		             g_port_resets, 0, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1, "lock still released",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+
+		/* nothing pending: the worker does nothing but release */
+		wdm_reset(&dx);
+		AdaptoidLockAcquire(&dx.RemoveLockB);
+		g_port_cycles = 0;
+		g_port_resets = 0;
+		dx.PollRestartPending = 0;
+		AdaptoidPollRestartWorker(&dx);
+		sched_expect(g_port_resets == 0 && g_port_cycles == 0,
+		             "a worker with nothing to do does nothing",
+		             g_port_resets + g_port_cycles, 0, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1, "but still releases",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		groups++;
+	}
+
+	hlog("Naming and recovery    : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -6438,6 +6877,7 @@ int main(int argc, char **argv)
 	bad += test_wdm_transport();
 	bad += test_triage_pnp();
 	bad += test_input_path();
+	bad += test_naming_recovery();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

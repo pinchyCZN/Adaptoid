@@ -318,6 +318,13 @@ Table of Contents
    hundred bytes against a 0x200 field. The location name is a controller
    letter followed by a short hub path, well inside ten characters.
 
+   THE LOCATION NAME'S LENGTH IS ONE CHARACTER PER HUB TIER, established
+   since: drv_FindDeviceOnHub prepends a port digit at every level of the
+   recursion and drv_BuildDeviceLocationName prepends the controller letter,
+   so the name is bounded by hub depth and nothing else. USB permits five
+   tiers, which gives at most six characters plus a terminator - inside the
+   ten-byte field, but by a margin the code neither knows nor checks.
+
    One accident limits the second: drv_SetDeviceNameAndSort reads
    FirmwareRevision BEFORE it writes the name, so the value it goes on to use
    cannot be corrupted by its own copy.

@@ -249,6 +249,118 @@ PIRP AdaptoidDequeueRead(struct _ADAPTOID_DEVEXT *DevExt);
 void AdaptoidCancelPendingReads(struct _ADAPTOID_DEVEXT *DevExt);
 NTSTATUS AdaptoidReadReport(struct _ADAPTOID_DEVEXT *DevExt, PIRP Irp);
 
+/* ======================================================================
+ * DEVICE NAMING
+ *
+ * The display string IOCTL function 0x835 returns, and the key the
+ * driver-wide device list is sorted by. It is a USB TOPOLOGY PATH: a
+ * controller letter followed by one digit per hub tier.
+ *
+ *     A21     controller A, port 2 of the root hub, port 1 of the hub there
+ *
+ * HOW THE DRIVER FINDS ITSELF is the interesting part. It cannot ask the bus
+ * driver "which port am I on"; instead it asks the ADAPTER, with vendor
+ * request 0x75, for its own USB bus address, and then walks every host
+ * controller and every hub looking for the port whose DeviceAddress matches.
+ * The device tells you who it is and you go and find it.
+ *
+ * THE FIELD THAT HOLDS THAT ADDRESS WAS CALLED FirmwareRevision. It is not
+ * one: drv_QueryFirmwareInfo stores the first byte of vendor request 0x75,
+ * and drv_FindDeviceOnHub compares it against DeviceAddress at offset 25 of
+ * the packed 0x23-byte USB_NODE_CONNECTION_INFORMATION. The firmware
+ * revision the configurator displays is a different thing entirely -
+ * bcdDevice, read out of the device descriptor by IOCTL 0x836 selector 1.
+ * ====================================================================== */
+
+#define ADAPTOID_VENDOR_ID      0x06F7u
+#define ADAPTOID_PRODUCT_ID     0x0001u
+
+/* Host controllers are searched as \\DosDevices\\HCD0 .. HCD5, and the
+ * controller's letter is 'A' plus its index. */
+#define ADAPTOID_MAX_CONTROLLERS 6
+
+/* One port of one hub, as the topology seam reports it. */
+typedef struct _ADAPTOID_PORT_INFO {
+	int    Connected;
+	int    IsHub;
+	USHORT VendorId;
+	USHORT ProductId;
+	USHORT DeviceAddress;
+	/* Valid only when IsHub; the name to recurse into. */
+	const WCHAR *ChildHubName;
+} ADAPTOID_PORT_INFO;
+
+/*
+ * THE TOPOLOGY SEAM. Walking hubs is four USB IOCTLs and a pile of
+ * marshalling; deciding what the walk MEANS is a dozen lines of recursion.
+ * Splitting them is what lets the naming be tested against a made-up
+ * topology instead of a real one.
+ *
+ * PortCount is the number of ports on that hub; ports are numbered from 1.
+ */
+typedef NTSTATUS (*ADAPTOID_HUB_PORTS_FN)(void *ctx, const WCHAR *HubName,
+                                          ULONG *PortCount);
+typedef NTSTATUS (*ADAPTOID_PORT_INFO_FN)(void *ctx, const WCHAR *HubName,
+                                          ULONG Port,
+                                          ADAPTOID_PORT_INFO *Info);
+/* The root hub of controller Index, or failure if there is none. */
+typedef NTSTATUS (*ADAPTOID_ROOT_HUB_FN)(void *ctx, ULONG Index,
+                                         const WCHAR **HubName);
+
+typedef struct _ADAPTOID_TOPOLOGY {
+	ADAPTOID_ROOT_HUB_FN  RootHub;
+	ADAPTOID_HUB_PORTS_FN HubPorts;
+	ADAPTOID_PORT_INFO_FN PortInfo;
+	void                 *Context;
+} ADAPTOID_TOPOLOGY;
+
+/*
+ * Build the location name for the device at UsbAddress into Name.
+ *
+ * NameBytes BOUNDS THE WRITE, which the original does not do anywhere on
+ * this path: it builds the name with pool allocations and then copies it
+ * into a ten-byte field with a plain strcpy. See known-defects.txt section 6.
+ *
+ * Returns non-zero if the device was found and named.
+ */
+int AdaptoidBuildLocationName(const ADAPTOID_TOPOLOGY *Topo,
+                              USHORT UsbAddress, char *Name,
+                              ULONG NameBytes);
+
+/* ======================================================================
+ * USB PORT RECOVERY
+ *
+ * What happens when a read fails. A ladder, not a loop: try to recover the
+ * port up to three times, and if that does not work, cycle it and let the
+ * device re-enumerate.
+ * ====================================================================== */
+
+/* Port status bits, as the bus driver reports them. */
+#define ADAPTOID_PORT_ENABLED   0x1u
+#define ADAPTOID_PORT_CONNECTED 0x2u
+
+/*
+ * The sentinel drv_RecoverPort returns when it has ALREADY cycled the port
+ * itself. It is not a normal error: the retry loop tests for it specifically
+ * and stops, because retrying would cycle the port again and again.
+ *
+ * An earlier note recorded this value as unexplained. It is simply
+ * drv_RecoverPort saying "I have already given up on your behalf".
+ */
+#define ADAPTOID_STATUS_GAVE_UP ((NTSTATUS)0xC0012345L)
+
+/* How many times the worker tries before cycling the port. */
+#define ADAPTOID_RECOVER_TRIES  3
+
+NTSTATUS AdaptoidRecoverPort(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidPollRestartWorker(struct _ADAPTOID_DEVEXT *DevExt);
+
+/* The OS edge of recovery. */
+NTSTATUS AdaptoidUsbGetPortStatus(struct _ADAPTOID_DEVEXT *DevExt,
+                                  ULONG *Status);
+NTSTATUS AdaptoidUsbResetPort(struct _ADAPTOID_DEVEXT *DevExt);
+void     AdaptoidUsbCyclePort(struct _ADAPTOID_DEVEXT *DevExt);
+
 typedef struct _ADAPTOID_DEVEXT {
 	PDEVICE_OBJECT  Self;
 	PDEVICE_OBJECT  NextDeviceObject;
@@ -292,6 +404,18 @@ typedef struct _ADAPTOID_DEVEXT {
 
 	LIST_ENTRY           PendingReads;
 	LONG                 PendingReadCount;
+
+	/*
+	 * The device's own USB bus address, from vendor request 0x75. Named
+	 * FirmwareRevision in the original, which it is not - see the note
+	 * above DEVICE NAMING. It is what locates this adapter in the hub
+	 * topology.
+	 */
+	USHORT               UsbAddress;
+
+	/* How to walk the hubs. Filled at AddDevice; a seam so that naming
+	 * can be tested against a topology that does not exist. */
+	ADAPTOID_TOPOLOGY    Topology;
 } ADAPTOID_DEVEXT, *PADAPTOID_DEVEXT;
 
 /*

@@ -126,6 +126,7 @@ main	harness.c	new	-	-	-
 n64_reset_log	harness.c	new	-	-	-
 n64_set_reply	harness.c	new	-	-	-
 n64_sync	harness.c	new	-	-	-
+names_equal	harness.c	new	-	-	-
 nat_prog	harness.c	new	-	-	-
 nat_run	harness.c	new	-	-	-
 pak_arm	harness.c	new	-	-	-
@@ -156,6 +157,7 @@ test_input_path	harness.c	new	-	-	-
 test_ioctl	harness.c	new	-	-	-
 test_joystick_report	harness.c	new	-	-	-
 test_n64_transaction	harness.c	new	-	-	-
+test_naming_recovery	harness.c	new	-	-	-
 test_natives	harness.c	new	-	-	-
 test_pak_change	harness.c	new	-	-	-
 test_pak_crcs	harness.c	new	-	-	-
@@ -164,6 +166,14 @@ test_script	harness.c	new	-	-	-
 test_triage_pnp	harness.c	new	-	-	-
 test_tune_mode	harness.c	new	-	-	-
 test_wdm_transport	harness.c	new	-	-	-
+topo_child	harness.c	new	-	-	-
+topo_hub	harness.c	new	-	-	-
+topo_index	harness.c	new	-	-	-
+topo_info	harness.c	new	-	-	-
+topo_leaf	harness.c	new	-	-	-
+topo_ports	harness.c	new	-	-	-
+topo_reset	harness.c	new	-	-	-
+topo_root	harness.c	new	-	-	-
 triage_irp	harness.c	new	-	-	-
 triage_setup	harness.c	new	-	-	-
 usage	harness.c	new	-	-	-
@@ -247,6 +257,7 @@ core_script_set_native	script.c	new	-	-	-
 core_script_var_index	script.c	port	wishk201.sys	00018640	drv_ScriptCheckVarIndex
 AdaptoidAbortPipes	wdm.c	port	wishk201.sys	00016890	drv_AbortPipes
 AdaptoidAddDevice	wdm.c	port	wishk201.sys	0001236e	drv_AddDevice
+AdaptoidBuildLocationName	wdm.c	port	wishk201.sys	00011f5e	drv_BuildDeviceLocationName
 AdaptoidCancelIrp	wdm.c	new	-	-	-
 AdaptoidCancelPendingReads	wdm.c	port	wishk201.sys	00014d90	drv_CancelPendingReads
 AdaptoidChannelClose	wdm.c	port	wishk201.sys	000126f0	drv_HidChannelClose
@@ -279,6 +290,7 @@ AdaptoidLockReleaseAndWait	wdm.c	port	wishk201.sys	000159a0	drv_LockReleaseAndWa
 AdaptoidPnp	wdm.c	port	wishk201.sys	0001619f	drv_DispatchPnp
 AdaptoidPnpTriage	wdm.c	port	wishk201.sys	00011b10	drv_PnpTriage
 AdaptoidPollComplete	wdm.c	port	wishk201.sys	00016c47	drv_PollComplete
+AdaptoidPollRestartWorker	wdm.c	port	wishk201.sys	00016da7	drv_PollRestartWorker
 AdaptoidPollStart	wdm.c	port	wishk201.sys	00016a70	drv_PollStart
 AdaptoidPollStop	wdm.c	port	wishk201.sys	00016b00	drv_PollStop
 AdaptoidPollSubmit	wdm.c	port	wishk201.sys	00016940	drv_PollSubmit
@@ -289,6 +301,7 @@ AdaptoidQueueRead	wdm.c	part	wishk201.sys	00015020	drv_HidReadReport
 AdaptoidQuiesceIo	wdm.c	port	wishk201.sys	000167a0	drv_QuiesceIo
 AdaptoidRead	wdm.c	port	wishk201.sys	000119a0	drv_ReadTriage
 AdaptoidReadReport	wdm.c	port	wishk201.sys	00015020	drv_HidReadReport
+AdaptoidRecoverPort	wdm.c	port	wishk201.sys	00015f50	drv_RecoverPort
 AdaptoidRegistryRemove	wdm.c	port	wishk201.sys	00019160	drv_DisableDeviceInterface
 AdaptoidReportSink	wdm.c	part	wishk201.sys	00014de8	drv_SubmitHidReport
 AdaptoidRouteOf	wdm.c	part	wishk201.sys	000117f0	drv_CreateTriage
@@ -299,6 +312,9 @@ AdaptoidStartDevice	wdm.c	port	wishk201.sys	00016550	drv_StartDevice
 AdaptoidStartNextPowerIrp	wdm.c	new	-	-	-
 AdaptoidUnconfigureDevice	wdm.c	port	wishk201.sys	000167c0	drv_UnconfigureDevice
 AdaptoidUnload	wdm.c	port	wishk201.sys	000117e0	drv_Unload
+AdaptoidUsbCyclePort	wdm.c	port	wishk201.sys	00016080	drv_UsbCyclePort
+AdaptoidUsbGetPortStatus	wdm.c	port	wishk201.sys	00015f90	drv_UsbGetPortStatus
+AdaptoidUsbResetPort	wdm.c	port	wishk201.sys	00016010	drv_UsbResetPort
 AdaptoidVendorClaimForIrp	wdm.c	port	wishk201.sys	00019960	drv_ClaimVendorSlotForIrp
 AdaptoidVendorComplete	wdm.c	port	wishk201.sys	00019747	drv_VendorUrbComplete
 AdaptoidVendorSend	wdm.c	port	wishk201.sys	000193df	drv_SendVendorRequest
@@ -306,6 +322,7 @@ AdaptoidVendorSubmitUrb	wdm.c	port	wishk201.sys	00019527	drv_SubmitVendorUrb
 AdaptoidVendorTryClaim	wdm.c	port	wishk201.sys	00019670	drv_TryClaimVendorSlot
 AdaptoidWrite	wdm.c	port	wishk201.sys	00011a10	drv_WriteTriage
 DriverEntry	wdm.c	port	wishk201.sys	000115f0	drv_DriverEntry
+FindOnHub	wdm.c	port	wishk201.sys	000120ea	drv_FindDeviceOnHub
 PassDown	wdm.c	part	wishk201.sys	0001619f	drv_DispatchPnp
 PassDownAndWait	wdm.c	part	wishk201.sys	0001619f	drv_DispatchPnp
 ToHidclass	wdm.c	part	wishk201.sys	000117f0	drv_CreateTriage
