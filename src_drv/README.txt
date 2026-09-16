@@ -28,7 +28,7 @@ Table of Contents
    4.  Why The Driver Uses The WDK 7.1 Toolchain
    5.  Settings That Are Not Obvious
    6.  The File Plan
-   6.1.  What Is Left
+   6.1.  State
    6.2.  Specifications For What Remains
    7.  Installing It
    7.1.  Signing
@@ -257,11 +257,12 @@ Table of Contents
    specified in one document, ../docs/ioctl-surface.txt. One surface, one
    document, one file.
 
-   IT ALSO TURNED OUT TO BE OS-FREE, which the plan did not assume. Every
-   case on both surfaces is a length check and a small action on device
-   state; an IRP is decoded into a core_ioctl by the caller and what comes
-   back is a status and a byte count. Only four things needed seams: the raw
-   vendor passthrough, the enable toggle, and the claim and deliver steps of
+   THE WHOLE SURFACE IS OS-FREE, which is not obvious from the original's
+   dispatcher. Every case on both surfaces is a length check and a small
+   action on device state; an IRP is decoded into a core_ioctl by the
+   caller and what comes back is a status and a byte count. Only four things
+   need seams: the raw vendor passthrough, the enable toggle, and the claim
+   and deliver steps of
    the notification queue - the last two because whether a parked request is
    still ours is a cancellation question and therefore the OS's to answer.
    That is why the whole surface, including its four defects, is exercised
@@ -274,479 +275,77 @@ Table of Contents
    other device-object work. The registry those handles name is here; the
    objects they name are there.
 
-6.1.  What Is Left
+6.1.  State
 
-   Measured against the Ghidra database: 142 of the 147 functions in
-   wishk201.sys have a counterpart, and the five that do not are accounted
-   for in origin.txt section 3 - a release with nothing to release, two
-   string helpers the naming no longer needs, and two compiler intrinsics.
+   142 of the 147 functions in wishk201.sys have a counterpart here. The
+   five that do not are accounted for in origin.txt section 3: a release
+   with nothing to release, two string helpers the naming does not need, and
+   two compiler intrinsics.
 
-   The count is 147 rather than 146 because stage five recovered one more
-   function from a code gap: drv_VendorRequestCompleteKeepSlot at 00018d10,
-   reached only through a stored address and so never disassembled.
+   THE COUNT IS 147, NOT 146. drv_VendorRequestCompleteKeepSlot at 00018d10
+   is reached only through a stored address and never by a CALL, so nothing
+   leads a disassembler to it - it sits in what looks like padding between
+   two other functions. Expect a function count from Ghidra to be one short
+   until that one is created by hand.
 
-   THE COUNT NOW INCLUDES NAMED-BUT-EMPTY FUNCTIONS. Stage two declared and
-   shaped the whole of wdm.c's remaining surface so that the dispatchers
-   above it compile and can be tested; roughly twenty of those bodies are
-   still stubs. The origin map records them like any other row, because the
-   correspondence to the original is what the map is for and it is already
-   decided. Judge completeness by the test groups, not by this percentage.
+   +--------------------------+---------------------------------------+
+   | Subsystem                | Where it lives, how far it is trusted |
+   +==========================+=======================================+
+   | packet decode, reports   | core.c, test groups                   |
+   | accessory probe          | core.c, test groups                   |
+   | Controller Pak CRCs      | core.c, test vectors                  |
+   | effect engine and ring   | core.c, test groups                   |
+   | raw N64 transaction      | core.c, test groups                   |
+   | keyboard and mouse       | core.c, test groups                   |
+   | HID report descriptors   | core.c, byte-compared to the original |
+   | script interpreter       | script.c, test programs               |
+   | scheduler and builtins   | sched.c, test groups                  |
+   | private IOCTL surface    | ioctl.c, test groups                  |
+   | control device surface   | ioctl.c, test groups                  |
+   | SDK command block        | ioctl.c, test groups                  |
+   | HID minidriver contract  | ioctl.c + wdm.c, test groups          |
+   | remove lock, transport   | wdm.c, test groups                    |
+   | dispatch triage and PnP  | wdm.c, test groups                    |
+   | input path and queues    | wdm.c, test groups                    |
+   | device naming, recovery  | wdm.c, test groups                    |
+   | power                    | wdm.c, test groups                    |
+   | control device object    | wdm.c, test groups                    |
+   | subsystem wiring         | wdm.c + core.c, test groups           |
+   | THE USB LAYER            | wdm.c, COMPILES - NOTHING MORE        |
+   | 64-bit division helpers  | not ported; the toolchain supplies it |
+   +--------------------------+---------------------------------------+
 
-   wdm.c IS BEING PORTED IN STAGES, because it is the OS-facing half and
-   most of it cannot be exercised the way the rest was.
+   TWO THINGS ARE NOT SETTLED BY ANY AMOUNT OF PORTING, and both are worth
+   knowing before trusting a build.
 
-   Stage one was the remove lock and the vendor transport - the foundation
-   the other subsystems sit on, and the piece that turns core.c's transport
-   seams into something real.
-
-   Stage two was the dispatch triage and PnP: the wrapper layer that lets
-   one driver object serve three kinds of client, and the PnP dispatcher
-   with its bring-up and tear-down ordering. Both are testable, and both
-   are tested.
-
-   Stage three was THE INPUT PATH, end to end: the double-buffered polling
-   engine, the report queue and the reads waiting on it. That is the
-   driver's actual job - a packet goes from a completed URB through
-   core_on_raw_packet and out of a completed HID read - and all of it is
-   testable, so all of it is tested.
-
-   Stage four was DEVICE NAMING and USB PORT RECOVERY. Naming is the hub
-   walk that gives a device its display string, and it is where the
-   unbounded string copy of known-defects.txt section 6 lives; recovery is
-   the retry ladder a failed read falls into. Both are testable - the hub
-   walk against a made-up topology, the ladder against a scripted port - and
-   both are tested.
-
-   Stage five was the last, and had four parts.
-
-   THE SDK COMMAND-BLOCK CHANNEL turned out to belong in ioctl.c, not
-   wdm.c: walking a 64-byte block of joybus commands, deciding which the
-   driver answers from its own cache and which go on the wire, and
-   emulating a Rumble Pak at two addresses is all OS-free logic over a byte
-   buffer. Only the transport is a seam. It is specified in
-   ../docs/command-block.txt and has thirteen test groups.
-
-   POWER is the driver acting as its own policy owner - mapping system
-   states to device states out of DEVICE_CAPABILITIES, parking a system IRP
-   while it asks for the device IRP that mapping calls for, and supporting
-   remote wake. Testable, and tested.
-
-   THE CONTROL DEVICE OBJECT and its notification IRPs: the singleton's two
-   reference counts, its four dispatch entry points, and the cancel-safe
-   waiter queue. Testable, and tested.
-
-   THE HID MINIDRIVER CONTRACT was found afterwards, while answering a
-   question about the two functions still carrying TODO comments. One of
-   them, AdaptoidUnload, was correct as it stood - drv_Unload is a single
-   RET and there is nothing to tear down. The other,
-   AdaptoidIntDeviceControl, was the single most load-bearing stub in the
-   tree: it is what hidclass.sys calls, and without an answer to
-   GET_REPORT_DESCRIPTOR no keyboard, mouse or game controller is ever
-   created and the driver does nothing at all. It and the three report
-   descriptors are now in core.c and ioctl.c, with nine test groups - the
-   first of which checks the assembled descriptor against the original's
-   185 bytes.
-
-   THE WIRING came last, and was the largest single gap in the tree. Every
-   subsystem had been ported and unit-tested on its own, and almost none of
-   them were joined up: AddDevice was never installed into the driver
-   extension, so nothing ever enumerated; core_tick stored the clock and did
-   nothing with it, so the effect ring and the script scheduler never ran; a
-   script's _key event reached no state machine; and the accessory probe
-   stalled after its first transfer because no completion was routed back.
-
-   A sweep for functions that nothing in the driver sources referenced found
-   twenty-nine of them. Unit tests could not have caught this - every part
-   passed on its own - so there is now a test group for the JOINS, and six
-   deliberate breaks against it.
-
-   THE USB LAYER is the one part that is not. Descriptor fetch, select
+   THE USB LAYER HAS NEVER TALKED TO A DEVICE. Descriptor fetch, select
    configuration, the two asynchronous transfer types, abort and the port
-   IOCTLs are all URB marshalling against a bus that does not exist in the
-   harness, so they are written against ../docs/usb-transport.txt and
-   verified only by compiling in all four configurations. Building the
-   driver for real is what found four DDK divergences the harness could not
-   - POWER_STATE is a union and not a ULONG among them.
+   IOCTLs are URB marshalling against a bus the harness does not have. They
+   are written from ../docs/usb-transport.txt and checked only by compiling.
+   Every other subsystem here was checked against hand-built vectors. Treat
+   this one as the least trustworthy code in the tree.
+
+   NOTHING HAS BEEN LOADED. The four clean builds say the code compiles and
+   links as a kernel driver. They say nothing about whether it runs. See
+   section 7.
+
+   TWO TRAPS IN HOW THIS TREE IS VERIFIED, both of which have already caught
+   real defects and will again:
+
+   -  A GREEN HARNESS IS NOT A WORKING DRIVER. Every subsystem can pass its
+      own tests while none of them are connected to each other - no
+      AddDevice installed, no clock driving the engines, script events
+      reaching nothing. Unit tests cannot see it, because each part is
+      correct. The wiring test group exists for exactly this and should be
+      extended whenever a new seam is added.
+
+   -  BUILD ALL FOUR CONFIGURATIONS, not just the harness. The harness uses
+      kstub.h, and a type that is wrong there compiles cleanly and then
+      fails against the real DDK - or worse, differs silently. POWER_STATE
+      is a union and not a ULONG; KeSetTimer takes a LARGE_INTEGER by value;
+      GET_SELECT_CONFIGURATION_REQUEST_SIZE(0, 0) underflows. None of those
+      is visible from Win32 Debug alone.
 
-   EVERY SUBSYSTEM OF THE ORIGINAL NOW HAS AN IMPLEMENTATION. What is left
-   is not a list of functions; it is the two things no amount of porting
-   settles.
-
-   FIRST, THE USB LAYER HAS NEVER TALKED TO A DEVICE. It compiles in all
-   four configurations and it is written from a specification, but every
-   other subsystem here was checked against hand-built vectors and this one
-   cannot be. Treat it as the least trustworthy code in the tree.
-
-   SECOND, NOTHING HAS BEEN LOADED. The driver is unsigned, there is no
-   test VM, and that is separate work - see section 6.2.
-
-   +--------------------------+-----+---------------------------------+
-   | Stage five covered       | fns | Where it went                   |
-   +==========================+=====+=================================+
-   | SDK command block        |   3 | ioctl.c, 496 lines, 13 groups   |
-   | power                    |   8 | wdm.c, tested                   |
-   | control device object    |   9 | wdm.c, tested                   |
-   | notification queue IRPs  |   5 | wdm.c, tested                   |
-   | the device enable        |   3 | wdm.c, tested                   |
-   | the scheduler DPC        |   1 | wdm.c                           |
-   | the USB layer            |  13 | wdm.c, COMPILED ONLY            |
-   | HID minidriver contract  |   3 | core.c + ioctl.c, 9 groups      |
-   | the wiring               |  18 | wdm.c + core.c, 8 groups        |
-   | registry and interface   |   3 | wdm.c, driver build only        |
-   +--------------------------+-----+---------------------------------+
-
-   The two 64-bit division helpers, __aulldiv and __alldiv, are compiler
-   runtime rather than driver code and come from the toolchain.
-
-6.2.  Specifications For What Remains
-
-1.  Layout
-
-   +-----------------+---------------------------------------------------+
-   | File            | Contents                                          |
-   +=================+===================================================+
-   | adaptoid.sln    | Both projects, four configurations                |
-   | common.props    | WdkRoot, output layout, shared C settings         |
-   | driver.vcxproj  | the sources below         -> wishk300.sys         |
-   | harness.vcxproj | the same, plus harness.c  -> wishk300.exe         |
-   | core.h core.c   | OS-free logic. No Windows types at all.           |
-   | script.h .c     | The bytecode interpreter and its builtins         |
-   | sched.h .c      | Script threads, the scheduler, input binding      |
-   | ioctl.h .c      | The private IOCTL surface and control device      |
-   | wdm.h wdm.c     | DriverEntry, AddDevice, PnP, power, URBs          |
-   | kstub.h         | Fake kernel ABI for user-mode builds              |
-   | harness.c       | main() plus the kernel stub implementations       |
-   | origin.tsv      | Where each function came from in Ghidra           |
-   | origin.txt      | What the rows in origin.tsv mean                  |
-   | build/          | All output. Not tracked.                          |
-   +-----------------+---------------------------------------------------+
-
-   THE RULE THAT MATTERS: core.c and core.h must never include a Windows or
-   DDK header, call a kernel API, or name a Windows type. Everything they
-   need from outside arrives through the two seams in section 3.
-
-   That rule is load-bearing rather than stylistic. Measured against the 2001
-   driver, the script, report, effect and CRC code reaches only 18 of that
-   driver's 49 kernel imports, and all 18 reduce to those two seams. Holding
-   the line is what lets the interesting code be tested without a VM.
-
-1.1.  Where Each Function Came From
-
-   origin.tsv maps every function here to the address and name of the original
-   it derives from, because the names have already diverged and no rule
-   recovers that - core_pak_addr_crc5 was drv_N64PakAddrCrc5. Add a row in the
-   same change that adds a function.
-
-       python tools/originmap.py --check    report drift, exit 1 if any
-       python tools/originmap.py --fix      sort and normalise
-
-   origin.txt section 3 explains the entries that are not one to one.
-
-2.  Building
-
-   From a plain shell, no Visual Studio environment needed:
-
-       msbuild src_drv\adaptoid.sln /p:Configuration=Debug /p:Platform=Win32
-
-   Platforms are Win32 and x64; configurations are Debug and Release. All
-   four combinations build clean. Output goes to
-
-       build\<Platform>\<Configuration>\wishk300.sys
-       build\<Platform>\<Configuration>\wishk300.exe
-
-   with intermediates under build\obj\<Project>\<Platform>\<Configuration>\.
-
-   The driver needs WDK 7.1 at the path in WdkRoot, which defaults to
-   E:\DEV\WinDDK. Override it with /p:WdkRoot=... or the WDK71_ROOT
-   environment variable. A wrong path fails once with a clear message rather
-   than a thousand missing-header errors.
-
-   The harness needs nothing beyond Visual Studio 2017 and the Windows SDK.
-   Run it directly; it exits non-zero on failure, so it is usable from a
-   script.
-
-3.  The Core Seam
-
-   core.c receives input and emits output through function pointers:
-
-       typedef void (*core_report_fn)(void *ctx, u8 report_id,
-                                      const u8 *data, u32 len);
-
-       void core_init(core_state *cs, core_report_fn sink, void *sink_ctx);
-       void core_on_raw_packet(core_state *cs, const u8 *raw);
-       void core_tick(core_state *cs, u64 now_100ns);
-
-   core_report_fn is the seam the 2001 driver calls drv_SubmitHidReport. In
-   the driver it completes a pending HID read IRP; in the harness it prints.
-   Cutting here is what removes IoAllocateIrp, IoFreeIrp, IofCallDriver and
-   IofCompleteRequest from the dependency closure of the logic.
-
-   now_100ns replaces KeQueryInterruptTime and is the single most valuable
-   stub in the tree. The harness advances it by hand, which makes the script
-   scheduler, the effect ring and the keep-alive deterministic and steppable.
-   A VM cannot offer that.
-
-4.  Why The Driver Uses The WDK 7.1 Toolchain
-
-   No WDK is installed on this machine. Windows Kits 10 is present but is
-   SDK-only: it has um and ucrt headers, no km headers, no kernel libraries,
-   and no WindowsDriver targets. The Visual Studio Driver project type is
-   therefore unavailable.
-
-   WDK 7.1.0 at E:\DEV\WinDDK does ship a complete kernel toolchain,
-   including its own compiler and linker:
-
-       bin\x86\x86\cl.exe       15.00.30729.207   (x86)
-       bin\x86\amd64\cl.exe     15.00.30729.207   (x64)
-       matching link.exe        9.00.30729.207
-
-   That is the Visual Studio 2008 SP1 toolchain those headers were written
-   and tested against. So rather than pairing 2009 headers with the 2018
-   compiler - which fails on at least one count, since cl 19 emits calls to
-   __report_rangecheckfailure and that symbol does not exist in the 2009
-   kernel libraries - driver.vcxproj keeps the v141 project system for build
-   plumbing and redirects the CL and Link tasks:
-
-       CLToolPath / CLToolExe / LinkToolPath / LinkToolExe
-
-   One solution, one build command, a matched toolchain, and no installs.
-   IncludePath and LibraryPath are overridden outright rather than inherited,
-   because the DDK ships its own SAL 1 sal.h and it must be the one that
-   wins.
-
-   Compiler and linker flags follow the DDK build system rather than being
-   invented here. E:\DEV\WinDDK\bin\makefile.new, i386mk.inc and amd64mk.inc
-   are the reference.
-
-   If the modern WDK is ever installed, WdkRoot and the two path properties
-   are the only things that change.
-
-5.  Settings That Are Not Obvious
-
-   Each of these was found the hard way and is commented at its site.
-
-   KeAcquireSpinLock, NOT KfAcquireSpinLock. The Kf forms are x86-only
-   fastcall exports: on x64 the symbol does not exist and the link fails
-   with an unresolved external, having compiled without complaint. The DDK's
-   two-argument KeAcquireSpinLock(Lock, &OldIrql) is a macro over Kf on x86
-   and a real function on x64, so it is the only spelling that works in both.
-   The 2001 driver uses the Kf forms throughout, because it only ever had to
-   be a 32-bit driver.
-
-   THIS IS WHY ALL FOUR CONFIGURATIONS GET BUILT rather than just the one
-   being worked on. The harness is Win32 and would never have shown it; the
-   x64 driver link is what caught it.
-
-   /Z7 RATHER THAN /Zi. mspdbsrv.exe is absent from the DDK bin tree, so the
-   PDB server cannot be spawned and /Zi fails. /Z7 keeps debug information in
-   the object file, and is the DDK default anyway.
-
-   UseDebugLibraries IS FALSE IN EVERY DRIVER CONFIGURATION, Debug included.
-   Four v141 defaults key off that one property: /MDd, /RTC1, /Od and
-   /DEBUG:FASTLINK. link 9.00 rejects /DEBUG:FASTLINK outright, and the /RTC
-   switches emit _RTC_InitBase and friends, which the 2009 libraries do not
-   provide. Debug-ness is set explicitly instead.
-
-   GenerateDebugInformation IS true, NOT DebugFull. link 9.00 ignores
-   /DEBUG:FULL with LNK4224, which would silently produce no PDB at all.
-
-   THE ENTRY POINT IS GsDriverEntry, NOT DriverEntry. /GS makes
-   BufferOverflowK.lib::GsDriverEntry the real entry; it initialises the
-   stack cookie and then calls DriverEntry. x86 decorates the stdcall name as
-   GsDriverEntry@8, x64 does not.
-
-   /Gz ON x86. The DDK declares its exports with no explicit calling
-   convention and hidclass.lib exports _HidRegisterMinidriver@4, so stdcall
-   must be the compiler default. STD_CALL must be defined to match, and
-   neither may be set without the other.
-
-   NonCoreWin IS true. Without it Microsoft.Cpp.CoreWin.props prepends
-   kernel32.lib, user32.lib and nine others to the link line.
-
-   NO /DYNAMICBASE, IN EITHER DIRECTION. link 9.00 rejects the switch
-   alongside /DRIVER; driver ASLR arrived with the Win8 WDK. The property is
-   left empty so nothing is emitted.
-
-   INCREMENTAL LINKING IS OFF FOR BOTH PROJECTS. They share an output
-   directory and both target the base name wishk300, so each would want the
-   same wishk300.ilk. The linker PDB is named wishk300.sys.pdb and
-   wishk300.exe.pdb for the same reason. Intermediates are per-project
-   because two projects sharing an IntDir is an MSB8027 error, and because
-   both compile core.c with different toolchains and different defines.
-
-   LNK4078 IS SUPPRESSED, and only that one. link adds the WRITE attribute to
-   any section named in /SECTION, so the image INIT section differs from the
-   one the compiler emitted and the linker reports the mismatch. Verified by
-   dumping both. The resulting section is correct - discardable code - and
-   4078 is in the DDK own suppression list.
-
-6.  The File Plan
-
-   THE SET OF SOURCE FILES IS FIXED AT SIX. Everything still to be ported
-   has a named home in the table below, and nothing outside this list is to
-   be created without a deliberate decision to change the plan. The reason
-   for writing it down is that a port of this size drifts into a file per
-   subsystem if each one is decided on its own.
-
-   +-----------+----------+---------+---------------------------------------+
-   | File      | Now      | Planned | Holds                                 |
-   +===========+==========+=========+=======================================+
-   | core.c    |     2088 |    2088 | decode, effects, Pak CRCs, the N64    |
-   |           |          |         | transaction, HID report state; done   |
-   +-----------+----------+---------+---------------------------------------+
-   | script.c  |      382 |     382 | the bytecode interpreter, and only    |
-   |           |          |         | that; it is finished                  |
-   +-----------+----------+---------+---------------------------------------+
-   | sched.c   |     1069 |    1069 | thread pool, scheduler, input         |
-   |           |          |         | binding, native builtins; finished    |
-   +-----------+----------+---------+---------------------------------------+
-   | ioctl.c   |     1303 |    1303 | both IOCTL surfaces, the registry and |
-   |           |          |         | the notify queue; finished            |
-   +-----------+----------+---------+---------------------------------------+
-   | wdm.c     |     1582 |   ~2100 | DriverEntry, AddDevice, PnP, power,   |
-   |           |          |         | polling, URB transport, device naming |
-   +-----------+----------+---------+---------------------------------------+
-   | harness.c |     6964 |   ~7400 | main() and every test                 |
-   +-----------+----------+---------+---------------------------------------+
-
-   THE BUILTINS WENT INTO sched.c, NOT script.c as first planned. Eleven of
-   the seventeen are thread operations - _fork, _kill, _wake, _sleep, _exit,
-   _getpid - and the rest post events; all of that is scheduler state that
-   script.c deliberately cannot see. Moving them kept the layering intact at
-   the cost of one file being larger than estimated. The file SET is what
-   this section fixes, and that has not changed.
-
-   WHY ioctl.c IS A FILE AND NOT PART OF wdm.c. It is not a size split. It
-   holds BOTH dispatchers - the per-device surface and the control device's -
-   plus the device registry the second one enumerates and the user-mode
-   notification queue. That is the entire contract with wishd201.exe,
-   specified in one document, ../docs/ioctl-surface.txt. One surface, one
-   document, one file.
-
-   IT ALSO TURNED OUT TO BE OS-FREE, which the plan did not assume. Every
-   case on both surfaces is a length check and a small action on device
-   state; an IRP is decoded into a core_ioctl by the caller and what comes
-   back is a status and a byte count. Only four things needed seams: the raw
-   vendor passthrough, the enable toggle, and the claim and deliver steps of
-   the notification queue - the last two because whether a parked request is
-   still ours is a cancellation question and therefore the OS's to answer.
-   That is why the whole surface, including its four defects, is exercised
-   in the harness.
-
-   WHAT WENT TO wdm.c INSTEAD. The control DEVICE OBJECT - IoCreateDevice,
-   the symbolic link, the open count, the Create/Close/Cleanup/ReadWrite
-   handlers, the IRP cancel routines and the request routing in
-   drv_IoctlViaHidHandle - is device-object plumbing and lives with the
-   other device-object work. The registry those handles name is here; the
-   objects they name are there.
-
-6.1.  What Is Left
-
-   Measured against the Ghidra database: 142 of the 147 functions in
-   wishk201.sys have a counterpart, and the five that do not are accounted
-   for in origin.txt section 3 - a release with nothing to release, two
-   string helpers the naming no longer needs, and two compiler intrinsics.
-
-   The count is 147 rather than 146 because stage five recovered one more
-   function from a code gap: drv_VendorRequestCompleteKeepSlot at 00018d10,
-   reached only through a stored address and so never disassembled.
-
-   THE COUNT NOW INCLUDES NAMED-BUT-EMPTY FUNCTIONS. Stage two declared and
-   shaped the whole of wdm.c's remaining surface so that the dispatchers
-   above it compile and can be tested; roughly twenty of those bodies are
-   still stubs. The origin map records them like any other row, because the
-   correspondence to the original is what the map is for and it is already
-   decided. Judge completeness by the test groups, not by this percentage.
-
-   wdm.c IS BEING PORTED IN STAGES, because it is the OS-facing half and
-   most of it cannot be exercised the way the rest was.
-
-   Stage one was the remove lock and the vendor transport - the foundation
-   the other subsystems sit on, and the piece that turns core.c's transport
-   seams into something real.
-
-   Stage two was the dispatch triage and PnP: the wrapper layer that lets
-   one driver object serve three kinds of client, and the PnP dispatcher
-   with its bring-up and tear-down ordering. Both are testable, and both
-   are tested.
-
-   Stage three was THE INPUT PATH, end to end: the double-buffered polling
-   engine, the report queue and the reads waiting on it. That is the
-   driver's actual job - a packet goes from a completed URB through
-   core_on_raw_packet and out of a completed HID read - and all of it is
-   testable, so all of it is tested.
-
-   Stage four was DEVICE NAMING and USB PORT RECOVERY. Naming is the hub
-   walk that gives a device its display string, and it is where the
-   unbounded string copy of known-defects.txt section 6 lives; recovery is
-   the retry ladder a failed read falls into. Both are testable - the hub
-   walk against a made-up topology, the ladder against a scripted port - and
-   both are tested.
-
-   Stage five was the last, and had four parts.
-
-   THE SDK COMMAND-BLOCK CHANNEL turned out to belong in ioctl.c, not
-   wdm.c: walking a 64-byte block of joybus commands, deciding which the
-   driver answers from its own cache and which go on the wire, and
-   emulating a Rumble Pak at two addresses is all OS-free logic over a byte
-   buffer. Only the transport is a seam. It is specified in
-   ../docs/command-block.txt and has thirteen test groups.
-
-   POWER is the driver acting as its own policy owner - mapping system
-   states to device states out of DEVICE_CAPABILITIES, parking a system IRP
-   while it asks for the device IRP that mapping calls for, and supporting
-   remote wake. Testable, and tested.
-
-   THE CONTROL DEVICE OBJECT and its notification IRPs: the singleton's two
-   reference counts, its four dispatch entry points, and the cancel-safe
-   waiter queue. Testable, and tested.
-
-   THE USB LAYER is the one part that is not. Descriptor fetch, select
-   configuration, the two asynchronous transfer types, abort and the port
-   IOCTLs are all URB marshalling against a bus that does not exist in the
-   harness, so they are written against ../docs/usb-transport.txt and
-   verified only by compiling in all four configurations. Building the
-   driver for real is what found four DDK divergences the harness could not
-   - POWER_STATE is a union and not a ULONG among them.
-
-   EVERY SUBSYSTEM OF THE ORIGINAL NOW HAS AN IMPLEMENTATION. What is left
-   is not a list of functions; it is the two things no amount of porting
-   settles.
-
-   FIRST, THE USB LAYER HAS NEVER TALKED TO A DEVICE. It compiles in all
-   four configurations and it is written from a specification, but every
-   other subsystem here was checked against hand-built vectors and this one
-   cannot be. Treat it as the least trustworthy code in the tree.
-
-   SECOND, NOTHING HAS BEEN LOADED. The driver is unsigned, there is no
-   test VM, and that is separate work - see section 6.2.
-
-   +--------------------------+-----+-------+----------+-----------+
-   | Subsystem                | fns | bytes | ~C lines | Goes to   |
-   +==========================+=====+=======+==========+===========+
-   | IOCTL and CDO plumbing   |   5 |  2050 |      341 | wdm.c     |
-   | vendor transport, rest   |   5 |   640 |      106 | wdm.c     |
-   | control device object    |   6 |   609 |      101 | wdm.c     |
-   | power                    |   6 |   608 |      101 | wdm.c     |
-   | PnP and start/stop, rest |   5 |   592 |       98 | wdm.c     |
-   | notification queue IRPs  |   4 |   560 |       93 | wdm.c     |
-   | device naming, rest      |   3 |   420 |       70 | wdm.c     |
-   | kernel glue              |   3 |   384 |       64 | wdm.c     |
-   | USB port recovery, rest  |   2 |   223 |       37 | wdm.c     |
-   | 64-bit division helpers  |   2 |   208 |       34 | compiler  |
-   +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  41 |  6294 |     1049 |           |
-   +--------------------------+-----+-------+----------+-----------+
-
-   Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
-   the IOCTL surface's bytes and is one very large switch; switch bodies
-   compile densely, so that row lands nearer 700 to 900 lines in practice.
-   And the two 64-bit division helpers are compiler runtime, not driver
-   code - the replacement gets them from the toolchain.
-
-   The pressure is NOT on the OS-free side. Everything left that belongs in
-   core.c, script.c and sched.c comes to about 700 lines together and fits
-   in files that already exist. wdm.c is what grows.
 
 6.2.  Specifications For What Remains
 

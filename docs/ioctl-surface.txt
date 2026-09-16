@@ -433,12 +433,12 @@ Table of Contents
    transaction with command byte 0x36. The sine machinery is described in
    section 5.5.
 
-   CORRECTION. An earlier revision of this note described these slots as the
-   mechanism behind behaviour like "hold A and it emits repeated mouse
-   clicks". That was wrong. Autofire and repeat behaviour are implemented by
-   the script interpreter, which spawns a thread and sleeps - see script-
-   bytecode.txt section 6.5, builtins 0x4000000C and 0x40000009. The slot
-   engine and the script engine are separate subsystems that coexist.
+   THESE SLOTS ARE NOT THE AUTOFIRE MECHANISM, which their shape strongly
+   suggests. Behaviour like "hold A and it emits repeated mouse clicks" is
+   implemented by the script interpreter, which spawns a thread and sleeps -
+   see script-bytecode.txt section 6.5, builtins 0x4000000C and 0x40000009.
+   The slot engine drives the RUMBLE MOTOR and nothing else. The two are
+   separate subsystems that coexist.
 
    Neither is the compiled-script download path, which is IOCTL 0xb98c20f0
    described in section 5a.
@@ -473,9 +473,9 @@ Table of Contents
    0xC0 of the flags gate whether the slot's start timestamp is reset, which
    is how an effect is restarted versus merely reparameterised.
 
-   Earlier revisions of this note described the +0x0C field as landing at
-   devext + (slot + 0x14) * 0x38. That is the same address as slot+0x460; the
-   decompiler simply factored it differently.
+   The decompiler renders the +0x0C field's destination as
+   devext + (slot + 0x14) * 0x38. That is the SAME ADDRESS as slot+0x460,
+   factored differently - do not read it as a second field.
 
    Each axis parameter block is 8 bytes:
 
@@ -597,9 +597,9 @@ Table of Contents
        Q2  18000..27000  -sin(x - 18000)
        Q3  27000..36000  -sin(36000 - x)
 
-   This table is NOT the analog stick response curve, which is what an
-   earlier revision of hid-descriptor.txt guessed. drv_BuildJoystickReport
-   scales the stick arithmetically and never consults a lookup.
+   THIS TABLE IS NOT THE ANALOG STICK RESPONSE CURVE, which its shape and
+   size both suggest. drv_BuildJoystickReport scales the stick
+   arithmetically and never consults a lookup.
 
    BUG in drv_SineLerp, confirmed at instruction level rather than from the
    decompiler. The interpolation weights are swapped: table[idx+1] is paired
@@ -692,10 +692,9 @@ Table of Contents
           RAW axes, and only the result is added to the scaled value.
               X += (|rawY| * stretch * rawX) / 256
               Y += (|rawX| * stretch * rawY) / 256
-          An earlier revision of this list wrote the factors as X and Y
-          with no qualifier, which reads as the scaled values and is
-          wrong by a factor of 16. The worked example in known-defects
-          .txt section 3 was right; this list was not. Confirmed by
+          WRITING THE FACTORS AS PLAIN X AND Y IS WRONG BY A FACTOR OF
+          16, because by this point in the function X and Y hold the
+          SCALED values and the product uses the raw ones. Confirmed by
           reading 00015150 directly and by emulating it.
        4. if devext+0x3EC is neither 0 nor 0x4B, RANGE CLIPPING,
           IOCTL fn 0x83e:
@@ -726,9 +725,9 @@ Table of Contents
    zero, and maximal on the diagonal. At the diagonal limit, 65 * 16 = 1040
    plus (65 * 10 * 65) / 256 = 165 gives 1205, which clips to full scale.
 
-   An earlier revision of this note called step 3 a probable bug with swapped
-   operands. That was wrong; see known-defects.txt section 3 for the
-   retraction and the reasoning.
+   Step 3 reads like a bug with swapped operands and is not one; see
+   known-defects.txt section 3 for why the cross-coupled form is the
+   correct one.
 
    There is no dead zone anywhere in the path.
 
@@ -750,19 +749,18 @@ Table of Contents
    it writes (CodeCount != 0) - 1, giving 0 for a real script and -1 for an
    unload.
 
-   CORRECTION. An earlier revision of this note called the field a counter
-   and read the one-sided guards in drv_ScriptSchedulerDpc - increment only
-   while non-negative, decrement only while positive - as a latch bug that
-   permanently locks a script out of the stick. THAT WAS WRONG and is
-   retracted. With the state values above the guards are simply refusing to
-   count passes while the engine is unloaded (-1) or loading (-2), which is
-   exactly what they should do. drv_AddDevice initialising the field to -1 is
-   the correct initial state, not a latched fault.
+   THE ONE-SIDED GUARDS ARE NOT A LATCH BUG, and they look exactly like
+   one. drv_ScriptSchedulerDpc increments the field only while it is
+   non-negative and decrements only while it is positive, and drv_AddDevice
+   initialises it to -1 - which reads as a counter latched permanently at a
+   value no code path can lift, locking a script out of the stick forever.
 
-   The LESSON generalises, and is the same one recorded in known-defects.txt
-   section 3: a field read as a counter behaved oddly, and the oddity was in
-   the reading, not the code. Nothing named the field until the IOCTL that
-   writes its distinguished values was read.
+   It is not a counter. With the state values above, the guards are
+   refusing to count passes while the engine is UNLOADED (-1) or LOADING
+   (-2), which is what they should do, and -1 is the correct initial state.
+
+   The field cannot be understood from the DPC alone; only fn 0x83C, which
+   writes its distinguished values, names it.
 
 8.  Consequences For The Replacement Driver
 

@@ -267,10 +267,12 @@ Table of Contents
    log, including all eleven interpreter status codes. It is the
    authoritative naming of those codes and it agrees with the driver.
 
-   CORRECTION on type 99. cfg_MessageWndProc tests "if (msg != 0x40A)" and
-   skips its whole body when the message IS 0x40A, returning 0 without
-   reaching DefWindowProc. So 0x40A is deliberately recognised and then
-   dropped: it does nothing in this build. Device rescan is driven instead by
+   TYPE 99, AND A TEST THAT READS BACKWARDS. cfg_MessageWndProc tests
+   "if (msg != 0x40A)" and skips its whole body when the message IS 0x40A,
+   returning 0 without reaching DefWindowProc. The shape invites the
+   opposite reading - that 0x40A is the message being handled - when it is
+   the one being dropped. So 0x40A is deliberately recognised and then
+   discarded: it does nothing in this build. Device rescan is driven instead by
    WM_DEVICECHANGE (0x219), which the same procedure does handle, and by
    message 0x40B, which calls cfg_CompleteDeviceRescan.
 
@@ -387,8 +389,8 @@ Table of Contents
        HKLM\Software\Wish Technologies\Adaptoid
            DetectGameLaunches   REG_DWORD   0 or 1
 
-   ESTABLISHED. The DLL has since been read. It is a WH_SHELL hook, and the
-   mechanism is smaller than the export list suggests.
+   The DLL is a WH_SHELL hook, and the mechanism is smaller than its export
+   list suggests.
 
    InstallHook calls SetWindowsHookExA(WH_SHELL, hook_ShellProc, hinst, 0).
    The final 0 is the thread id, which makes the hook global, so Windows maps

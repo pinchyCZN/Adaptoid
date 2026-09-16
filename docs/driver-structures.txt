@@ -163,9 +163,9 @@ Table of Contents
    | 0x400  | VirtualDeviceMode        | int                          | reports synthesised, not polled          |
    | 0x404  | LastHidReport            | byte[5]                      | replayed on a NULL submit                |
 
-   DEVICE INSTANCE ID, +0x3F8, IS AN IDENTIFIER AND NOT A CALIBRATION VALUE.
-   An earlier revision recorded it as VirtualStickValue, a synthetic stick
-   position. drv_AddDevice assigns it at 00012582 as
+   DEVICE INSTANCE ID, +0x3F8, IS AN IDENTIFIER THAT DOUBLES AS A STICK
+   POSITION - which makes it look like a calibration constant and is worth
+   being clear about. drv_AddDevice assigns it at 00012582 as
 
        (InterlockedIncrement(counter) % 1100) + 50
 
@@ -209,8 +209,8 @@ Table of Contents
    +--------+--------------------------+------------------------------+------------------------------------------+
 
    THE FOUR FIELDS MARKED MOTOR CALIBRATION ARE NOT TUNING-MODE-ONLY STATE,
-   which an earlier revision of this note implied by grouping them all under
-   the on-controller tuning mode. drv_AddDevice SEEDS THEM at device start -
+   which their names and their neighbours both suggest. drv_AddDevice SEEDS
+   THEM at device start -
    TunePeriod 500, TuneDuty 50, TuneDutyComplement 50, TuneStrength 100 - and
    drv_EffectEvaluate multiplies its intensity by duty * period. With all four
    left at zero the effect engine emits no pulses at all, so these are the
@@ -396,10 +396,11 @@ Table of Contents
    every precomputed tick once EffectIdleTicks passes 4, at the same moment it
    sends the motor-stop command 0x32.
 
-   UsbDeviceAddress, +0x33E, WAS RECORDED AS FirmwareRevision. It is the
-   adapter's own USB bus address, which drv_QueryFirmwareInfo obtains with
-   vendor request 0x75 and keeps the first byte of. What settles it is its
-   single use: drv_FindDeviceOnHub compares it against DeviceAddress at
+   UsbDeviceAddress, +0x33E, IS NOT A FIRMWARE REVISION, which is what
+   drv_QueryFirmwareInfo's name suggests it collects. It is the adapter's
+   own USB bus address: the function issues vendor request 0x75 and keeps
+   the first byte. What settles it is the field's single use:
+   drv_FindDeviceOnHub compares it against DeviceAddress at
    offset 25 of the packed 0x23-byte USB_NODE_CONNECTION_INFORMATION, while
    walking the hub tree to discover which port this adapter is plugged into.
 
@@ -580,18 +581,19 @@ Table of Contents
    | drv_ProcessCommandBlock          | weak  | 3    | control extension, block, pass     |
    +----------------------------------+-------+------+------------------------------------+
 
-   drv_N64Transaction is the one whose correction changes meaning rather than
-   just readability. It was recorded as taking a single buffer that held the
-   command on entry and received the reply. It does not: the command buffer
-   and the reply buffer are SEPARATE arguments, five and six. Every caller
-   passes a distinct local for the reply.
+   drv_N64Transaction is the one whose signature changes MEANING rather than
+   just readability, and the wrong reading is the natural one: it looks like
+   a single buffer that holds the command on entry and receives the reply.
+   It is not. The command buffer and the reply buffer are SEPARATE
+   arguments, five and six, and every caller passes a distinct local for the
+   reply.
 
-   HOW THEY WERE FOUND. The first thirteen came from reading call sites. The
-   remaining six came from a mechanical sweep comparing each function's
-   declared parameter bytes against the RET immediate in its own epilogue -
-   which is the check that should have been run first. A wrong (void)
-   signature is invisible to any search for suspicious-looking prototypes,
-   because there is nothing suspicious about it.
+   HOW TO FIND THESE. Compare each function's declared parameter bytes
+   against the RET immediate in its own epilogue; on stdcall they must
+   agree. Reading call sites finds most of them and MISSES THE WORST KIND:
+   a function wrongly declared (void) is invisible to any search for
+   suspicious-looking prototypes, because there is nothing suspicious about
+   it. Run the mechanical sweep first.
 
 7.  Unreferenced Regions
 

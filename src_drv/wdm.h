@@ -391,8 +391,8 @@ int AdaptoidBuildLocationName(const ADAPTOID_TOPOLOGY *Topo,
  * itself. It is not a normal error: the retry loop tests for it specifically
  * and stops, because retrying would cycle the port again and again.
  *
- * An earlier note recorded this value as unexplained. It is simply
- * drv_RecoverPort saying "I have already given up on your behalf".
+ * It is drv_RecoverPort saying "I have already given up on your behalf" -
+ * not an NTSTATUS, which is why it decodes as nothing meaningful.
  */
 #define ADAPTOID_STATUS_GAVE_UP ((NTSTATUS)0xC0012345L)
 

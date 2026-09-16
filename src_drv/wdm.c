@@ -349,9 +349,8 @@ void AdaptoidUnwireDevice(PADAPTOID_DEVEXT DevExt)
  * because nothing else can reach this entry point.
  *
  * THE ENTRY GUARD refuses everything while the device is being torn down.
- * Note the status: STATUS_DELETE_PENDING, which is what 0xC0000056 is - an
- * earlier note here named it STATUS_DEVICE_NOT_CONNECTED, which is
- * 0xC000009D and a different thing.
+ * Note the status: 0xC0000056 is STATUS_DELETE_PENDING, not the one that
+ * sounds right - STATUS_DEVICE_NOT_CONNECTED is 0xC000009D.
  */
 NTSTATUS NTAPI AdaptoidIntDeviceControl(PDEVICE_OBJECT DeviceObject,
                                         PIRP Irp)

@@ -466,8 +466,9 @@ Table of Contents
    byte, whose bit 0 means a Pak is present and bit 1 means one was removed
    since the last query.
 
-   THE TWO CLASSIFY STEPS DO NOT BEHAVE THE SAME WAY ON FAILURE, and an
-   earlier revision of this section said they did. The outcomes are:
+   THE TWO CLASSIFY STEPS DO NOT BEHAVE THE SAME WAY ON FAILURE, though
+   they are otherwise near-identical and read as a matched pair. The
+   outcomes are:
 
    +---------------------------+---------------------------------------------+
    | Condition                 | Result                                      |

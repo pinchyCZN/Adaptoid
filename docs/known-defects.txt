@@ -23,9 +23,11 @@ Abstract
    count that never reaches zero, so the device can never finish removing.
    Section 17 is the reachable one. This
    note records each one, the exact condition that triggers it, what it
-   would actually do, and whether a user would be likely to notice. It also
-   records claims that were made here and later RETRACTED, in sections 3
-   and 7.
+   would actually do, and whether a user would be likely to notice.
+
+   SECTIONS 3 AND 7 ARE THE OPPOSITE: two pieces of code that read as
+   defects, are not, and would be "fixed" by anyone who read them the
+   obvious way. They are here so that the fix is not attempted twice.
 
    TWO OF THEM, SECTIONS 13 AND 14, ARE DIFFERENT IN KIND from the rest.
    Every other entry here is a correctness slip whose worst outcome is
@@ -63,11 +65,11 @@ Table of Contents
 
    1.  Severity Summary
    2.  Defect 1: Button Map Filler Entries
-   3.  RETRACTED: Cross-Coupled Stick Acceleration Is Not A Defect
+   3.  Cross-Coupled Stick Acceleration Is Deliberate
    4.  Defect 3: Swapped Sine Interpolation Weights
    5.  Defect 4: Race On The Launch-Detection Path Buffer
    6.  Defect 5: Unbounded String Copies Into Fixed Fields
-   7.  RETRACTED: The Script State Field Is Not A Latch Bug
+   7.  The Script State Field Is A State, Not A Counter
    8.  Defect 6: The Immediate Call Bounds-Checks The Wrong Value
    9.  Defect 7: _fork Gives The Child The Parent's StackSize
    10. Defect 8: _kill Never Decrements ThreadCount
@@ -91,7 +93,6 @@ Table of Contents
        -------------------------  ---------------  ------------------
        button map filler entries  joystick report  yes, but needs a
                                                    rare button combo
-       (stick cross-coupling)     joystick report  RETRACTED, see 3
        sine interpolation         effect engine    only if an effect
                                                    slot is running
        launch-detection race      wishh201.dll     only with Detect
@@ -138,7 +139,6 @@ Table of Contents
                                                    dispatch window
        control device power IRP   control device   no, nothing sends
        omits PoStartNextPowerIrp                   one
-       (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
 
@@ -173,20 +173,22 @@ Table of Contents
    button", or better, give the table a sentinel such as 0xFF for "not a
    button" and test for it.
 
-3.  RETRACTED: Cross-Coupled Stick Acceleration Is Not A Defect
+3.  Cross-Coupled Stick Acceleration Is Deliberate
 
-   An earlier revision of this note recorded the cross-coupled stick term in
-   drv_BuildJoystickReport as an arithmetic defect. THAT WAS WRONG, and this
-   section records the correction rather than deleting the claim.
+   THIS SECTION IS HERE TO STOP THE TERM BEING "FIXED". The cross-coupled
+   stick term in drv_BuildJoystickReport reads as a transposition slip, is
+   not one, and correcting it would break the controller.
 
    The term is applied as
 
        X += (|Y| * k * X) / 256
        Y += (|X| * k * Y) / 256
 
-   with k taken from devext+0x3F0, which drv_AddDevice initialises to 10. The
-   earlier reading was that a conventional acceleration curve would use each
-   axis's own magnitude, so cross-coupling looked like a transposition slip.
+   with k taken from devext+0x3F0, which drv_AddDevice initialises to 10.
+
+   WHY IT LOOKS WRONG: a conventional acceleration curve uses each axis's
+   own magnitude, so seeing |Y| scale X and |X| scale Y looks like the two
+   were swapped by mistake.
 
    It is not acceleration. The vendor SDK, shipped as sdk_1163b.zip and
    documented in src/dxsample/dxescape.cpp, names these two parameters and
@@ -208,23 +210,21 @@ Table of Contents
    axis but only about 65 into a diagonal corner, so a diagonal can never
    reach full scale. A term that is ZERO on-axis and MAXIMAL on the diagonal
    is precisely the correction needed, and cross-coupling is the only way to
-   express it. Using each axis's own magnitude - the "fix" the earlier
-   revision proposed - would have boosted the axes that already reach full
-   scale and done nothing for the corners, which is the opposite of what is
-   wanted.
+   express it. THE OBVIOUS FIX MAKES IT WORSE: using each axis's own
+   magnitude boosts the axes that already reach full scale and does nothing
+   for the corners, which is the opposite of what is wanted.
 
-   The arithmetic in the earlier revision proves the point once it is read
-   correctly. Reports are raw * 16, clipped at 1200, so 1200/16 = 75 is the
-   clipping range. At the diagonal maximum of 65 raw on each axis:
+   The arithmetic settles it. Reports are raw * 16, clipped at 1200, so
+   1200/16 = 75 is the clipping range. At the diagonal maximum of 65 raw on
+   each axis:
 
        base  = 65 * 16                 = 1040
        boost = (65 * 10 * 65) / 256    =  165
        final = 1040 + 165             = 1205, clipped to 1200
 
    1200 is full scale. The corner reaches it exactly, which is the documented
-   behaviour: 65 warped out to 75. The earlier note recorded the same number
-   and described the clip as "hiding the error", when reaching full diagonal
-   deflection was the entire purpose.
+   behaviour: 65 warped out to 75. THE CLIP IS NOT HIDING AN OVERFLOW -
+   reaching full diagonal deflection is the entire purpose of the term.
 
    For a replacement: implement this deliberately, and expose both
    parameters. Setting corner stretch to 0 disables the warp and setting
@@ -369,16 +369,16 @@ Table of Contents
    For a replacement: bound both copies. This costs nothing and removes a
    whole class of question.
 
-7.  RETRACTED: The Script State Field Is Not A Latch Bug
+7.  The Script State Field Is A State, Not A Counter
 
-   An earlier revision of this note, and of ioctl-surface.txt, recorded the
-   field at devext+0x1640 as a counter with a latch defect: drv_AddDevice
-   initialises it to -1, and drv_ScriptSchedulerDpc only increments while it
-   is non-negative, so it appeared that nothing could ever lift it and the
-   script could never own the stick.
+   THIS SECTION IS HERE TO STOP A NON-BUG BEING REPORTED. The field at
+   devext+0x1640 reads as a counter with a latch defect: drv_AddDevice
+   initialises it to -1, drv_ScriptSchedulerDpc increments only while it is
+   non-negative, and nothing in the scheduler can ever lift it - so it looks
+   as though a script can never own the stick.
 
-   THAT WAS WRONG. The field is a state, not a counter, and IOCTL fn 0x83C
-   writes its distinguished values:
+   It is a state, not a counter, and IOCTL fn 0x83C writes its
+   distinguished values:
 
        -1   no script loaded          -2   a load is in progress
         0   script loaded and idle    -3   also accepted by the load
@@ -388,11 +388,11 @@ Table of Contents
    to count scheduler passes while the engine is unloaded or loading. A load
    through fn 0x83C moves the field to 0 and the mechanism works.
 
-   LESSON, the same one as section 3: the behaviour looked wrong against an
-   assumed purpose the code never claimed. Naming the field
-   ScriptStickCounter committed to the counter reading before the IOCTL that
-   drives it had been read. Where a field's PURPOSE is inferred from one of
-   its users, a defect in it is only as sound as that inference.
+   THE FIELD CANNOT BE UNDERSTOOD FROM THE SCHEDULER ALONE. Only fn 0x83C,
+   which writes the distinguished values, names it - and naming it from the
+   DPC instead produces a counter, a latch, and a defect report. Where a
+   field's purpose is inferred from ONE of its users, any defect found in it
+   is only as sound as that inference. Section 3 is the same shape.
 
 8.  Defect 6: The Immediate Call Bounds-Checks The Wrong Value
 

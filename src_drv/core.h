@@ -668,8 +668,8 @@ typedef struct core_state {
 	 * +/-1200 stick range, because virtual mode reports it as the Y axis.
 	 * Each adapter therefore parks its stick at its own identity, and
 	 * control-device function 0x822 resolves a handle from the same value.
-	 * An earlier reading called this VirtualStickValue and treated it as a
-	 * calibration constant; it is an identifier that doubles as one.
+	 * It is an IDENTIFIER THAT DOUBLES AS a stick position, which is why it
+	 * reads like a calibration constant and is not one.
 	 */
 	s32             instance_id;
 	int             reports_enabled;

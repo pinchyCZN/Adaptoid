@@ -132,5 +132,18 @@ Table of Contents
        wishd201.exe    00400000 - 004a1ba4   (configurator)
 
    One fact has one home. Other documents point at that home rather than
-   restating it. Documents are corrected in place, never by appending a
-   note that contradicts an earlier section.
+   restating it.
+
+   THESE DOCUMENTS STATE WHAT IS TRUE NOW. They are not a development log.
+   A finding that turns out to be wrong is DELETED and replaced by the right
+   one - not annotated, not retracted in place, not given a paragraph
+   recording that someone once believed it. There is no "an earlier revision
+   said", and no before-and-after.
+
+   THE ONE EXCEPTION IS A TRAP: code that reads as a defect and is not, an
+   approach that looks correct and fails for a reason invisible from the
+   result, a tool whose obvious use breaks. Those are recorded as standing
+   cautions in the present tense, because a reader without them repeats the
+   mistake. known-defects.txt sections 3 and 7 are the pattern: stated as
+   "this is deliberate, here is why it looks wrong", never as "this was
+   once reported as a bug".

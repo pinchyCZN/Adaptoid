@@ -205,9 +205,37 @@ python tools/rfcfmt.py  --fix P    render a markdown-ish draft as RFC text
 file already in RFC form. Author new documents in RFC form directly. Run
 `asciify.py --check` before treating any document as finished.
 
-Record facts, not the journey. One fact has one home; everything else points at
-it rather than restating it. Correct a document in place instead of appending a
-correction.
+### Documents state the current facts. They are not a development log.
+
+A document describes **what is true now**. Nothing in it records how the
+understanding got there: no "CORRECTION", no "RETRACTED", no "an earlier
+revision said", no "this was previously recorded as", no before-and-after.
+
+When a finding turns out to be wrong, **delete the wrong statement and write the
+right one**. The old claim does not get a farewell paragraph. One fact has one
+home; everything else points at it rather than restating it.
+
+**The single exception is a trap.** History may be recorded only when a reader
+who does not know it would repeat the mistake -- an approach that looks correct,
+was tried, and failed for a reason that is not visible from the result. The test
+is whether the note prevents a future error, not whether it is interesting:
+
+- "The joybus address word carries a CRC-5 in its low five bits, so 0x8001 is
+  address 0x8000" -- a fact. State it, no history.
+- "`origin.tsv` is tab-separated, not an aligned table: fixed columns had one
+  character of headroom, so a longer name aborted the tool and widening a column
+  rewrote every row" -- a trap. Someone would reformat it and hit the same wall.
+  Keep it.
+- "An earlier revision named this field FirmwareRevision" -- not a trap. The
+  field is named correctly now and nothing leads a reader back to the old name.
+  Delete it and just describe the field.
+
+A retraction is only ever warranted for a claim **that still looks true from the
+evidence** -- where a reader examining the same code would reach the discarded
+conclusion again. Write that as a positive statement of why the obvious reading
+is wrong, not as a record that someone once believed it.
+
+The same applies to source comments and to Ghidra plate comments.
 
 ## Source code: tabs for indentation, spaces for alignment
 

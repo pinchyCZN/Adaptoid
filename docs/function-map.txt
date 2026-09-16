@@ -181,9 +181,8 @@ Table of Contents
    to drv_ExecuteRawCommand, which either emulates a Controller Pak read
    or write locally or forwards the bytes as an N64 transaction.
 
-   This is the same 64-byte exchange the control IOCTLs fn 0x802 and
-   0x803 declare, which earlier revisions of ioctl-surface.txt recorded
-   as an unexplained transfer length.
+   This is the same 64-byte exchange the control IOCTLs fn 0x802 and 0x803
+   declare - see command-block.txt, which specifies what fills it.
 
 5.  Private IOCTL Handlers
 
@@ -263,8 +262,8 @@ Table of Contents
        00013e90  drv_EffectSlotActive
        000149a0  drv_SineLerp
 
-   The vendor command byte that carries the motor bitmap varies with
-   context rather than being fixed at 0x36 as earlier notes implied:
+   The vendor command byte that carries the motor bitmap VARIES WITH
+   CONTEXT. It is not fixed at 0x36, which one path alone would suggest:
 
        0x32  idle or stop, sent when the engine has been quiet
        0x34  update following accessory insertion
@@ -350,10 +349,10 @@ Table of Contents
        00019a80  __alldiv                    compiler helper
        00019b2a  HidRegisterMinidriver       import thunk
 
-13.1.  Declared Arity Was Wrong In Thirteen Functions
+13.1.  Declared Arity Is Not To Be Trusted
 
    Naming a function does not make its signature right. TWENTY routines in
-   wishk201.sys had a declared parameter count that did not match the stack
+   wishk201.sys carry a declared parameter count that does not match the stack
    purge in their own epilogue, so the decompilation silently dropped
    arguments.
 
@@ -395,8 +394,8 @@ Table of Contents
    A NULL CHECK THAT LOOKS LIKE A PARAMETER COMPARISON. In
    drv_ResetAllDeviceState the decompiler renders the loop guard as `if (link
    != (undefined4 **)0x344)`. That reads as a comparison against a parameter-
-   relative address, and an earlier revision named the argument Except on
-   that basis. The disassembly is XOR EDI,EDI followed by LEA ECX,[ESI-0x344]
+   relative address, and invites naming the argument something like Except.
+   The disassembly is XOR EDI,EDI followed by LEA ECX,[ESI-0x344]
    and CMP ECX,EDI - a NULL test on the extension base recovered from the
    list link. The function processes every device and never reads its
    argument at all.
@@ -418,12 +417,12 @@ Table of Contents
 
    -  Which accessory kind maps to accessory state 2 versus state 3.
 
-   -  RESOLVED, and both turned out to be dead. devext+0x17F4 is read exactly
-   -  once in the whole image, in drv_DispatchPnp, and is never written
-   -  anywhere - so it is permanently zero and the veto it gates can never
-   -  fire. devext+0x17F8 is read exactly once, to free it, and is never
-   -  assigned - so it is permanently NULL and that ExFreePool never runs.
-   -  See driver-structures.txt section 7.
+   -  BOTH ARE DEAD. devext+0x17F4 is read exactly once in the whole image,
+      in drv_DispatchPnp, and is never written anywhere - so it is
+      permanently zero and the veto it gates can never fire. devext+0x17F8
+      is read exactly once, to free it, and is never assigned - so it is
+      permanently NULL and that ExFreePool never runs. See
+      driver-structures.txt section 7.
 
    -  The eleven entries marked [I] above, where the name is an inference
       from call sites rather than a full reading of the body.

@@ -101,24 +101,18 @@ Table of Contents
    cross-references Ghidra reports against 00019b40 are PE section-table
    fields at 000100f0 and 000101ec, not code.
 
-   RETRACTED: THERE IS NO SECOND SOURCE FOR THESE BYTES. An earlier revision
-   of this section claimed the installer ships three files, RPD1.bin,
-   RPD2.bin and RPD3.bin, whose contents corroborate the three descriptors.
-   IT DOES NOT. Those files were placed in the install directory by hand
-   during research and are not part of the product. The installer lays down
-   only scripts\, _readme.txt, script.db, unins000.dat, unins000.exe,
-   wishd201.exe and wishna1.inf.
+   THE ONLY SOURCE FOR THESE BYTES IS THE IMAGE. Nothing the product ships
+   contains a second copy to check them against, so the evidence is the
+   bytes themselves, read out of the Ghidra database at the three addresses
+   above. That is what the driver serves, which makes it sound; it is not
+   corroborated by anything independent.
 
-   So the descriptors have ONE source: the bytes in the image, read out of
-   the Ghidra database at the three addresses above. That is sound evidence
-   - it is the data the driver actually serves - but it is not corroborated,
-   and this note said it was.
-
-   What IS an independent check is structural rather than second-source: the
-   185-byte descriptor parses as three balanced top-level collections with
-   report IDs 3, 2 and 1, and the 121- and 64-byte fragments parse on their
-   own as two collections and one. A transcription slip that still parsed
-   would have to be a deliberate one. src_drv/harness.c performs that parse.
+   The check that is available is structural. The 185-byte descriptor
+   parses as three balanced top-level collections carrying report IDs 3, 2
+   and 1, and the 121- and 64-byte fragments parse on their own as two
+   collections and one. A transcription slip that still parsed correctly
+   would have to be a deliberate one. src_drv/harness.c performs that parse
+   alongside the byte comparison.
 
 3.  Descriptor Selection
 
@@ -419,9 +413,9 @@ Table of Contents
    virtual mode is not a fixed test pattern - it makes every adapter report
    a DIFFERENT, known stick position, which is how a user with several
    plugged in can tell which one is which. Control-device function 0x822
-   resolves a device handle from the same number. An earlier revision of
-   this note called the field VirtualStickValue and read it as a
-   calibration constant; see driver-structures.txt.
+   resolves a device handle from the same number. It is an identifier that
+   doubles as a stick position, not a calibration constant - see
+   driver-structures.txt.
 
 6.  Device Identity
 
@@ -464,10 +458,9 @@ Table of Contents
    +---------+----+-----------------------+---------------------------------+
 
    A guard runs before the switch: drv_IsDeviceReady(devext) returning zero
-   completes the IRP with 0xC0000056. CORRECTION: that value was recorded
-   here as STATUS_DEVICE_NOT_CONNECTED. It is STATUS_DELETE_PENDING;
-   STATUS_DEVICE_NOT_CONNECTED is 0xC000009D and a different thing. The
-   value was right and the name was not.
+   completes the IRP with 0xC0000056, STATUS_DELETE_PENDING. Note the
+   value, not the name that sounds right: STATUS_DEVICE_NOT_CONNECTED is
+   0xC000009D and is a different status.
 
    THE GUARD COVERS EVERYTHING, not just the read. A device that is being
    removed refuses even GET_REPORT_DESCRIPTOR, which is correct - the
@@ -512,9 +505,9 @@ Table of Contents
    image for the offset.
 
    So the driver acknowledges hidclass's notification and does nothing with
-   it; hidclass tracks collection state itself. The earlier note that the
-   index order was unconfirmed is moot - the order cannot matter to
-   behaviour when the value is never consulted.
+   it; hidclass tracks collection state itself. THE INDEX ORDER THEREFORE
+   CANNOT MATTER to behaviour, because the value is never consulted - do not
+   spend effort establishing it.
 
    AN OUT-OF-RANGE INDEX SUCCEEDS having done nothing. Both cases bound the
    index to 0..2 and fall through to a success return either way.
@@ -576,8 +569,8 @@ Table of Contents
    cycles the port, which forces the device to re-enumerate.
 
    THE SENTINEL 0xC0012345 IS drv_RecoverPort SAYING IT ALREADY GAVE UP.
-   Earlier revisions of this note recorded its meaning as unestablished. It
-   is not an NTSTATUS at all: drv_RecoverPort resets the port only when the
+   It is NOT AN NTSTATUS, which is why decoding it as one yields nothing:
+   drv_RecoverPort resets the port only when the
    device is still connected but the port has been disabled, and in every
    other case cycles the port ITSELF and returns that value. The worker tests
    for it and stops - both the retry and its own cycle are skipped, because
@@ -645,10 +638,13 @@ Table of Contents
        calls drv_EffectKick, committing the values.
 
    So the mode is NOT left by releasing the combination. It is left by the
-   next button press after releasing it. An earlier revision of this section
-   said the next poll alone would zero it, which is wrong: with everything
-   released, every later poll takes the same branch and the mode stays at 1.
-   Verified by emulation.
+   next button press after releasing it.
+
+   THE OBVIOUS READING IS WRONG AND LOOKS RIGHT. Reading the branch as "the
+   next poll clears it" fits the code until the released case is worked
+   through: with no buttons held, every later poll takes the SAME branch
+   and the mode stays at 1 indefinitely. Only a press reaches the clearing
+   path. Verified by emulation.
 
    WHAT THE MODE DOES TO THE ENGINE. Both branches sit inside
    drv_EffectEvaluate and both bypass the effect set entirely:

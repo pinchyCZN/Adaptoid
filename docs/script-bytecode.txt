@@ -187,11 +187,11 @@ Table of Contents
 
 6.  Opcodes
 
-   The opcode set was first recovered from the compiler by enumerating every
-   caller of cfg_EmitWord and cfg_EmitOpOperand in wishd201.exe. It has since
-   been confirmed against the driver-side interpreter, drv_ScriptExecute at
-   00017b90 in wishk201.sys, which decodes every one of them. The semantics
-   below are read out of that interpreter and are FACT, not inference.
+   The opcode set has two independent sources that agree: every caller of
+   cfg_EmitWord and cfg_EmitOpOperand in wishd201.exe, which is what emits
+   them, and drv_ScriptExecute at 00017b90 in wishk201.sys, which decodes
+   every one of them. The semantics below are read out of that interpreter
+   and are FACT, not inference.
 
    The machine is a stack machine with a register accumulator. Below, "acc"
    is the accumulator and "pop" is the value taken off the operand stack.
@@ -318,12 +318,11 @@ Table of Contents
    | 0xd92 | -     | load local, (index) | (depth << 16)      |
    +-------+-------+------------------------------------------+
 
-   RESOLVED. Earlier revisions of this note could not say which C operator
-   each code in the 0x250..0x267 block meant, because the bison rule numbers
-   could not be mapped back to tokens. The mnemonic table answers it
-   directly, and the answer matches the inference that was recorded: 0x250
-   through 0x259 are the ten operators with a compound-assignment form, and
-   0x260 through 0x267 are the comparison and logical operators.
+   THE MNEMONIC TABLE NAMES EACH OPERATOR DIRECTLY, and is the only thing
+   that does: the bison rule numbers cannot be mapped back to tokens, so the
+   0x250..0x267 block is unreadable without it. 0x250 through 0x259 are the
+   ten operators with a compound-assignment form, and 0x260 through 0x267
+   are the comparison and logical operators.
 
    NEW. 0x191, bail, was not separately identified from the driver, because
    drv_ScriptExecute handles 0x190 and 0x191 in one range test and both
@@ -394,9 +393,8 @@ Table of Contents
    reserved and never finished. A script using them compiles and runs and
    does nothing.
 
-   _debug explains event type 0x4D, which section 7.2 previously recorded as
-   unidentified. It is the script's print statement, delivered to the
-   configurator through IOCTL fn 0x818.
+   _debug is event type 0x4D in section 7.2: the script's print statement,
+   delivered to the configurator through IOCTL fn 0x818.
 
    The stick clamp of +/-1200 is the same logical range the joystick
    collection declares in the HID report descriptor, so a script writes
@@ -426,8 +424,8 @@ Table of Contents
        slot +0x48  on_begin    runs first on any change
        slot +0x4C  on_end      runs last on any change
 
-   This list CONFIRMS the N64 bit order that ioctl-surface.txt section 7
-   could previously only infer from the driver's button map. Bit 8 is named
+   This list is the authority for the N64 bit order; the driver's button map
+   in ioctl-surface.txt section 7 only implies it. Bit 8 is named
    on_lrs, that is L plus R plus Start, the combination the controller itself
    reports as its reset bit, and bit 9 is on_unk. Those are exactly the two
    positions holding filler zeros in the button map.
@@ -562,13 +560,12 @@ Table of Contents
    |      |                   | which.                                |
    +------+-------------------+---------------------------------------+
 
-   TYPE 3 IS ESTABLISHED, and was marked INFERENCE in an earlier revision.
-   Three independent sources agree. The driver clamps both arguments to
-   0..0xFFFF. The shipped script @--Sample Absolute Mouse.ac tracks the
-   pointer in variables declared `static int mx=32768, my=32768`, i.e.
-   centred in that range. And another shipped script computes the argument
-   directly as `x * 65535 / 2400 + 32768`, mapping the +/-1200 stick range
-   onto the full 16-bit span.
+   TYPE 3 IS ESTABLISHED, not inferred. Three independent sources agree. The
+   driver clamps both arguments to 0..0xFFFF. The shipped script @--Sample
+   Absolute Mouse.ac tracks the pointer in variables declared `static int
+   mx=32768, my=32768`, i.e. centred in that range. And another shipped
+   script computes the argument directly as `x * 65535 / 2400 + 32768`,
+   mapping the +/-1200 stick range onto the full 16-bit span.
 
    ONE LIMITATION WORTH CARRYING INTO A REPLACEMENT: a script cannot drive
    the mouse wheel. drv_DispatchEvents calls drv_HidMouseMoveEvent with the
@@ -665,10 +662,11 @@ Table of Contents
        +0x20  StackSize         capacity in words
        +0x24  the stack itself, StackSize words
 
-   The two fields at +0x10 and +0x14 were named Blocked and ArgCount in an
-   earlier revision of the Ghidra database. Both names were wrong:
-   drv_ScriptExecute loads +0x10 into the accumulator and +0x14 into the
-   stack pointer at entry, and writes both back at exit.
+   THE FIELDS AT +0x10 AND +0x14 ARE THE SAVED ACCUMULATOR AND STACK
+   POINTER, not a blocked flag and an argument count - which is what their
+   sizes and position suggest. drv_ScriptExecute loads +0x10 into the
+   accumulator and +0x14 into the stack pointer at entry, and writes both
+   back at exit.
 
    Allocation is max(StackSize, 8) * 4 + 0x24; the clamp to eight words is
    written back over the caller's argument slot, so thread 0, requested with
@@ -859,8 +857,8 @@ Table of Contents
    pushes them, so sp is the same after the call as before and there is
    nothing to clean up.
 
-   THAT ALSO SETTLES HOW A SCRIPT FUNCTION RECEIVES ITS ARGUMENTS, which
-   earlier revisions of this document left open. Opcode 0x181 pushes the
+   THAT ALSO SETTLES HOW A SCRIPT FUNCTION RECEIVES ITS ARGUMENTS.
+   Opcode 0x181 pushes the
    return address at slot sp before jumping, so the callee runs at depth
    sp+1 and its own local 0 is slot sp+1 - the same slot the caller wrote
    argument 1 into. The two are one convention, seen from either side:

@@ -8559,11 +8559,10 @@ static int test_power_and_control(void)
  * docs/hid-descriptor.txt section 4, so this is a conformance check of one
  * against the other and not a copy compared with itself.
  *
- * THAT IS THE ONLY SOURCE FOR THESE BYTES. There is no second copy shipped
- * anywhere to check them against, which is why group 2 parses the result
- * structurally as well - a transcription slip that still parsed as three
- * balanced collections with the right report IDs would have to be a
- * deliberate one.
+ * The image is the only source for these bytes - nothing shipped carries a
+ * second copy - which is why group 2 also parses the result structurally. A
+ * transcription slip that still parsed as three balanced collections with
+ * the right report IDs would have to be a deliberate one.
  * ====================================================================== */
 
 static const u8 HID_DESC_ORIGINAL[185] = {

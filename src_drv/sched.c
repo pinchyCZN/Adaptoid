@@ -519,8 +519,8 @@ static void sched_fault(core_sched *s, core_sched_thread *t, int status)
  * (depth + operand), and never pushes them, so sp is unchanged by the call and
  * the caller does not clean up.
  *
- * That also settles how a SCRIPT function receives arguments, which an earlier
- * pass left open. Opcode 0x181 pushes the return address at slot sp before
+ * That also settles how a SCRIPT function receives arguments.
+ * Opcode 0x181 pushes the return address at slot sp before
  * jumping, so the callee runs at depth sp+1 and its own local 0 is slot sp+1 -
  * the same slot the caller wrote argument 1 into. The two conventions are one
  * convention. A thread created by the input binding starts at depth 0 with its
