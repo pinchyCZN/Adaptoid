@@ -260,7 +260,8 @@ void core_on_raw_packet(core_state *cs, const u8 *raw)
 	for (i = 0; i < CORE_RAW_PACKET_BYTES; i++) {
 		cs->raw[i] = raw[i];
 	}
-	cs->have_raw = 1;
+	cs->have_raw       = 1;
+	cs->report_pending = 1;     /* cleared by IOCTL fn 0x833 */
 
 	/*
 	 * THE PROBE GATES ALL CONTROLLER INPUT. Until it has concluded, no

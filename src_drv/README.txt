@@ -219,8 +219,8 @@ Table of Contents
    | sched.c   |     1069 |    1069 | thread pool, scheduler, input         |
    |           |          |         | binding, native builtins; finished    |
    +-----------+----------+---------+---------------------------------------+
-   | ioctl.c   | not yet  |  ~1200  | the private IOCTL surface, the        |
-   |           |          |         | control device, the notify queue      |
+   | ioctl.c   |      754 |   ~1200 | the private IOCTL surface; the        |
+   |           |          |         | control device and notify queue next  |
    +-----------+----------+---------+---------------------------------------+
    | wdm.c     |      195 |   ~1700 | DriverEntry, AddDevice, PnP, power,   |
    |           |          |         | polling, URB transport, device naming |
@@ -246,8 +246,8 @@ Table of Contents
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 59 of the 146 functions in
-   wishk201.sys are ported, 18603 of 38690 bytes, so 48 percent by code
+   Measured against the Ghidra database: 61 of the 146 functions in
+   wishk201.sys are ported, 21595 of 38690 bytes, so 56 percent by code
    size. The 3109 lines written so far cover those 16331 bytes, which is 5.3
    bytes of original per line of replacement and is the ratio the estimates
    below use.
@@ -260,20 +260,19 @@ Table of Contents
    +--------------------------+-----+-------+----------+-----------+
    | Subsystem                | fns | bytes | ~C lines | Goes to   |
    +==========================+=====+=======+==========+===========+
-   | IOCTL surface            |   9 |  7045 |     1174 | ioctl.c   |
+   | control device           |  10 |  1473 |      245 | ioctl.c   |
+   | notification queue       |   6 |   832 |      138 | ioctl.c   |
    | PnP, start and stop      |  14 |  2577 |      429 | wdm.c     |
    | device naming            |   6 |  1808 |      301 | wdm.c     |
    | HID report IRP plumbing  |   6 |   768 |      128 | wdm.c     |
    | vendor transport         |   8 |  1522 |      253 | wdm.c     |
-   | control device           |  10 |  1473 |      245 | ioctl.c   |
    | interrupt polling        |   5 |  1287 |      214 | wdm.c     |
    | power                    |   7 |  1225 |      204 | wdm.c     |
-   | notification queue       |   6 |   832 |      138 | ioctl.c   |
    | kernel glue              |   8 |   703 |      117 | wdm.c     |
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  87 | 20087 |     3347 |           |
+   | TOTAL REMAINING          |  85 | 17095 |     2849 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
@@ -297,9 +296,9 @@ Table of Contents
 
    Already ported: the raw packet decode, the joystick report, the accessory
    probe, the Controller Pak CRCs, the effect engine and its ring, the raw
-   N64 transaction, the keyboard and mouse report state machines, and the
-   entire script engine - interpreter, scheduler,
-   input binding and builtin library, specified in
+   N64 transaction, the keyboard and mouse report state machines, the
+   eighteen private IOCTL functions, and the entire script engine -
+   interpreter, scheduler, input binding and builtin library, specified in
    ../docs/script-bytecode.txt sections 5, 6 and 9.
 
    Loading the driver is out of scope here. It is unsigned, and x64 Windows

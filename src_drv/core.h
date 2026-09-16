@@ -73,6 +73,9 @@ typedef signed   long long s64;
  * 0x7834BB11. See ../docs/known-defects.txt section 3.
  */
 #define CORE_STICK_SCALE        16    /* raw units to report units      */
+/* The display name, ten bytes at devext+0x334 including the NUL. */
+#define CORE_DEVICE_NAME_BYTES  10
+
 #define CORE_STICK_CLIP_DEFAULT 75    /* range clipping, 0x4B           */
 #define CORE_STICK_STRETCH_DEF  10    /* octagon-to-square corner warp  */
 #define CORE_STICK_LIMIT        1200  /* 0x4B0, full scale on either axis */
@@ -344,6 +347,9 @@ typedef struct core_effect_slot {
 	s32              attack_time;
 	s32              fade_level;
 	s32              fade_time;
+	/* Bytes of axis parameter block the programming IOCTL supplied. Zero
+	 * means the slot is programmed but not startable. */
+	s32              block_length;
 	core_effect_axis axis[CORE_EFFECT_AXES];
 } core_effect_slot;
 
@@ -442,8 +448,14 @@ typedef struct core_state {
 	 * meant to keep them adjustable: stretch 0 disables the corner warp,
 	 * clip 128 restores the raw range.
 	 */
-	u8              stick_clip;
-	u8              stick_stretch;
+	/*
+	 * s32, not u8: IOCTL functions 0x83e and 0x83f get and set these as
+	 * DWORDs and the original stores them as int at devext+0x3ec/0x3f0.
+	 * Narrowing them here would silently truncate a value the
+	 * configurator is entitled to write.
+	 */
+	s32             stick_clip;
+	s32             stick_stretch;
 
 	/* Raw button bit -> HID button, zero based, or CORE_BUTTON_NONE. */
 	u8              button_map[CORE_RAW_BUTTON_BITS];
@@ -500,6 +512,18 @@ typedef struct core_state {
 	s32             tune_mode;
 	u8              prev_raw_x;
 	u8              prev_raw_y;
+
+	/*
+	 * Read out by the private IOCTL surface. report_pending is set when a
+	 * controller packet arrives and cleared by the snapshot call;
+	 * device_name is the display string, ten bytes including its NUL in
+	 * the original; bcd_device is the firmware revision from the USB
+	 * device descriptor.
+	 */
+	int             report_pending;
+	char            device_name[CORE_DEVICE_NAME_BYTES];
+	u16             bcd_device;
+	u32             counter_two;
 
 	/* The accessory probe. */
 	core_vendor_fn  vendor;

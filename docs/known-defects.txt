@@ -7,21 +7,22 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Ten defects have been found during reverse engineering: two arithmetic
-   ones in wishk201.sys, a pair of unbounded string copies also in the
-   driver, a race in wishh201.dll, a bounds check in the script interpreter
-   that tests the wrong value, four in the script engine's native builtin
-   library, and an unbounded receive length on the raw N64 transaction.
-   This note records each one, the exact condition that triggers it, what it
+   Twelve defects have been found during reverse engineering: two
+   arithmetic ones in wishk201.sys, a pair of unbounded string copies also
+   in the driver, a race in wishh201.dll, a bounds check in the script
+   interpreter that tests the wrong value, four in the script engine's
+   native builtin library, and three on the private IOCTL surface. This
+   note records each one, the exact condition that triggers it, what it
    would actually do, and whether a user would be likely to notice. It also
    records claims that were made here and later RETRACTED, in sections 3
    and 7.
 
-   ONE OF THEM, SECTION 13, IS DIFFERENT IN KIND from the rest. Every other
-   entry here is a correctness slip whose worst outcome is wrong behaviour.
-   That one is a memory-safety failure on a path that reaches the driver
-   from an ordinary user-mode request, and a replacement must not reproduce
-   it.
+   TWO OF THEM, SECTIONS 13 AND 14, ARE DIFFERENT IN KIND from the rest.
+   Every other entry here is a correctness slip whose worst outcome is
+   wrong behaviour. Those two are memory-safety failures on paths that
+   reach the driver from an ordinary user-mode request, and section 14 is
+   the more serious of the pair because it WRITES. A replacement must not
+   reproduce either.
 
    The purpose is not to criticise a driver that shipped in 2001 and
    worked. It is to stop a clean-room replacement from faithfully
@@ -36,10 +37,8 @@ Abstract
    simple remapping profile would hit, which is why the software's
    reputation for robustness survives them.
 
-   None of the ten is in the HID report descriptor or the keyboard and
-   mouse report builders. The tenth is reached THROUGH the private IOCTL
-   surface, though the missing check is in the transaction helper rather
-   than in the dispatcher.
+   None of the twelve is in the HID report descriptor or the keyboard and
+   mouse report builders.
 
 Table of Contents
 
@@ -56,7 +55,9 @@ Table of Contents
    11. Defect 9: _wake Leaves The Ready List Unsorted
    12. Defect 10: The Native Argument Frame Is One Word Short
    13. Defect 11: The N64 Transaction Receive Length Is Unbounded
-   14. What Is Not Affected
+   14. Defect 12: The Effect Slot Index Is Signed And Only Bounded Above
+   15. Defect 13: The Script Fault Snapshot Can Leak
+   16. What Is Not Affected
 
 1.  Severity Summary
 
@@ -85,6 +86,11 @@ Table of Contents
        over-reads at depth 200                     hand-built script
        N64 transaction receive   raw N64 IOCTL    yes, reachable
        length unbounded                             from user mode
+       effect slot index is      effect IOCTLs    yes, reachable
+       signed, bounded above                       from user mode
+       only
+       script fault snapshot     script IOCTL     yes, on an exact
+       can leak                                    buffer size
        (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
@@ -614,7 +620,106 @@ Table of Contents
    rather than relying only on the helper. Defence in one place is how this
    happened.
 
-14. What Is Not Affected
+14. Defect 12: The Effect Slot Index Is Signed And Only Bounded Above
+
+   Location:  drv_IoctlDeviceCommand, the fn 0x853 case at 0001320b and the
+              fn 0x855 case at 000132ed
+   Also:      drv_EffectSlotActive (00013e90), which checks nothing at all
+
+   THIS IS THE MORE SERIOUS OF THE TWO MEMORY-SAFETY DEFECTS, because it
+   writes. Defect 11 discloses memory; this one corrupts it.
+
+   Function 0x853 takes a two-byte input, {command, slot}. The slot byte is
+   loaded as a SIGNED char and compared against 32 with a SIGNED branch:
+
+       00013224  MOV   AL, byte ptr [EDI + 0x1]     ; the slot byte
+       00013227  CMP   AL, 0x20
+       00013229  JGE   reject                       ; signed - upper bound only
+       ...
+       0001323a  MOVSX EAX, AL                      ; sign-extended
+       0001323f  SHL   EDX, 0x3
+       00013242  SUB   EDX, EAX                     ; EDX = slot * 7
+       00013244  MOV   ECX, [ESI + EDX*8 + 0x46c]   ; devext + slot*0x38 + ...
+
+   Every byte from 0x80 to 0xFF is negative as a signed char, so every one
+   of them passes a test meant to keep the index inside a 32-entry array.
+   The effective address is devext + slot * 0x38 + field, and with the slot
+   at -128 that is 0x1C00 bytes BEFORE the device extension.
+
+   Trigger:  a device-control request on function 0x853 with a slot byte of
+   0x80 or above. Nothing else is needed - no timing, no particular device
+   state, and the input is two bytes.
+
+   Effect:  three dwords are written at a caller-chosen negative offset.
+   Command 1 writes Running and the two halves of the start timestamp:
+
+       00013256  MOV dword ptr [EAX + 0x44c], 0x1
+       0001327f  MOV dword ptr [ESI + EDI*8 + 0x450], EAX
+       00013286  MOV dword ptr [ESI + EDI*8 + 0x454], EDX
+
+   and is gated on a dword read from that same out-of-bounds region being
+   positive. COMMAND 2 HAS NO GATE AT ALL: it writes a zero dword at the
+   chosen offset unconditionally. The offset moves in 0x38-byte steps over
+   a 0x1C00-byte window, so this is a controlled write into whatever the
+   allocator placed before the device extension.
+
+   Function 0x855 is the same slip on the read side. Its one-byte input is
+   loaded the same way and handed to drv_EffectSlotActive, which indexes
+   EffectSlot[SlotIndex] with no bounds check whatsoever - and which also
+   WRITES Running on its expiry path, so it is not purely a read.
+
+   Would a user notice:  no. The configurator only ever sends slot numbers
+   it chose itself, which are 0 to 31, so nothing misbehaves in normal use.
+
+   In the replacement:  NOT reproduced. core_ioctl_dispatch in
+   src_drv/ioctl.c rejects any slot outside 0..31 on both paths, and
+   core_effect_slot_active bounds-checks its own argument as well rather
+   than trusting its caller - which is precisely the trust that failed
+   here. The harness checks five representative negative bytes against both
+   commands and the query.
+
+15. Defect 13: The Script Fault Snapshot Can Leak
+
+   Location:  drv_IoctlDeviceCommand, the fn 0x83d case at 0001333b
+
+   Draining the post-mortem dump takes BOTH buffers out of the device
+   extension under the script lock - the faulted thread node and a snapshot
+   of the globals - and then copies out as much as the caller's buffer
+   holds. The thread node is freed unconditionally. The snapshot is not:
+
+       uVar14 = OutputLength - uVar16;        ; room left after the thread
+       if (0 < (int)uVar14) {
+           ... copy the globals ...
+           ExFreePool(vars);                  ; INSIDE the branch
+       }
+
+   so when the output buffer is exactly the size of the thread node, or
+   smaller, the snapshot is never released. It has already been cleared
+   from devext+0x1688, so nothing else can ever find it either.
+
+   Trigger:  drain a fault record with an output buffer that leaves no room
+   for the globals. A caller sizing its buffer from the thread node alone
+   does this every time.
+
+   Effect:  one pool allocation of VarCount * 4 bytes leaks per drained
+   fault. Small, but unbounded over a long session with a misbehaving
+   script, and driver pool is never reclaimed until unload.
+
+   There is a second, narrower path: if the thread pointer is null the
+   function returns immediately without looking at the snapshot pointer. In
+   the shipped driver the two are always set together, so this arm is not
+   reachable, but a port that keeps the structure should not rely on that.
+
+   Would a user notice:  not directly. It needs a faulting script and a
+   caller that sizes its buffer tightly, and the symptom is pool usage that
+   does not come back.
+
+   In the replacement:  NOT reproduced. Both buffers are released on every
+   path in ioc_script_fault, including the null-thread one. The harness
+   drains a real fault with an output buffer exactly the size of the thread
+   node and asserts that the allocator got both blocks back.
+
+16. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
@@ -633,7 +738,11 @@ Table of Contents
       assemble reports that match the descriptor byte for byte.
    -  The HID report descriptors themselves and their selection.
    -  The dispatch wrapper triage. The private IOCTL surface itself is
-      NOT clean: function 0x83a reaches defect 11, section 13.
+      NOT clean: function 0x83a reaches defect 11 (section 13), functions
+      0x853 and 0x855 are defect 12 (section 14), and function 0x83d is
+      defect 13 (section 15). Fifteen of its eighteen function codes are
+      sound; the three that are not are all bounds or lifetime slips
+      rather than logic errors.
    -  The Controller Pak CRCs, which are the genuine N64 algorithms.
 
    A user writing complex scripts exercises every item in that list. That

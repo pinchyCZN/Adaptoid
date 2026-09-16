@@ -292,14 +292,47 @@ Table of Contents
    STATUS_INVALID_PARAMETER (0xC000000D). The distinction is useful when
    probing a live device.
 
-   FN 0x83a IS THE ONE ENTRY ON THIS SURFACE WITH A MEMORY-SAFETY DEFECT.
-   Both of its lengths are the caller's InputBufferLength and
-   OutputBufferLength, passed through untouched, and the case tests only
-   that neither is zero. drv_N64Transaction then receives into a 64-byte
-   stack buffer sized for the largest reply the N64 bus produces. A
-   replacement must cap the output length at 63 here, in the dispatcher,
-   as well as in the transaction itself. See known-defects.txt section 13
-   and usb-transport.txt section 4.
+   HOW THE DISPATCH IS BUILT, and why the table above is exactly complete.
+   drv_IoctlDeviceCommand does not compare codes one at a time. It computes
+   an index as IoControlCode + 0x4673df3c, which is the code minus
+   0xB98C20C4 and therefore the offset of the code from function 0x831,
+   rejects anything above 0x90, reads a byte from the table at 00013640 and
+   jumps through the twenty-entry table at 000135f0. Reading those two
+   tables settles the surface without reading the switch.
+
+   FUNCTION 0x831 HAS AN INDEX-TABLE ENTRY AND IS STILL NOT HANDLED. Its
+   entry selects case 0, and the case-0 slot of the jump table holds
+   000135ce - the same address as the default. So it answers
+   STATUS_NOT_SUPPORTED exactly as an unrecognised code does. It is listed
+   here only because its presence in the table invites the opposite
+   conclusion. Every other index in the range selects either a real case or
+   the default, and the eighteen that select real cases are exactly the
+   eighteen codes drv_IoctlViaHidHandle accepts.
+
+   THREE OF THE EIGHTEEN HAVE DEFECTS, and all three are bounds or lifetime
+   slips rather than logic errors.
+
+   +-------+-------------------------------------+----------------------+
+   | fn    | What is wrong                       | Where                |
+   +=======+=====================================+======================+
+   | 0x83a | both lengths are the caller's,      | known-defects.txt    |
+   |       | passed through untouched, and the   | section 13;          |
+   |       | receive buffer is 64 bytes of stack | usb-transport.txt 4  |
+   +-------+-------------------------------------+----------------------+
+   | 0x853 | the slot byte is a SIGNED char and  | known-defects.txt    |
+   | 0x855 | is bounded only above, so a         | section 14           |
+   |       | negative index writes before the    |                      |
+   |       | device extension                    |                      |
+   +-------+-------------------------------------+----------------------+
+   | 0x83d | the globals snapshot is freed only  | known-defects.txt    |
+   |       | when the output buffer had room for | section 15           |
+   |       | it, and is unreachable afterwards   |                      |
+   +-------+-------------------------------------+----------------------+
+
+   A replacement must bound the receive length at 63 for 0x83a and reject a
+   slot outside 0..31 for 0x853 and 0x855 IN THE DISPATCHER, not only in the
+   helpers it calls. Relying on the helper is how 0x83a came to have no
+   check at all.
 
    0x83c guards on the state word at devext+0x1640 and returns
    STATUS_DEVICE_BUSY (0x80000011) if a script load is already in

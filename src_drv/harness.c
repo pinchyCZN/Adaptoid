@@ -18,6 +18,7 @@
 #include "wdm.h"
 #include "script.h"
 #include "sched.h"
+#include "ioctl.h"
 
 /* ------------------------------------------------------------------ */
 /* Output                                                              */
@@ -3778,6 +3779,675 @@ static int test_hid_reports(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the private IOCTL surface                                           */
+/* ------------------------------------------------------------------ */
+
+/* Little-endian dword access, so the tests read the buffers the way the
+ * configurator lays them out rather than by struct punning. */
+static void wr32_test(u8 *p, u32 v)
+{
+	p[0] = (u8)(v & 0xFFu);
+	p[1] = (u8)((v >> 8) & 0xFFu);
+	p[2] = (u8)((v >> 16) & 0xFFu);
+	p[3] = (u8)((v >> 24) & 0xFFu);
+}
+
+static u32 rd32_test(const u8 *p)
+{
+	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) |
+	       ((u32)p[3] << 24);
+}
+
+static int g_ioc_enable_calls;
+static int g_ioc_enable_last;
+static u32 g_ioc_vendor_ret;
+static int g_ioc_vendor_calls;
+static u32 g_ioc_vendor_len;
+
+static void ioc_enable_stub(void *ctx, int on)
+{
+	(void)ctx;
+	g_ioc_enable_calls++;
+	g_ioc_enable_last = on;
+}
+
+static u32 ioc_vendor_stub(void *ctx, const u8 *setup, u8 *data, u32 len)
+{
+	(void)ctx;
+	(void)setup;
+	(void)data;
+	g_ioc_vendor_calls++;
+	g_ioc_vendor_len = len;
+	return g_ioc_vendor_ret;
+}
+
+/* One request, with the buffers the harness owns. */
+static u8 g_ioc_in[256];
+static u8 g_ioc_out[256];
+
+static u32 ioc_call(core_ioctl_env *env, u32 fn, u32 in_len, u32 out_len,
+                    u32 *info)
+{
+	core_ioctl r;
+
+	r.code    = CORE_IOCTL_CODE(fn);
+	r.in      = g_ioc_in;
+	r.in_len  = in_len;
+	r.out     = g_ioc_out;
+	r.out_len = out_len;
+	return core_ioctl_dispatch(env, &r, info);
+}
+
+static int test_ioctl(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_state cs;
+	core_sched sch;
+	core_ioctl_env env;
+	u32 st, info;
+	int i;
+
+	/* Every group starts from a clean device. */
+#define IOC_OPEN()                                                        \
+	do {                                                                  \
+		core_init(&cs, 0, 0);                                             \
+		core_set_vendor_sync(&cs, n64_sync);                              \
+		core_sched_init(&sch, sched_test_alloc, sched_test_free, 0);      \
+		env.cs         = &cs;                                             \
+		env.sched      = &sch;                                            \
+		env.vendor     = ioc_vendor_stub;                                 \
+		env.vendor_ctx = 0;                                               \
+		env.enable     = ioc_enable_stub;                                 \
+		env.enable_ctx = 0;                                               \
+		env.now_100ns  = 0;                                               \
+		n64_reset_log();                                                  \
+		for (i = 0; i < 256; i++) { g_ioc_in[i] = 0; g_ioc_out[i] = 0; }  \
+	} while (0)
+
+	/* ---- 1. unknown codes versus wrong lengths --------------------- */
+	{
+		IOC_OPEN();
+
+		/* function 0x831 has an index-table entry but shares the default
+		 * target, so it is NOT handled */
+		sched_expect(ioc_call(&env, 0x831, 0, 0, &info) ==
+		             CORE_ST_NOT_SUPPORTED, "fn 0x831 is not handled",
+		             1, 1, &bad);
+		sched_expect(ioc_call(&env, 0x838, 0, 0, &info) ==
+		             CORE_ST_NOT_SUPPORTED, "fn 0x838 gap", 1, 1, &bad);
+		sched_expect(ioc_call(&env, 0x83B, 0, 0, &info) ==
+		             CORE_ST_NOT_SUPPORTED, "fn 0x83b gap", 1, 1, &bad);
+		sched_expect(ioc_call(&env, 0x999, 0, 0, &info) ==
+		             CORE_ST_NOT_SUPPORTED, "an unrelated code", 1, 1,
+		             &bad);
+		/* a HANDLED code with wrong lengths is a different answer */
+		sched_expect(ioc_call(&env, CORE_IOC_STATUS_SNAP, 0, 5, &info) ==
+		             CORE_ST_INVALID_PARAM, "wrong length is not the same",
+		             1, 1, &bad);
+		/* and a foreign device type is not ours at all */
+		{
+			core_ioctl r;
+
+			r.code = 0x12340000u | (CORE_IOC_STATUS_SNAP << 2);
+			r.in = g_ioc_in; r.in_len = 0;
+			r.out = g_ioc_out; r.out_len = 6;
+			sched_expect(core_ioctl_dispatch(&env, &r, &info) ==
+			             CORE_ST_NOT_SUPPORTED, "foreign device type",
+			             1, 1, &bad);
+		}
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 2. the status snapshot clears its flag -------------------- */
+	{
+		static const u8 RAW[] = {0x11, 0x22, CORE_STATUS_VALID, 0x44, 0x55};
+
+		IOC_OPEN();
+		cs.accessory_state = CORE_ACC_FOUND_1;
+		core_on_raw_packet(&cs, RAW);
+
+		st = ioc_call(&env, CORE_IOC_STATUS_SNAP, 0, 6, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "snapshot succeeds", (long)st,
+		             0, &bad);
+		sched_expect(info == 6, "six bytes", (long)info, 6, &bad);
+		sched_expect(g_ioc_out[0] == 1, "pending flag was set",
+		             g_ioc_out[0], 1, &bad);
+		sched_expect(g_ioc_out[1] == 0x11 && g_ioc_out[5] == 0x55,
+		             "carrying the raw packet", g_ioc_out[1], 0x11, &bad);
+
+		ioc_call(&env, CORE_IOC_STATUS_SNAP, 0, 6, &info);
+		sched_expect(g_ioc_out[0] == 0, "reading it cleared the flag",
+		             g_ioc_out[0], 0, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 3. the device name, and a buffer too small ---------------- */
+	{
+		IOC_OPEN();
+		cs.device_name[0] = 'A';
+		cs.device_name[1] = 'd';
+		cs.device_name[2] = 'a';
+		cs.device_name[3] = 0;
+
+		st = ioc_call(&env, CORE_IOC_DEVICE_NAME, 0, 16, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "name read succeeds", (long)st,
+		             0, &bad);
+		sched_expect(info == 4, "three characters and the NUL", (long)info,
+		             4, &bad);
+		sched_expect(g_ioc_out[0] == 'A' && g_ioc_out[3] == 0, "contents",
+		             g_ioc_out[0], 'A', &bad);
+
+		/* a short buffer fills what it can and reports that much */
+		ioc_call(&env, CORE_IOC_DEVICE_NAME, 0, 2, &info);
+		sched_expect(info == 2, "a short buffer is filled, not overrun",
+		             (long)info, 2, &bad);
+
+		sched_expect(ioc_call(&env, CORE_IOC_DEVICE_NAME, 0, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "a zero buffer is rejected",
+		             1, 1, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 4. the four counters, read and zero ----------------------- */
+	{
+		IOC_OPEN();
+		cs.bcd_device      = 0x0123;
+		cs.counter_two     = 4444;
+		cs.reports_emitted = 77;
+		cs.accessory_state = CORE_ACC_FOUND_2;
+
+		wr32_test(g_ioc_in, CORE_COUNTER_FIRMWARE);
+		ioc_call(&env, CORE_IOC_READ_COUNTER, 4, 4, &info);
+		sched_expect(rd32_test(g_ioc_out) == 0x0123, "selector 1, bcdDevice",
+		             (long)rd32_test(g_ioc_out), 0x0123, &bad);
+
+		wr32_test(g_ioc_in, CORE_COUNTER_TWO);
+		ioc_call(&env, CORE_IOC_READ_COUNTER, 4, 4, &info);
+		sched_expect(rd32_test(g_ioc_out) == 4444, "selector 2",
+		             (long)rd32_test(g_ioc_out), 4444, &bad);
+
+		wr32_test(g_ioc_in, CORE_COUNTER_REPORTS);
+		ioc_call(&env, CORE_IOC_READ_COUNTER, 4, 4, &info);
+		sched_expect(rd32_test(g_ioc_out) == 77, "selector 3",
+		             (long)rd32_test(g_ioc_out), 77, &bad);
+
+		wr32_test(g_ioc_in, CORE_COUNTER_PROBE);
+		ioc_call(&env, CORE_IOC_READ_COUNTER, 4, 4, &info);
+		sched_expect(rd32_test(g_ioc_out) == CORE_ACC_FOUND_2, "selector 4",
+		             (long)rd32_test(g_ioc_out), CORE_ACC_FOUND_2, &bad);
+
+		wr32_test(g_ioc_in, 0);
+		sched_expect(ioc_call(&env, CORE_IOC_READ_COUNTER, 4, 4, &info) ==
+		             CORE_ST_INVALID_PARAM, "selector 0 rejected", 1, 1,
+		             &bad);
+		wr32_test(g_ioc_in, 5);
+		sched_expect(ioc_call(&env, CORE_IOC_READ_COUNTER, 4, 4, &info) ==
+		             CORE_ST_INVALID_PARAM, "selector 5 rejected", 1, 1,
+		             &bad);
+
+		/* only 2 and 3 are writable */
+		wr32_test(g_ioc_in, CORE_COUNTER_TWO);
+		ioc_call(&env, CORE_IOC_ZERO_COUNTER, 4, 0, &info);
+		sched_expect(cs.counter_two == 0, "selector 2 zeroed",
+		             (long)cs.counter_two, 0, &bad);
+		wr32_test(g_ioc_in, CORE_COUNTER_REPORTS);
+		ioc_call(&env, CORE_IOC_ZERO_COUNTER, 4, 0, &info);
+		sched_expect(cs.reports_emitted == 0, "selector 3 zeroed",
+		             (long)cs.reports_emitted, 0, &bad);
+		wr32_test(g_ioc_in, CORE_COUNTER_FIRMWARE);
+		st = ioc_call(&env, CORE_IOC_ZERO_COUNTER, 4, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && cs.bcd_device == 0x0123,
+		             "selector 1 accepted but does nothing",
+		             cs.bcd_device, 0x0123, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 5. the two get/set tunables ------------------------------- */
+	{
+		IOC_OPEN();
+
+		/* read only */
+		st = ioc_call(&env, CORE_IOC_STICK_CLIP, 0, 4, &info);
+		sched_expect(st == CORE_ST_SUCCESS &&
+		             rd32_test(g_ioc_out) == CORE_STICK_CLIP_DEFAULT,
+		             "clip reads its default",
+		             (long)rd32_test(g_ioc_out), CORE_STICK_CLIP_DEFAULT,
+		             &bad);
+
+		/* set and read in one call: the OLD value comes back */
+		wr32_test(g_ioc_in, 100);
+		ioc_call(&env, CORE_IOC_STICK_CLIP, 4, 4, &info);
+		sched_expect(rd32_test(g_ioc_out) == CORE_STICK_CLIP_DEFAULT,
+		             "set-and-get returns the old value",
+		             (long)rd32_test(g_ioc_out), CORE_STICK_CLIP_DEFAULT,
+		             &bad);
+		sched_expect(cs.stick_clip == 100, "and stores the new one",
+		             cs.stick_clip, 100, &bad);
+
+		/* write only */
+		wr32_test(g_ioc_in, 33);
+		st = ioc_call(&env, CORE_IOC_STICK_STRETCH, 4, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && cs.stick_stretch == 33,
+		             "stretch write only", cs.stick_stretch, 33, &bad);
+		sched_expect(info == 0, "and reports nothing back", (long)info, 0,
+		             &bad);
+
+		/* a value that would not survive a byte, proving the widening */
+		wr32_test(g_ioc_in, 0x1234);
+		ioc_call(&env, CORE_IOC_STICK_CLIP, 4, 0, &info);
+		sched_expect(cs.stick_clip == 0x1234, "values above 255 survive",
+		             cs.stick_clip, 0x1234, &bad);
+
+		sched_expect(ioc_call(&env, CORE_IOC_STICK_CLIP, 2, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "a 2-byte input is rejected",
+		             1, 1, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 6. the enable toggle -------------------------------------- */
+	{
+		IOC_OPEN();
+		g_ioc_enable_calls = 0;
+
+		wr32_test(g_ioc_in, 0);
+		ioc_call(&env, CORE_IOC_SET_ENABLE, 4, 0, &info);
+		sched_expect(g_ioc_enable_last == 0, "zero turns it off",
+		             g_ioc_enable_last, 0, &bad);
+		wr32_test(g_ioc_in, 7);
+		ioc_call(&env, CORE_IOC_SET_ENABLE, 4, 0, &info);
+		sched_expect(g_ioc_enable_last == 1, "any non-zero turns it on",
+		             g_ioc_enable_last, 1, &bad);
+		sched_expect(g_ioc_enable_calls == 2, "twice", g_ioc_enable_calls,
+		             2, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 7. DEFECT 11: the N64 passthrough receive bound ------------ */
+	{
+		static const u8 REPLY[] = {0x03, 0x02, 0x00, 0x05};
+
+		IOC_OPEN();
+		n64_set_reply(REPLY, 4);
+		g_ioc_in[0] = CORE_N64_CMD_INFO;
+
+		st = ioc_call(&env, CORE_IOC_N64_PASSTHRU, 1, 3, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "a normal transaction runs",
+		             (long)st, 0, &bad);
+		sched_expect(info == 3, "three bytes back", (long)info, 3, &bad);
+
+		/* the bound: 63 is the largest reply the original's buffer held */
+		n64_reset_log();
+		st = ioc_call(&env, CORE_IOC_N64_PASSTHRU, 1, CORE_N64_RX_MAX,
+		              &info);
+		sched_expect(st == CORE_ST_SUCCESS, "63 is allowed", (long)st, 0,
+		             &bad);
+		n64_reset_log();
+		st = ioc_call(&env, CORE_IOC_N64_PASSTHRU, 1, CORE_N64_RX_MAX + 1,
+		              &info);
+		sched_expect(st == CORE_ST_INVALID_PARAM, "64 is refused HERE",
+		             (long)st, CORE_ST_INVALID_PARAM, &bad);
+		sched_expect(g_n64count == 0, "before any transfer is attempted",
+		             g_n64count, 0, &bad);
+		n64_reset_log();
+		st = ioc_call(&env, CORE_IOC_N64_PASSTHRU, 1, 200, &info);
+		sched_expect(st == CORE_ST_INVALID_PARAM, "and so is 200",
+		             (long)st, CORE_ST_INVALID_PARAM, &bad);
+
+		sched_expect(ioc_call(&env, CORE_IOC_N64_PASSTHRU, 0, 3, &info) ==
+		             CORE_ST_INVALID_PARAM, "a zero input is rejected", 1,
+		             1, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 8. DEFECT 14: the signed effect slot index ----------------- */
+	{
+		IOC_OPEN();
+		cs.effect[0].block_length = 8;
+
+		/* the valid range works */
+		g_ioc_in[0] = CORE_EFFECT_CMD_START;
+		g_ioc_in[1] = 0;
+		st = ioc_call(&env, CORE_IOC_EFFECT_CTRL, 2, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && cs.effect[0].running == 1,
+		             "slot 0 starts", cs.effect[0].running, 1, &bad);
+
+		g_ioc_in[0] = CORE_EFFECT_CMD_STOP;
+		g_ioc_in[1] = 31;
+		sched_expect(ioc_call(&env, CORE_IOC_EFFECT_CTRL, 2, 0, &info) ==
+		             CORE_ST_SUCCESS, "slot 31 is in range", 1, 1, &bad);
+
+		/* 32 and above were already rejected by the original */
+		g_ioc_in[1] = 32;
+		sched_expect(ioc_call(&env, CORE_IOC_EFFECT_CTRL, 2, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "slot 32 is rejected", 1, 1,
+		             &bad);
+
+		/*
+		 * These are the bytes the original accepts: read as a signed
+		 * char, every one of them is negative and passes its
+		 * upper-bound-only test.
+		 */
+		{
+			static const u8 NEG[] = {0x80, 0xC0, 0xFF, 0xF0, 0xE0};
+			int k;
+			int rejected = 0;
+
+			for (k = 0; k < 5; k++) {
+				g_ioc_in[0] = CORE_EFFECT_CMD_STOP;
+				g_ioc_in[1] = NEG[k];
+				if (ioc_call(&env, CORE_IOC_EFFECT_CTRL, 2, 0, &info) ==
+				    CORE_ST_INVALID_PARAM) {
+					rejected++;
+				}
+				g_ioc_in[0] = CORE_EFFECT_CMD_START;
+				if (ioc_call(&env, CORE_IOC_EFFECT_CTRL, 2, 0, &info) ==
+				    CORE_ST_INVALID_PARAM) {
+					rejected++;
+				}
+			}
+			sched_expect(rejected == 10,
+			             "all ten negative slot calls refused", rejected,
+			             10, &bad);
+		}
+
+		/* the query path takes the same index and must refuse it too */
+		g_ioc_in[0] = 0xFF;
+		sched_expect(ioc_call(&env, CORE_IOC_EFFECT_QUERY, 1, 1, &info) ==
+		             CORE_ST_INVALID_PARAM, "and the query path too", 1, 1,
+		             &bad);
+		g_ioc_in[0] = 0;
+		sched_expect(ioc_call(&env, CORE_IOC_EFFECT_QUERY, 1, 1, &info) ==
+		             CORE_ST_SUCCESS, "while slot 0 is answered", 1, 1,
+		             &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 9. stop-all, and programming a slot ----------------------- */
+	{
+		IOC_OPEN();
+
+		for (i = 0; i < CORE_EFFECT_SLOTS; i++) {
+			cs.effect[i].running = 1;
+		}
+		g_ioc_in[0] = CORE_EFFECT_CMD_STOP_ALL;
+		g_ioc_in[1] = 0;
+		ioc_call(&env, CORE_IOC_EFFECT_CTRL, 2, 0, &info);
+		{
+			int any = 0;
+
+			for (i = 0; i < CORE_EFFECT_SLOTS; i++) {
+				if (cs.effect[i].running) {
+					any = 1;
+				}
+			}
+			sched_expect(!any, "stop-all clears all 32", any, 0, &bad);
+		}
+
+		/* program slot 3: header, then one 8-byte axis stream */
+		wr32_test(g_ioc_in + 0x00, 3u | (0x01u << 16) | (0x55u << 24));
+		wr32_test(g_ioc_in + 0x04, 1000);   /* duration     */
+		wr32_test(g_ioc_in + 0x08, 11);     /* attack level */
+		wr32_test(g_ioc_in + 0x0C, 22);     /* attack time  */
+		wr32_test(g_ioc_in + 0x10, 33);     /* fade level   */
+		wr32_test(g_ioc_in + 0x14, 44);     /* fade time    */
+		wr32_test(g_ioc_in + 0x18, 8);      /* block length */
+		for (i = 0; i < 8; i++) {
+			g_ioc_in[0x1C + i] = (u8)(0x60 + i);
+		}
+		st = ioc_call(&env, CORE_IOC_EFFECT_PROG, 0x1C + 8, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "programming succeeds",
+		             (long)st, 0, &bad);
+		sched_expect(cs.effect[3].type == 0x55, "type from the top byte",
+		             (long)cs.effect[3].type, 0x55, &bad);
+		sched_expect(cs.effect[3].duration == 1000, "duration at +4",
+		             cs.effect[3].duration, 1000, &bad);
+		sched_expect(cs.effect[3].attack_level == 11, "attack level at +8",
+		             cs.effect[3].attack_level, 11, &bad);
+		sched_expect(cs.effect[3].attack_time == 22, "attack time at +0C",
+		             cs.effect[3].attack_time, 22, &bad);
+		sched_expect(cs.effect[3].fade_level == 33, "fade level at +10",
+		             cs.effect[3].fade_level, 33, &bad);
+		sched_expect(cs.effect[3].fade_time == 44, "fade time at +14",
+		             cs.effect[3].fade_time, 44, &bad);
+		sched_expect(cs.effect[3].block_length == 8, "block length at +18",
+		             cs.effect[3].block_length, 8, &bad);
+		sched_expect(cs.effect[3].axis[0].periodic.magnitude == 0x60,
+		             "the stream landed on axis 0",
+		             cs.effect[3].axis[0].periodic.magnitude, 0x60, &bad);
+		sched_expect(cs.effect[3].running == 1, "and the slot started",
+		             cs.effect[3].running, 1, &bad);
+
+		/* a truncated payload is rejected on length */
+		sched_expect(ioc_call(&env, CORE_IOC_EFFECT_PROG, 0x1C + 4, 0,
+		                      &info) == CORE_ST_INVALID_PARAM,
+		             "a short payload is rejected", 1, 1, &bad);
+		/* and so is an out-of-range slot */
+		wr32_test(g_ioc_in + 0x00, 32u);
+		wr32_test(g_ioc_in + 0x18, 0);
+		sched_expect(ioc_call(&env, CORE_IOC_EFFECT_PROG, 0x1C, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "slot 32 is rejected", 1, 1,
+		             &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 10. the Controller Pak paths, and their CRC answers -------- */
+	{
+		u8 reply[CORE_PAK_BLOCK_BYTES + 2];
+
+		IOC_OPEN();
+		/* a good read: 32 data bytes then the CRC the device computed */
+		reply[0] = 0x21;                        /* the length byte */
+		for (i = 0; i < CORE_PAK_BLOCK_BYTES; i++) {
+			reply[1 + i] = (u8)(0xA0 + i);
+		}
+		{
+			/* the transaction reverses, so lay the payload out backwards */
+			u8 fwd[CORE_PAK_BLOCK_BYTES + 1];
+			u8 crc;
+
+			for (i = 0; i < CORE_PAK_BLOCK_BYTES; i++) {
+				fwd[i] = (u8)(0xA0 + i);
+			}
+			crc = core_pak_data_crc8(fwd, CORE_PAK_BLOCK_BYTES);
+			fwd[CORE_PAK_BLOCK_BYTES] = crc;
+			reply[0] = 0x21;
+			for (i = 0; i < CORE_PAK_BLOCK_BYTES + 1; i++) {
+				reply[1 + i] = fwd[CORE_PAK_BLOCK_BYTES - i];
+			}
+			n64_set_reply(reply, CORE_PAK_BLOCK_BYTES + 2);
+		}
+		wr32_test(g_ioc_in, 0x40);
+		st = ioc_call(&env, CORE_IOC_PAK_READ, 4, 32, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "a good block read succeeds",
+		             (long)st, 0, &bad);
+		sched_expect(info == 32, "32 bytes", (long)info, 32, &bad);
+		sched_expect(g_ioc_out[0] == 0xA0 && g_ioc_out[31] == 0xBF,
+		             "with the right contents", g_ioc_out[0], 0xA0, &bad);
+
+		/* corrupt the CRC byte -> CRC error */
+		n64_reset_log();
+		reply[1] = (u8)(reply[1] ^ 0x01);
+		n64_set_reply(reply, CORE_PAK_BLOCK_BYTES + 2);
+		st = ioc_call(&env, CORE_IOC_PAK_READ, 4, 32, &info);
+		sched_expect(st == CORE_ST_CRC_ERROR, "a bad CRC is reported",
+		             (long)st, CORE_ST_CRC_ERROR, &bad);
+
+		sched_expect(ioc_call(&env, CORE_IOC_PAK_READ, 4, 31, &info) ==
+		             CORE_ST_INVALID_PARAM, "a 31-byte buffer is rejected",
+		             1, 1, &bad);
+		sched_expect(ioc_call(&env, CORE_IOC_PAK_WRITE, 0x23, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "a 0x23 write is rejected", 1,
+		             1, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 11. script load, and the fault drain ---------------------- */
+	{
+		IOC_OPEN();
+
+		/* in_len must equal code_count * 4 + 8 exactly */
+		wr32_test(g_ioc_in + 0, 1);           /* code_count */
+		wr32_test(g_ioc_in + 4, 4);           /* var_count  */
+		wr32_test(g_ioc_in + 8, 0x082);       /* ret        */
+		st = ioc_call(&env, CORE_IOC_SCRIPT_LOAD, 12, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "a one-word script loads",
+		             (long)st, 0, &bad);
+		sched_expect(sch.vm.code_count == 1, "and is installed",
+		             sch.vm.code_count, 1, &bad);
+
+		sched_expect(ioc_call(&env, CORE_IOC_SCRIPT_LOAD, 13, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "a length that disagrees is "
+		             "rejected", 1, 1, &bad);
+		sched_expect(ioc_call(&env, CORE_IOC_SCRIPT_LOAD, 4, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "and one too short to hold a "
+		             "header", 1, 1, &bad);
+
+		/* a count that would overflow the multiply must not match */
+		wr32_test(g_ioc_in + 0, 0x40000001u);
+		sched_expect(ioc_call(&env, CORE_IOC_SCRIPT_LOAD, 12, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "an overflowing count is "
+		             "rejected", 1, 1, &bad);
+
+		/* code_count 0 is the unload */
+		wr32_test(g_ioc_in + 0, 0);
+		wr32_test(g_ioc_in + 4, 4);
+		st = ioc_call(&env, CORE_IOC_SCRIPT_LOAD, 8, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && sch.vm.code == 0,
+		             "count 0 unloads", sch.vm.code != 0, 0, &bad);
+
+		/* the fault drain with nothing to drain */
+		st = ioc_call(&env, CORE_IOC_SCRIPT_FAULT, 0, 64, &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 0,
+		             "an empty fault slot reports nothing", (long)info, 0,
+		             &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 12. the fault drain releases both blocks ------------------- */
+	{
+		static const u32 LOOP[] = {0x170, 0xFFFFFFFEu};
+		int live_before;
+
+		IOC_OPEN();
+		g_sched_live = 0;
+		core_sched_set_native(&sch, core_sched_native, &sch);
+		core_sched_load(&sch, LOOP, 2, 4, 0);   /* runs out of budget */
+
+		sched_expect(sch.fault_thread != 0, "a thread faulted",
+		             sch.fault_thread != 0, 1, &bad);
+		live_before = g_sched_live;
+
+		/*
+		 * An output buffer exactly the size of the thread node leaves no
+		 * room for the globals. The original frees the snapshot only
+		 * inside the branch that copies it, so this is the shape that
+		 * leaks; both must come back here.
+		 */
+		st = ioc_call(&env, CORE_IOC_SCRIPT_FAULT, 0,
+		              (u32)(sizeof(core_sched_thread) +
+		                    (u32)sch.fault_thread->stack_size * 4u), &info);
+		sched_expect(st == CORE_ST_SUCCESS, "the drain succeeds", (long)st,
+		             0, &bad);
+		sched_expect(sch.fault_thread == 0, "the slot is emptied",
+		             sch.fault_thread != 0, 0, &bad);
+		sched_expect(g_sched_live == live_before - 2,
+		             "BOTH blocks were released",
+		             live_before - g_sched_live, 2, &bad);
+		core_sched_unload(&sch);
+		sched_expect(g_sched_live == 0, "all memory returned",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 13. the raw vendor passthrough buffer split ---------------- */
+	{
+		IOC_OPEN();
+		g_ioc_vendor_ret   = CORE_ST_SUCCESS;
+		g_ioc_vendor_calls = 0;
+
+		/* IN: six-byte setup with the direction bit, data to the output */
+		g_ioc_in[0] = 0xC0;
+		st = ioc_call(&env, CORE_IOC_RAW_VENDOR, 6, 8, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "an IN transfer is accepted",
+		             (long)st, 0, &bad);
+		sched_expect(g_ioc_vendor_len == 8, "data length is the output",
+		             (long)g_ioc_vendor_len, 8, &bad);
+
+		/* OUT: data follows the setup packet in the input buffer */
+		g_ioc_in[0] = 0x40;
+		st = ioc_call(&env, CORE_IOC_RAW_VENDOR, 6 + 5, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "an OUT transfer is accepted",
+		             (long)st, 0, &bad);
+		sched_expect(g_ioc_vendor_len == 5, "data length is the tail",
+		             (long)g_ioc_vendor_len, 5, &bad);
+
+		/* no data stage */
+		st = ioc_call(&env, CORE_IOC_RAW_VENDOR, 6, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && g_ioc_vendor_len == 0,
+		             "a setup-only transfer is accepted",
+		             (long)g_ioc_vendor_len, 0, &bad);
+
+		/* mismatched direction and buffers are rejected */
+		g_ioc_in[0] = 0xC0;
+		sched_expect(ioc_call(&env, CORE_IOC_RAW_VENDOR, 6 + 5, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "IN with input data is "
+		             "rejected", 1, 1, &bad);
+		g_ioc_in[0] = 0x40;
+		sched_expect(ioc_call(&env, CORE_IOC_RAW_VENDOR, 6, 8, &info) ==
+		             CORE_ST_INVALID_PARAM, "OUT with an output buffer is "
+		             "rejected", 1, 1, &bad);
+		sched_expect(ioc_call(&env, CORE_IOC_RAW_VENDOR, 5, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "a short setup is rejected",
+		             1, 1, &bad);
+
+		/* the seam can answer PENDING, and only this case can */
+		g_ioc_vendor_ret = CORE_ST_PENDING;
+		g_ioc_in[0] = 0xC0;
+		sched_expect(ioc_call(&env, CORE_IOC_RAW_VENDOR, 6, 8, &info) ==
+		             CORE_ST_PENDING, "and PENDING is passed through", 1,
+		             1, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+	/* ---- 14. the accept-and-ignore case ---------------------------- */
+	{
+		IOC_OPEN();
+		sched_expect(ioc_call(&env, CORE_IOC_ACCEPT_NOP, 0, 0, &info) ==
+		             CORE_ST_SUCCESS, "an empty request is accepted", 1, 1,
+		             &bad);
+		sched_expect(ioc_call(&env, CORE_IOC_ACCEPT_NOP, 0x200, 0, &info) ==
+		             CORE_ST_SUCCESS, "0x200 bytes are accepted", 1, 1,
+		             &bad);
+		sched_expect(ioc_call(&env, CORE_IOC_ACCEPT_NOP, 0x201, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "0x201 is not", 1, 1, &bad);
+		sched_expect(ioc_call(&env, CORE_IOC_ACCEPT_NOP, 0, 4, &info) ==
+		             CORE_ST_INVALID_PARAM, "nor is an output buffer", 1,
+		             1, &bad);
+		core_sched_unload(&sch);
+		groups++;
+	}
+
+#undef IOC_OPEN
+
+	hlog("Private IOCTL surface  : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -3856,6 +4526,7 @@ int main(int argc, char **argv)
 	bad += test_natives();
 	bad += test_n64_transaction();
 	bad += test_hid_reports();
+	bad += test_ioctl();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);
