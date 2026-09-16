@@ -1591,10 +1591,11 @@ void core_hid_mouse_move(core_state *cs, s32 dx, s32 dy, s32 wheel)
  * immediately.
  *
  * VIRTUAL MODE replaces the controller entirely: real reports are dropped,
- * and a NULL submit synthesises one from virtual_stick, which drv_AddDevice
+ * and a NULL submit synthesises one from instance_id, which drv_AddDevice
  * sets once and nothing ever changes. The synthesised report is X = 1 with
- * Y = virtual_stick and no buttons, so it is a fixed deflection - a
- * diagnostic, not an input source.
+ * Y = instance_id and no buttons - so each adapter parks its stick at its
+ * own identity number, which is what makes this a diagnostic rather than an
+ * input source. See core.h on instance_id.
  */
 void core_submit_joystick(core_state *cs, const u8 *report)
 {
@@ -1624,8 +1625,8 @@ void core_submit_joystick(core_state *cs, const u8 *report)
 			return;         /* virtual mode ignores the controller */
 		}
 		payload[0] = 1;
-		payload[1] = (u8)((u32)cs->virtual_stick << 4);
-		payload[2] = (u8)(cs->virtual_stick >> 4);
+		payload[1] = (u8)((u32)cs->instance_id << 4);
+		payload[2] = (u8)(cs->instance_id >> 4);
 		payload[3] = 0;
 		payload[4] = 0;
 	}

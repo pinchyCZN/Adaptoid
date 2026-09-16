@@ -219,13 +219,13 @@ Table of Contents
    | sched.c   |     1069 |    1069 | thread pool, scheduler, input         |
    |           |          |         | binding, native builtins; finished    |
    +-----------+----------+---------+---------------------------------------+
-   | ioctl.c   |      754 |   ~1200 | the private IOCTL surface; the        |
-   |           |          |         | control device and notify queue next  |
+   | ioctl.c   |     1303 |    1303 | both IOCTL surfaces, the registry and |
+   |           |          |         | the notify queue; finished            |
    +-----------+----------+---------+---------------------------------------+
    | wdm.c     |      195 |   ~1700 | DriverEntry, AddDevice, PnP, power,   |
    |           |          |         | polling, URB transport, device naming |
    +-----------+----------+---------+---------------------------------------+
-   | harness.c |     3168 |   ~4000 | main() and every test                 |
+   | harness.c |     5171 |   ~5600 | main() and every test                 |
    +-----------+----------+---------+---------------------------------------+
 
    THE BUILTINS WENT INTO sched.c, NOT script.c as first planned. Eleven of
@@ -235,19 +235,34 @@ Table of Contents
    the cost of one file being larger than estimated. The file SET is what
    this section fixes, and that has not changed.
 
-   WHY ioctl.c IS A FILE AND NOT PART OF wdm.c. It is not a size split. The
-   IOCTL surface owns a DIFFERENT DEVICE OBJECT: drv_CreateControlDevice
-   makes a singleton control device with its own extension, its own Create,
-   Close, Cleanup and ReadWrite handlers, its own symbolic link and its own
-   IRP queues, none of which the per-device HID minidriver path in wdm.c
-   touches. It is also the entire contract with wishd201.exe, specified in
-   one document, ../docs/ioctl-surface.txt. One surface, one document, one
-   file.
+   WHY ioctl.c IS A FILE AND NOT PART OF wdm.c. It is not a size split. It
+   holds BOTH dispatchers - the per-device surface and the control device's -
+   plus the device registry the second one enumerates and the user-mode
+   notification queue. That is the entire contract with wishd201.exe,
+   specified in one document, ../docs/ioctl-surface.txt. One surface, one
+   document, one file.
+
+   IT ALSO TURNED OUT TO BE OS-FREE, which the plan did not assume. Every
+   case on both surfaces is a length check and a small action on device
+   state; an IRP is decoded into a core_ioctl by the caller and what comes
+   back is a status and a byte count. Only four things needed seams: the raw
+   vendor passthrough, the enable toggle, and the claim and deliver steps of
+   the notification queue - the last two because whether a parked request is
+   still ours is a cancellation question and therefore the OS's to answer.
+   That is why the whole surface, including its four defects, is exercised
+   in the harness.
+
+   WHAT WENT TO wdm.c INSTEAD. The control DEVICE OBJECT - IoCreateDevice,
+   the symbolic link, the open count, the Create/Close/Cleanup/ReadWrite
+   handlers, the IRP cancel routines and the request routing in
+   drv_IoctlViaHidHandle - is device-object plumbing and lives with the
+   other device-object work. The registry those handles name is here; the
+   objects they name are there.
 
 6.1.  What Is Left
 
-   Measured against the Ghidra database: 61 of the 146 functions in
-   wishk201.sys are ported, 21595 of 38690 bytes, so 56 percent by code
+   Measured against the Ghidra database: 64 of the 146 functions in
+   wishk201.sys are ported, 23532 of 38690 bytes, so 61 percent by code
    size. The 3109 lines written so far cover those 16331 bytes, which is 5.3
    bytes of original per line of replacement and is the ratio the estimates
    below use.
@@ -260,8 +275,7 @@ Table of Contents
    +--------------------------+-----+-------+----------+-----------+
    | Subsystem                | fns | bytes | ~C lines | Goes to   |
    +==========================+=====+=======+==========+===========+
-   | control device           |  10 |  1473 |      245 | ioctl.c   |
-   | notification queue       |   6 |   832 |      138 | ioctl.c   |
+   | IOCTL and CDO plumbing   |  21 |  4565 |      759 | wdm.c     |
    | PnP, start and stop      |  14 |  2577 |      429 | wdm.c     |
    | device naming            |   6 |  1808 |      301 | wdm.c     |
    | HID report IRP plumbing  |   6 |   768 |      128 | wdm.c     |
@@ -272,7 +286,7 @@ Table of Contents
    | USB port recovery        |   6 |   639 |      106 | wdm.c     |
    | 64-bit division helpers  |   2 |   208 |       34 | not ported|
    +--------------------------+-----+-------+----------+-----------+
-   | TOTAL REMAINING          |  85 | 17095 |     2849 |           |
+   | TOTAL REMAINING          |  82 | 15158 |     2526 |           |
    +--------------------------+-----+-------+----------+-----------+
 
    Two notes on reading that table. drv_IoctlDeviceCommand alone is 2864 of
@@ -297,7 +311,8 @@ Table of Contents
    Already ported: the raw packet decode, the joystick report, the accessory
    probe, the Controller Pak CRCs, the effect engine and its ring, the raw
    N64 transaction, the keyboard and mouse report state machines, the
-   eighteen private IOCTL functions, and the entire script engine -
+   eighteen private IOCTL functions, the eleven control-device functions
+   with their registry and notification queue, and the entire script engine -
    interpreter, scheduler, input binding and builtin library, specified in
    ../docs/script-bytecode.txt sections 5, 6 and 9.
 

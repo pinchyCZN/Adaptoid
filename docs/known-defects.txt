@@ -7,11 +7,12 @@ wishk201.sys                                                 2001 driver
 
 Abstract
 
-   Twelve defects have been found during reverse engineering: two
+   Thirteen defects have been found during reverse engineering: two
    arithmetic ones in wishk201.sys, a pair of unbounded string copies also
    in the driver, a race in wishh201.dll, a bounds check in the script
    interpreter that tests the wrong value, four in the script engine's
-   native builtin library, and three on the private IOCTL surface. This
+   native builtin library, three on the private IOCTL surface, and a remove
+   lock that one error path never releases. This
    note records each one, the exact condition that triggers it, what it
    would actually do, and whether a user would be likely to notice. It also
    records claims that were made here and later RETRACTED, in sections 3
@@ -37,7 +38,7 @@ Abstract
    simple remapping profile would hit, which is why the software's
    reputation for robustness survives them.
 
-   None of the twelve is in the HID report descriptor or the keyboard and
+   None of the thirteen is in the HID report descriptor or the keyboard and
    mouse report builders.
 
 Table of Contents
@@ -57,7 +58,8 @@ Table of Contents
    13. Defect 11: The N64 Transaction Receive Length Is Unbounded
    14. Defect 12: The Effect Slot Index Is Signed And Only Bounded Above
    15. Defect 13: The Script Fault Snapshot Can Leak
-   16. What Is Not Affected
+   16. Defect 14: A Remove Lock Is Not Released On One Path
+   17. What Is Not Affected
 
 1.  Severity Summary
 
@@ -91,6 +93,9 @@ Table of Contents
        only
        script fault snapshot     script IOCTL     yes, on an exact
        can leak                                    buffer size
+       remove lock leaked when   control device   no, a narrow
+       the control device is                       teardown race
+       already gone
        (script state latch)       script engine    RETRACTED, see 7
 
 2.  Defect 1: Button Map Filler Entries
@@ -719,7 +724,63 @@ Table of Contents
    drains a real fault with an output buffer exactly the size of the thread
    node and asserts that the allocator got both blocks back.
 
-16. What Is Not Affected
+16. Defect 14: A Remove Lock Is Not Released On One Path
+
+   Location:  drv_AcquireControlDeviceExt (000105a7)
+
+   The function takes the calling device's remove lock and then returns the
+   control device's extension:
+
+       if (drv_LockAcquire(&DevExt->RemoveLockA, ...) < 0) return NULL;
+       if (drv_g_ControlDeviceObject == 0)                 return NULL;
+       return ControlDeviceObject->DeviceExtension;
+
+   The two NULL returns are not alike. The first happens before the lock is
+   taken and is correct. THE SECOND HAPPENS AFTER, and drops the reference
+   on the floor.
+
+   Its name says it acquires, and both callers pair it with
+   drv_ReleaseControlDeviceExt only when the result is non-null:
+
+       CdoExt = drv_AcquireControlDeviceExt(DevExt);
+       if (CdoExt == NULL) { ...give up...; }          /* no release */
+       ... ; drv_ReleaseControlDeviceExt(DevExt);
+
+   so on the second path the lock is never released. There are exactly two
+   callers, drv_QueueUserNotification and drv_DisableDeviceInterface, and
+   both have that shape.
+
+   Trigger:  posting a user-mode notification, or disabling a device
+   interface, at a moment when drv_g_ControlDeviceObject is null. That
+   global is cleared by drv_DeleteControlSymlink, which runs BEFORE
+   drv_DeleteControlDevice, so the window opens as soon as the control
+   device begins tearing down.
+
+   How narrow is it:  narrow. The control device is torn down only when the
+   last handle to it closes AND drv_g_ControlDeviceRefCount is zero, and
+   that refcount is meant to be non-zero while any adapter exists. It needs
+   an adapter to be removing itself concurrently with the last control
+   handle closing - which is exactly what unplugging the adapter while the
+   configurator exits looks like.
+
+   Effect:  a remove lock that never returns to zero. The device can then
+   never complete removal: drv_LockReleaseAndWait waits for a count that
+   will not arrive, so the removal IRP blocks indefinitely. The symptom is
+   a device stuck in removal, not a crash.
+
+   Would a user notice:  only as a device that will not go away, and only
+   after an unlucky ordering. It is recorded because the consequence is
+   disproportionate to how small the slip is, and because a port that keeps
+   the same helper shape inherits it silently.
+
+   In the replacement:  the shape is avoided rather than patched. Nothing in
+   src_drv/ioctl.c couples acquiring a reference to looking something up -
+   the registry and the notification queue are plain data structures, and
+   whatever the OS layer needs to hold across a call it acquires and
+   releases on its own path. A helper that sometimes acquires and sometimes
+   does not, distinguished only by its return value, is the defect.
+
+17. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original

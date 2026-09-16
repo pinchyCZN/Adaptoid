@@ -159,9 +159,23 @@ Table of Contents
    +========+==========================+==============================+==========================================+
    | 0x3EC  | StickRangeClip           | int                          | default 0x4B; SDK escape 0x7834BB10      |
    | 0x3F0  | StickCornerStretch       | int                          | default 10; SDK escape 0x7834BB11        |
-   | 0x3F8  | VirtualStickValue        | int                          | synthetic stick for virtual mode         |
+   | 0x3F8  | DeviceInstanceId         | int                          | 50..1149; doubles as the virtual stick   |
    | 0x400  | VirtualDeviceMode        | int                          | reports synthesised, not polled          |
    | 0x404  | LastHidReport            | byte[5]                      | replayed on a NULL submit                |
+
+   DEVICE INSTANCE ID, +0x3F8, IS AN IDENTIFIER AND NOT A CALIBRATION VALUE.
+   An earlier revision recorded it as VirtualStickValue, a synthetic stick
+   position. drv_AddDevice assigns it at 00012582 as
+
+       (InterlockedIncrement(counter) % 1100) + 50
+
+   giving each adapter a number in 50..1149, and two things read it back:
+   drv_SubmitJoystickReport reports it as the Y axis in virtual mode, and
+   control-device function 0x822 resolves a device handle from it. Both
+   readings are right. The range is chosen to sit inside the +/-1200 stick
+   range precisely so that the identity IS a legal stick coordinate - so
+   virtual mode parks every adapter's stick at its own identity, which is
+   what makes it a usable diagnostic rather than a constant.
    | 0x16F0 | LastRawReport            | byte[5]                      | the five raw controller bytes            |
    | 0x16F5 | PrevStatusByte           | byte                         | edge detection on the Pak bits           |
    | 0x16F8 | ReportPending            | int                          | IOCTL fn 0x833 reads and clears          |

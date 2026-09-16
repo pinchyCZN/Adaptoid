@@ -553,13 +553,27 @@ typedef struct core_state {
 
 	/*
 	 * Virtual joystick mode. When on, joystick reports are synthesised
-	 * from virtual_stick instead of coming from the controller, and real
-	 * reports are dropped. reports_enabled selects it; in the original
-	 * that is a driver-wide global written only by the control device's
-	 * IOCTL surface, so the OS layer mirrors it into each device.
+	 * instead of coming from the controller, and real reports are dropped.
+	 * reports_enabled selects it; in the original that is a driver-wide
+	 * global written only by the control device's IOCTL surface, so the OS
+	 * layer mirrors it into each device.
 	 */
 	s32             virtual_mode;
-	s32             virtual_stick;
+
+	/*
+	 * THE DEVICE INSTANCE NUMBER, and the synthetic stick position, which
+	 * are the same field. drv_AddDevice assigns it as
+	 *
+	 *     (InterlockedIncrement(counter) % 1100) + 50
+	 *
+	 * so it is a per-adapter number in 50..1149 - deliberately inside the
+	 * +/-1200 stick range, because virtual mode reports it as the Y axis.
+	 * Each adapter therefore parks its stick at its own identity, and
+	 * control-device function 0x822 resolves a handle from the same value.
+	 * An earlier reading called this VirtualStickValue and treated it as a
+	 * calibration constant; it is an identifier that doubles as one.
+	 */
+	s32             instance_id;
 	int             reports_enabled;
 	u8              last_report[CORE_JOY_REPORT_BYTES];
 

@@ -752,3 +752,552 @@ u32 core_ioctl_dispatch(core_ioctl_env *env, const core_ioctl *req, u32 *info)
 		return CORE_ST_NOT_SUPPORTED;
 	}
 }
+
+/* ------------------------------------------------------------------ */
+/* the notification queue                                              */
+/* ------------------------------------------------------------------ */
+
+static void nw_init(core_notify_waiter *head)
+{
+	head->flink = head;
+	head->blink = head;
+}
+
+static int nw_empty(const core_notify_waiter *head)
+{
+	return head->flink == head;
+}
+
+static void nw_append(core_notify_waiter *head, core_notify_waiter *w)
+{
+	w->flink          = head;
+	w->blink          = head->blink;
+	head->blink->flink = w;
+	head->blink        = w;
+}
+
+static void nw_unlink(core_notify_waiter *w)
+{
+	w->blink->flink = w->flink;
+	w->flink->blink = w->blink;
+	w->flink = 0;
+	w->blink = 0;
+}
+
+void core_notify_init(core_notify *n, core_notify_claim_fn claim,
+                      core_notify_deliver_fn deliver,
+                      core_notify_abort_fn abort, void *ctx)
+{
+	s32 i;
+
+	if (n == 0) {
+		return;
+	}
+	for (i = 0; i < CORE_NOTIFY_MAX; i++) {
+		n->events[i].type = 0;
+		n->events[i].arg1 = 0;
+		n->events[i].arg2 = 0;
+	}
+	n->head    = 0;
+	n->count   = 0;
+	n->dropped = 0;
+	nw_init(&n->waiters);
+	n->waiter_count = 0;
+	n->delivering   = 0;
+	n->claim   = claim;
+	n->deliver = deliver;
+	n->abort   = abort;
+	n->ctx     = ctx;
+}
+
+/*
+ * Hand events to waiters, one for one, until either runs out.
+ *
+ * A waiter the owner will not claim has been cancelled underneath us; it is
+ * dropped WITHOUT consuming its event, because the canceller completes it and
+ * the event is still owed to somebody.
+ */
+static void notify_pump(core_notify *n)
+{
+	while (n->count > 0 && !nw_empty(&n->waiters)) {
+		core_notify_waiter *w = n->waiters.flink;
+		core_sched_event e;
+
+		nw_unlink(w);
+		n->waiter_count--;
+
+		if (n->claim != 0 && !n->claim(n->ctx, w)) {
+			continue;       /* cancellation won; the event stays */
+		}
+
+		e = n->events[n->head];
+		n->head = (n->head + 1) % CORE_NOTIFY_MAX;
+		n->count--;
+		if (n->deliver != 0) {
+			n->deliver(n->ctx, w, e.type, e.arg1, e.arg2);
+		}
+	}
+	n->delivering = 0;
+}
+
+void core_notify_post(core_notify *n, u32 type, u32 arg1, u32 arg2)
+{
+	s32 slot;
+
+	if (n == 0) {
+		return;
+	}
+	if (n->count >= CORE_NOTIFY_MAX) {
+		/* Full: drop the OLDEST. A listener that stopped reading loses
+		 * history rather than stalling the driver. */
+		n->head = (n->head + 1) % CORE_NOTIFY_MAX;
+		n->count--;
+		n->dropped++;
+	}
+	slot = (n->head + n->count) % CORE_NOTIFY_MAX;
+	n->events[slot].type = type;
+	n->events[slot].arg1 = arg1;
+	n->events[slot].arg2 = arg2;
+	n->count++;
+
+	if (!nw_empty(&n->waiters) && !n->delivering) {
+		n->delivering = 1;
+		notify_pump(n);
+	}
+}
+
+int core_notify_wait(core_notify *n, core_notify_waiter *w)
+{
+	s32 before;
+
+	if (n == 0 || w == 0) {
+		return 0;
+	}
+	nw_append(&n->waiters, w);
+	n->waiter_count++;
+
+	if (n->count > 0 && !n->delivering) {
+		before = n->count;
+		n->delivering = 1;
+		notify_pump(n);
+		return n->count < before;
+	}
+	return 0;
+}
+
+int core_notify_cancel(core_notify *n, core_notify_waiter *w)
+{
+	if (n == 0 || w == 0 || w->flink == 0) {
+		return 0;           /* delivery already took it off the list */
+	}
+	nw_unlink(w);
+	n->waiter_count--;
+	return 1;
+}
+
+void core_notify_flush(core_notify *n)
+{
+	if (n == 0) {
+		return;
+	}
+	while (!nw_empty(&n->waiters)) {
+		core_notify_waiter *w = n->waiters.flink;
+
+		nw_unlink(w);
+		n->waiter_count--;
+		if (n->claim != 0 && !n->claim(n->ctx, w)) {
+			continue;
+		}
+		if (n->abort != 0) {
+			n->abort(n->ctx, w);
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* the device registry                                                 */
+/* ------------------------------------------------------------------ */
+
+/* The button map the original ships, mirrored here so a fresh registry
+ * hands out the same mapping core_init does. */
+static const u8 CTL_BUTTON_MAP_DEFAULT[CORE_RAW_BUTTON_BITS] = {
+	0, 3, 9, 8, 10, 11, 12, 13,
+	CORE_BUTTON_NONE, CORE_BUTTON_NONE, 6, 7, 5, 1, 4, 2
+};
+
+void core_registry_init(core_registry *reg)
+{
+	s32 i;
+
+	if (reg == 0) {
+		return;
+	}
+	reg->devices.flink = &reg->devices;
+	reg->devices.blink = &reg->devices;
+	reg->count           = 0;
+	reg->live_count      = 0;
+	reg->generation      = 0;
+	reg->reports_enabled = 0;
+	for (i = 0; i < CORE_RAW_BUTTON_BITS; i++) {
+		reg->button_map[i] = CTL_BUTTON_MAP_DEFAULT[i];
+	}
+	core_notify_init(&reg->notify, 0, 0, 0, 0);
+}
+
+void core_registry_add(core_registry *reg, core_device_entry *dev)
+{
+	if (reg == 0 || dev == 0) {
+		return;
+	}
+	dev->flink = &reg->devices;
+	dev->blink = reg->devices.blink;
+	reg->devices.blink->flink = dev;
+	reg->devices.blink        = dev;
+	reg->count++;
+}
+
+void core_registry_remove(core_registry *reg, core_device_entry *dev)
+{
+	if (reg == 0 || dev == 0 || dev->flink == 0) {
+		return;
+	}
+	if (dev->live) {
+		core_registry_set_live(reg, dev, 0);
+	}
+	dev->blink->flink = dev->flink;
+	dev->flink->blink = dev->blink;
+	dev->flink = 0;
+	dev->blink = 0;
+	reg->count--;
+}
+
+void core_registry_set_live(core_registry *reg, core_device_entry *dev,
+                            int live)
+{
+	if (reg == 0 || dev == 0 || (!dev->live) == (!live)) {
+		return;
+	}
+	dev->live = live ? 1 : 0;
+	reg->generation++;
+	reg->live_count += live ? 1 : -1;
+
+	/*
+	 * ONE EVENT FOR BOTH DIRECTIONS. Arrival and departure post the same
+	 * type 99, so a listener must re-enumerate to learn which happened.
+	 * That was corrected once already in the Ghidra notes and is worth
+	 * restating: the event is "the interface state changed", not
+	 * "a device arrived".
+	 */
+	core_notify_post(&reg->notify, CORE_EVENT_INTERFACE, 0, dev->handle);
+
+	/* The last adapter leaving releases everyone parked on a notification;
+	 * there will never be another event to serve them. */
+	if (!live && reg->live_count == 0) {
+		core_notify_flush(&reg->notify);
+	}
+}
+
+static core_device_entry *registry_find(core_registry *reg, u32 handle)
+{
+	core_device_entry *d;
+
+	for (d = reg->devices.flink; d != &reg->devices; d = d->flink) {
+		if (d->handle == handle) {
+			return d;
+		}
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* the control-device dispatcher                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Get and set the driver-wide button map, function 0x817.
+ *
+ * NO LENGTH VALIDATION AT ALL, which is unusual on this surface and is
+ * reproduced: both loops simply stop at the shorter of the caller's buffer
+ * and sixteen entries. So a zero-length call is legal and does nothing.
+ *
+ * The OLD map is snapshotted before the new one is applied, so a single call
+ * that both sets and gets returns what was there before - the same
+ * convention as the two stick tunables on the per-device surface.
+ *
+ * Only values below 14 are accepted; anything else leaves that entry alone.
+ * Fourteen is the number of HID buttons the joystick collection declares,
+ * and the map holds them zero-based.
+ */
+static u32 ctl_button_map(core_registry *reg, const core_ioctl *r, u32 *info)
+{
+	u8  old[CORE_RAW_BUTTON_BITS];
+	u32 i;
+	core_device_entry *d;
+
+	for (i = 0; i < CORE_RAW_BUTTON_BITS; i++) {
+		old[i] = reg->button_map[i];
+	}
+	for (i = 0; i < r->in_len && i < CORE_RAW_BUTTON_BITS; i++) {
+		if (r->in[i] < 14u) {
+			reg->button_map[i] = r->in[i];
+		}
+	}
+	/* Push the driver-wide map down to every adapter's own copy. */
+	for (d = reg->devices.flink; d != &reg->devices; d = d->flink) {
+		if (d->cs == 0) {
+			continue;
+		}
+		for (i = 0; i < CORE_RAW_BUTTON_BITS; i++) {
+			d->cs->button_map[i] = reg->button_map[i];
+		}
+	}
+	for (i = 0; i < r->out_len && i < CORE_RAW_BUTTON_BITS; i++) {
+		r->out[i] = old[i];
+	}
+	*info = i;
+	return CORE_ST_SUCCESS;
+}
+
+/*
+ * The virtual-joystick switch, function 0x816.
+ *
+ * Sets the driver-wide flag, then marks every adapter and resubmits a NULL
+ * joystick report to each one in turn. That resubmit is the only thing that
+ * re-evaluates the mode - see hid-descriptor.txt section 5.2 - so without
+ * this sweep the switch would not take effect until the next idle report.
+ */
+static u32 ctl_set_reports(core_registry *reg, const core_ioctl *r, u32 *info)
+{
+	core_device_entry *d;
+
+	if (r->in_len != 4 || r->out_len != 0) {
+		return CORE_ST_INVALID_PARAM;
+	}
+	reg->reports_enabled = (rd32(r->in) != 0);
+
+	for (d = reg->devices.flink; d != &reg->devices; d = d->flink) {
+		d->needs_resubmit = 1;
+	}
+	for (;;) {
+		core_device_entry *hit = 0;
+
+		for (d = reg->devices.flink; d != &reg->devices; d = d->flink) {
+			if (d->needs_resubmit) {
+				hit = d;
+				break;
+			}
+		}
+		if (hit == 0) {
+			break;
+		}
+		hit->needs_resubmit = 0;
+		if (hit->cs != 0) {
+			hit->cs->reports_enabled = reg->reports_enabled;
+			core_submit_joystick(hit->cs, 0);
+		}
+	}
+	*info = 0;
+	return CORE_ST_SUCCESS;
+}
+
+/*
+ * Walk the registry, function 0x821. Input is the previous handle or zero to
+ * start; output is the next live adapter's handle and the live count.
+ *
+ * A previous handle that is not in the list is CORE_ST_NO_SUCH_DEVICE, which
+ * is how a caller learns its enumeration went stale mid-walk.
+ */
+static u32 ctl_enum_devices(core_registry *reg, const core_ioctl *r, u32 *info)
+{
+	core_device_entry *d;
+	u32 prev;
+	int seeking;
+
+	if (r->in_len != 4 || r->out_len != 8) {
+		return CORE_ST_INVALID_PARAM;
+	}
+	prev    = rd32(r->in);
+	seeking = (prev != 0);
+
+	wr32(r->out, 0);
+	wr32(r->out + 4, (u32)reg->live_count);
+
+	for (d = reg->devices.flink; d != &reg->devices; d = d->flink) {
+		if (seeking) {
+			if (d->handle == prev) {
+				seeking = 0;
+			}
+			continue;
+		}
+		if (d->live) {
+			wr32(r->out, d->handle);
+			break;
+		}
+	}
+	if (seeking) {
+		return CORE_ST_NO_SUCH_DEVICE;  /* the previous handle is gone */
+	}
+	*info = 8;
+	return CORE_ST_SUCCESS;
+}
+
+u32 core_ctl_dispatch(core_registry *reg, const core_ioctl *req,
+                      core_notify_waiter *waiter, u64 now_100ns, u32 *info)
+{
+	u32 scratch = 0;
+	u32 fn;
+
+	if (info == 0) {
+		info = &scratch;
+	}
+	*info = 0;
+	if (reg == 0 || req == 0) {
+		return CORE_ST_INVALID_PARAM;
+	}
+	if ((req->code & 0xFFFF0000u) != CORE_IOCTL_DEVICE_TYPE) {
+		return CORE_ST_NOT_SUPPORTED;
+	}
+	fn = CORE_IOCTL_FN(req->code);
+
+	switch (fn) {
+	case CORE_CTL_DEVICE_COUNT:
+		if (req->in_len != 0 || req->out_len != 1) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		/* A single byte, so more than 255 adapters would wrap. The list
+		 * itself is unbounded; this is the original's own narrowing. */
+		req->out[0] = (u8)reg->live_count;
+		*info = 1;
+		return CORE_ST_SUCCESS;
+
+	case CORE_CTL_RESERVED_802:
+	case CORE_CTL_RESERVED_803:
+		/* Accepted, reports 0x40 bytes, does nothing whatsoever. Both
+		 * codes share one handler. */
+		if (req->in_len != 0x40 || req->out_len != 0x40) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		*info = 0x40;
+		return CORE_ST_SUCCESS;
+
+	case CORE_CTL_VERSION:
+		if (req->in_len != 0 || req->out_len < CORE_CTL_VERSION_BYTES) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		req->out[0] = 2;
+		req->out[1] = 1;
+		req->out[2] = 0;
+		req->out[3] = 0;
+		*info = CORE_CTL_VERSION_BYTES;
+		return CORE_ST_SUCCESS;
+
+	case CORE_CTL_GENERATION:
+		if (req->in_len != 0 || req->out_len != 4) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		wr32(req->out, reg->generation);
+		*info = 4;
+		return CORE_ST_SUCCESS;
+
+	case CORE_CTL_UNIMPLEMENTED:
+		/*
+		 * VALIDATED AND THEN REFUSED. The lengths must be 0 or 4 either
+		 * way, and a request that passes gets CORE_ST_NOT_SUPPORTED
+		 * anyway. Reproduced because the two answers are distinguishable
+		 * and a caller probing the surface can tell this code apart from
+		 * one that was never assigned.
+		 */
+		if ((req->in_len != 0 && req->in_len != 4) ||
+		    (req->out_len != 0 && req->out_len != 4)) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		return CORE_ST_NOT_SUPPORTED;
+
+	case CORE_CTL_SET_REPORTS:
+		return ctl_set_reports(reg, req, info);
+
+	case CORE_CTL_BUTTON_MAP:
+		return ctl_button_map(reg, req, info);
+
+	case CORE_CTL_WAIT_NOTIFY:
+		if (req->in_len != 0 || req->out_len != CORE_NOTIFY_BYTES) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		/* With no adapter present there will never be an event, so the
+		 * request is refused rather than parked forever. */
+		if (reg->live_count == 0) {
+			return CORE_ST_DELETE_PENDING;
+		}
+		if (waiter == 0) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		if (core_notify_wait(&reg->notify, waiter)) {
+			*info = CORE_NOTIFY_BYTES;
+			return CORE_ST_SUCCESS;     /* served immediately */
+		}
+		return CORE_ST_PENDING;
+
+	case CORE_CTL_ENUM_DEVICES:
+		return ctl_enum_devices(reg, req, info);
+
+	case CORE_CTL_LOOKUP_DEVICE: {
+		core_device_entry *d;
+		u32 id;
+
+		if (req->in_len != 4 || req->out_len != 4) {
+			return CORE_ST_INVALID_PARAM;
+		}
+		id = rd32(req->in);
+		for (d = reg->devices.flink; d != &reg->devices; d = d->flink) {
+			/* Resolved by the device INSTANCE NUMBER, the same value
+			 * virtual mode reports as the stick position. */
+			if (d->cs != 0 && (u32)d->cs->instance_id == id) {
+				wr32(req->out, d->handle);
+				*info = 4;
+				return CORE_ST_SUCCESS;
+			}
+		}
+		return CORE_ST_NO_SUCH_DEVICE;
+	}
+
+	default:
+		break;
+	}
+
+	/*
+	 * Anything else that is a per-device code is FORWARDED. The first four
+	 * input bytes are the adapter handle; the rest is that surface's input.
+	 *
+	 * NOTE THE BUFFERS OVERLAP. The forwarded input starts four bytes into
+	 * the same buffer the output is written to from offset zero, because
+	 * METHOD_BUFFERED gives one allocation for both. That is safe only
+	 * because every case reads all of its input before writing any output,
+	 * which is a property the per-device dispatcher has to keep.
+	 */
+	if (req->in_len < 4) {
+		return CORE_ST_INVALID_PARAM;
+	}
+	{
+		core_device_entry *d = registry_find(reg, rd32(req->in));
+		core_ioctl fwd;
+		core_ioctl_env env;
+
+		if (d == 0 || !d->live) {
+			return CORE_ST_NO_SUCH_DEVICE;
+		}
+		fwd.code    = req->code;
+		fwd.in      = req->in + 4;
+		fwd.in_len  = req->in_len - 4;
+		fwd.out     = req->out;
+		fwd.out_len = req->out_len;
+
+		env.cs         = d->cs;
+		env.sched      = d->sched;
+		env.vendor     = 0;
+		env.vendor_ctx = 0;
+		env.enable     = 0;
+		env.enable_ctx = 0;
+		env.now_100ns  = now_100ns;
+		return core_ioctl_dispatch(&env, &fwd, info);
+	}
+}

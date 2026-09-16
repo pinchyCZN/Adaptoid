@@ -3731,7 +3731,7 @@ static int test_hid_reports(void)
 
 		/* turning the switch on does not take effect until a NULL submit */
 		cs.reports_enabled = 1;
-		cs.virtual_stick   = 0x123;
+		cs.instance_id     = 0x123;
 		core_submit_joystick(&cs, R1);
 		sched_expect(g_hidlog[2].data[0] == 0x11,
 		             "the switch is not read on a real submit",
@@ -4448,6 +4448,563 @@ static int test_ioctl(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the control device and the notification queue                       */
+/* ------------------------------------------------------------------ */
+
+#define CTLLOG 256
+
+static struct {
+	void *req;
+	u32   type, a1, a2;
+} g_ctl_delivered[CTLLOG];
+static int g_ctl_delcount;
+static int g_ctl_abortcount;
+
+/* Which waiters the owner will refuse to hand over, standing in for a
+ * request that cancellation already claimed. */
+static void *g_ctl_unclaimable;
+
+static int ctl_claim(void *ctx, core_notify_waiter *w)
+{
+	(void)ctx;
+	return w->request != g_ctl_unclaimable;
+}
+
+static void ctl_deliver(void *ctx, core_notify_waiter *w, u32 t, u32 a1,
+                        u32 a2)
+{
+	(void)ctx;
+	if (g_ctl_delcount < CTLLOG) {
+		g_ctl_delivered[g_ctl_delcount].req  = w->request;
+		g_ctl_delivered[g_ctl_delcount].type = t;
+		g_ctl_delivered[g_ctl_delcount].a1   = a1;
+		g_ctl_delivered[g_ctl_delcount].a2   = a2;
+	}
+	g_ctl_delcount++;
+}
+
+static void ctl_abort(void *ctx, core_notify_waiter *w)
+{
+	(void)ctx;
+	(void)w;
+	g_ctl_abortcount++;
+}
+
+static void ctl_reset_log(void)
+{
+	g_ctl_delcount    = 0;
+	g_ctl_abortcount  = 0;
+	g_ctl_unclaimable = 0;
+}
+
+static u32 ctl_call(core_registry *reg, u32 fn, u32 in_len, u32 out_len,
+                    core_notify_waiter *w, u32 *info)
+{
+	core_ioctl r;
+
+	r.code    = CORE_IOCTL_CODE(fn);
+	r.in      = g_ioc_in;
+	r.in_len  = in_len;
+	r.out     = g_ioc_out;
+	r.out_len = out_len;
+	return core_ctl_dispatch(reg, &r, w, 0, info);
+}
+
+static int test_control_device(void)
+{
+	int bad    = 0;
+	int groups = 0;
+	core_registry reg;
+	core_notify_waiter w[8];
+	u32 st, info;
+	int i;
+
+	/* ---- 1. the queue delivers FIFO, one event per waiter ---------- */
+	{
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+
+		/* events with no waiter simply queue */
+		for (i = 0; i < 3; i++) {
+			core_notify_post(&reg.notify, CORE_EVENT_DEBUG, (u32)i, 0);
+		}
+		sched_expect(reg.notify.count == 3, "three events queued",
+		             reg.notify.count, 3, &bad);
+		sched_expect(g_ctl_delcount == 0, "and nothing delivered",
+		             g_ctl_delcount, 0, &bad);
+
+		/* each waiter takes exactly one, oldest first */
+		for (i = 0; i < 2; i++) {
+			w[i].request = &w[i];
+			core_notify_wait(&reg.notify, &w[i]);
+		}
+		sched_expect(g_ctl_delcount == 2, "two waiters, two deliveries",
+		             g_ctl_delcount, 2, &bad);
+		sched_expect(g_ctl_delivered[0].a1 == 0 &&
+		             g_ctl_delivered[1].a1 == 1, "in arrival order",
+		             (long)g_ctl_delivered[0].a1, 0, &bad);
+		sched_expect(reg.notify.count == 1, "one event still queued",
+		             reg.notify.count, 1, &bad);
+
+		/* a waiter parked before an event is served when it arrives */
+		w[2].request = &w[2];
+		core_notify_wait(&reg.notify, &w[2]);
+		sched_expect(g_ctl_delcount == 3, "the third event went out",
+		             g_ctl_delcount, 3, &bad);
+		w[3].request = &w[3];
+		sched_expect(core_notify_wait(&reg.notify, &w[3]) == 0,
+		             "a waiter with no event parks", 0, 0, &bad);
+		core_notify_post(&reg.notify, CORE_EVENT_DEBUG, 99, 0);
+		sched_expect(g_ctl_delcount == 4 &&
+		             g_ctl_delivered[3].a1 == 99,
+		             "and is served on the next post",
+		             (long)g_ctl_delivered[3].a1, 99, &bad);
+		groups++;
+	}
+
+	/* ---- 2. the hundred-event cap drops the oldest ----------------- */
+	{
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+
+		for (i = 0; i < 150; i++) {
+			core_notify_post(&reg.notify, CORE_EVENT_DEBUG, (u32)i, 0);
+		}
+		sched_expect(reg.notify.count == CORE_NOTIFY_MAX, "the ring is full",
+		             reg.notify.count, CORE_NOTIFY_MAX, &bad);
+		sched_expect(reg.notify.dropped == 50, "fifty were dropped",
+		             (long)reg.notify.dropped, 50, &bad);
+
+		w[0].request = &w[0];
+		core_notify_wait(&reg.notify, &w[0]);
+		sched_expect(g_ctl_delivered[0].a1 == 50,
+		             "the oldest survivor is 50",
+		             (long)g_ctl_delivered[0].a1, 50, &bad);
+		groups++;
+	}
+
+	/* ---- 3. a waiter the owner will not claim keeps its event ------ */
+	{
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+
+		w[0].request = &w[0];
+		w[1].request = &w[1];
+		core_notify_wait(&reg.notify, &w[0]);
+		core_notify_wait(&reg.notify, &w[1]);
+
+		/* cancellation got to the first one */
+		g_ctl_unclaimable = &w[0];
+		core_notify_post(&reg.notify, CORE_EVENT_DEBUG, 7, 0);
+
+		sched_expect(g_ctl_delcount == 1,
+		             "the unclaimable waiter was skipped", g_ctl_delcount,
+		             1, &bad);
+		sched_expect(g_ctl_delivered[0].req == &w[1],
+		             "and the event went to the next one",
+		             g_ctl_delivered[0].req == &w[1], 1, &bad);
+		sched_expect(reg.notify.count == 0, "the event was NOT wasted",
+		             reg.notify.count, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 4. cancel, and the teardown flush ------------------------- */
+	{
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+
+		for (i = 0; i < 3; i++) {
+			w[i].request = &w[i];
+			core_notify_wait(&reg.notify, &w[i]);
+		}
+		sched_expect(reg.notify.waiter_count == 3, "three parked",
+		             reg.notify.waiter_count, 3, &bad);
+		sched_expect(core_notify_cancel(&reg.notify, &w[1]) == 1,
+		             "the middle one is withdrawn", 1, 1, &bad);
+		sched_expect(reg.notify.waiter_count == 2, "two left",
+		             reg.notify.waiter_count, 2, &bad);
+		sched_expect(core_notify_cancel(&reg.notify, &w[1]) == 0,
+		             "withdrawing it twice is refused", 0, 0, &bad);
+
+		core_notify_flush(&reg.notify);
+		sched_expect(g_ctl_abortcount == 2, "the flush aborted both",
+		             g_ctl_abortcount, 2, &bad);
+		sched_expect(reg.notify.waiter_count == 0, "and emptied the list",
+		             reg.notify.waiter_count, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 5. the registry, and the interface event ------------------ */
+	{
+		core_device_entry d1, d2;
+		core_state cs1, cs2;
+
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+		core_init(&cs1, 0, 0);
+		core_init(&cs2, 0, 0);
+
+		d1.handle = 0x1111; d1.cs = &cs1; d1.sched = 0; d1.live = 0;
+		d2.handle = 0x2222; d2.cs = &cs2; d2.sched = 0; d2.live = 0;
+		core_registry_add(&reg, &d1);
+		core_registry_add(&reg, &d2);
+		sched_expect(reg.count == 2, "two registered", reg.count, 2, &bad);
+		sched_expect(reg.live_count == 0, "neither live yet",
+		             reg.live_count, 0, &bad);
+
+		core_registry_set_live(&reg, &d1, 1);
+		sched_expect(reg.live_count == 1, "one live", reg.live_count, 1,
+		             &bad);
+		sched_expect(reg.generation == 1, "the generation moved",
+		             (long)reg.generation, 1, &bad);
+		sched_expect(reg.notify.count == 1, "an event was posted",
+		             reg.notify.count, 1, &bad);
+		sched_expect(reg.notify.events[0].type == CORE_EVENT_INTERFACE,
+		             "of type 99", (long)reg.notify.events[0].type,
+		             CORE_EVENT_INTERFACE, &bad);
+
+		/* the SAME event on the way out; a listener must re-enumerate */
+		core_registry_set_live(&reg, &d1, 0);
+		sched_expect(reg.notify.events[1].type == CORE_EVENT_INTERFACE,
+		             "departure posts the same type",
+		             (long)reg.notify.events[1].type, CORE_EVENT_INTERFACE,
+		             &bad);
+		sched_expect(reg.generation == 2, "and moves it again",
+		             (long)reg.generation, 2, &bad);
+
+		/* setting the same state twice changes nothing */
+		core_registry_set_live(&reg, &d1, 0);
+		sched_expect(reg.generation == 2, "a repeat is ignored",
+		             (long)reg.generation, 2, &bad);
+
+		core_registry_remove(&reg, &d2);
+		sched_expect(reg.count == 1, "one removed", reg.count, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 6. the last adapter leaving releases every waiter --------- */
+	{
+		core_device_entry d1;
+		core_state cs1;
+
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+		core_init(&cs1, 0, 0);
+		d1.handle = 1; d1.cs = &cs1; d1.sched = 0; d1.live = 0;
+		core_registry_add(&reg, &d1);
+		core_registry_set_live(&reg, &d1, 1);
+
+		/* drain the arrival event so the waiters actually park */
+		reg.notify.count = 0;
+		for (i = 0; i < 3; i++) {
+			w[i].request = &w[i];
+			core_notify_wait(&reg.notify, &w[i]);
+		}
+		sched_expect(reg.notify.waiter_count == 3, "three parked",
+		             reg.notify.waiter_count, 3, &bad);
+
+		g_ctl_abortcount = 0;
+		core_registry_set_live(&reg, &d1, 0);
+		sched_expect(reg.notify.waiter_count == 0,
+		             "the last adapter leaving frees them all",
+		             reg.notify.waiter_count, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 7. the simple control codes ------------------------------- */
+	{
+		core_device_entry d1;
+		core_state cs1;
+
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+		core_init(&cs1, 0, 0);
+		d1.handle = 0xABCD; d1.cs = &cs1; d1.sched = 0; d1.live = 0;
+		core_registry_add(&reg, &d1);
+		core_registry_set_live(&reg, &d1, 1);
+
+		st = ctl_call(&reg, CORE_CTL_DEVICE_COUNT, 0, 1, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && g_ioc_out[0] == 1,
+		             "the live count is one byte", g_ioc_out[0], 1, &bad);
+
+		st = ctl_call(&reg, CORE_CTL_VERSION, 0, 8, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 4,
+		             "the version reports four bytes", (long)info, 4, &bad);
+		sched_expect(g_ioc_out[0] == 2 && g_ioc_out[1] == 1,
+		             "version 2.1", g_ioc_out[0], 2, &bad);
+		sched_expect(ctl_call(&reg, CORE_CTL_VERSION, 0, 3, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "and needs four bytes of room",
+		             1, 1, &bad);
+
+		st = ctl_call(&reg, CORE_CTL_GENERATION, 0, 4, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && rd32_test(g_ioc_out) == 1,
+		             "the generation counter", (long)rd32_test(g_ioc_out),
+		             1, &bad);
+
+		sched_expect(ctl_call(&reg, CORE_CTL_RESERVED_802, 0x40, 0x40, 0,
+		                      &info) == CORE_ST_SUCCESS,
+		             "fn 0x802 is accepted", 1, 1, &bad);
+		sched_expect(info == 0x40, "and reports 0x40 bytes", (long)info,
+		             0x40, &bad);
+		sched_expect(ctl_call(&reg, CORE_CTL_RESERVED_803, 0x40, 0x40, 0,
+		                      &info) == CORE_ST_SUCCESS,
+		             "so is fn 0x803", 1, 1, &bad);
+		sched_expect(ctl_call(&reg, CORE_CTL_RESERVED_802, 0x20, 0x40, 0,
+		                      &info) == CORE_ST_INVALID_PARAM,
+		             "but only at exactly 0x40", 1, 1, &bad);
+
+		/* validated, then refused anyway */
+		sched_expect(ctl_call(&reg, CORE_CTL_UNIMPLEMENTED, 4, 4, 0,
+		                      &info) == CORE_ST_NOT_SUPPORTED,
+		             "fn 0x814 validates then refuses", 1, 1, &bad);
+		sched_expect(ctl_call(&reg, CORE_CTL_UNIMPLEMENTED, 2, 4, 0,
+		                      &info) == CORE_ST_INVALID_PARAM,
+		             "and rejects bad lengths first", 1, 1, &bad);
+
+		sched_expect(ctl_call(&reg, 0x7FF, 0, 0, 0, &info) ==
+		             CORE_ST_INVALID_PARAM,
+		             "an unknown low code falls into the forward path", 1,
+		             1, &bad);
+		groups++;
+	}
+
+	/* ---- 8. the global button map, get and set --------------------- */
+	{
+		core_device_entry d1;
+		core_state cs1;
+
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+		core_init(&cs1, 0, 0);
+		d1.handle = 1; d1.cs = &cs1; d1.sched = 0; d1.live = 0;
+		core_registry_add(&reg, &d1);
+
+		/* read it back with no input */
+		st = ctl_call(&reg, CORE_CTL_BUTTON_MAP, 0, 16, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == 16,
+		             "sixteen entries come back", (long)info, 16, &bad);
+		sched_expect(g_ioc_out[0] == 0 && g_ioc_out[1] == 3,
+		             "the shipped mapping", g_ioc_out[1], 3, &bad);
+
+		/* set entry 0 to 5, and try an out-of-range 14 on entry 1 */
+		for (i = 0; i < 16; i++) {
+			g_ioc_in[i] = (u8)(reg.button_map[i]);
+		}
+		g_ioc_in[0] = 5;
+		g_ioc_in[1] = 14;           /* rejected: must be below 14 */
+		st = ctl_call(&reg, CORE_CTL_BUTTON_MAP, 16, 16, 0, &info);
+		sched_expect(reg.button_map[0] == 5, "entry 0 was set",
+		             reg.button_map[0], 5, &bad);
+		sched_expect(reg.button_map[1] == 3, "entry 1 was left alone",
+		             reg.button_map[1], 3, &bad);
+		sched_expect(g_ioc_out[0] == 0,
+		             "and the OLD value came back", g_ioc_out[0], 0, &bad);
+		sched_expect(cs1.button_map[0] == 5,
+		             "the map was pushed to the adapter",
+		             cs1.button_map[0], 5, &bad);
+
+		/* no length validation at all: a zero-length call is legal */
+		sched_expect(ctl_call(&reg, CORE_CTL_BUTTON_MAP, 0, 0, 0, &info) ==
+		             CORE_ST_SUCCESS, "a zero-length call is accepted", 1,
+		             1, &bad);
+		sched_expect(info == 0, "and reports nothing", (long)info, 0, &bad);
+		/* a short buffer stops at the shorter of the two */
+		ctl_call(&reg, CORE_CTL_BUTTON_MAP, 0, 4, 0, &info);
+		sched_expect(info == 4, "a four-byte read gives four", (long)info,
+		             4, &bad);
+		groups++;
+	}
+
+	/* ---- 9. the reports switch sweeps every adapter ---------------- */
+	{
+		core_device_entry d1, d2;
+		core_state cs1, cs2;
+
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+		core_init(&cs1, hid_sink, 0);
+		core_init(&cs2, hid_sink, 0);
+		cs1.instance_id = 100;
+		cs2.instance_id = 200;
+		d1.handle = 1; d1.cs = &cs1; d1.sched = 0; d1.live = 0;
+		d2.handle = 2; d2.cs = &cs2; d2.sched = 0; d2.live = 0;
+		core_registry_add(&reg, &d1);
+		core_registry_add(&reg, &d2);
+
+		g_hidcount = 0;
+		wr32_test(g_ioc_in, 1);
+		st = ctl_call(&reg, CORE_CTL_SET_REPORTS, 4, 0, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS, "the switch is accepted",
+		             (long)st, 0, &bad);
+		sched_expect(reg.reports_enabled == 1, "and recorded",
+		             reg.reports_enabled, 1, &bad);
+		sched_expect(g_hidcount == 2, "both adapters resubmitted",
+		             g_hidcount, 2, &bad);
+		sched_expect(cs1.virtual_mode == 3 && cs2.virtual_mode == 3,
+		             "and both entered virtual mode", cs1.virtual_mode, 3,
+		             &bad);
+		/* each parks its stick at its own instance number */
+		sched_expect(g_hidlog[0].data[2] == (100 >> 4),
+		             "the first reports its own identity",
+		             g_hidlog[0].data[2], 100 >> 4, &bad);
+		sched_expect(g_hidlog[1].data[2] == (200 >> 4),
+		             "and the second reports a different one",
+		             g_hidlog[1].data[2], 200 >> 4, &bad);
+
+		sched_expect(ctl_call(&reg, CORE_CTL_SET_REPORTS, 2, 0, 0, &info) ==
+		             CORE_ST_INVALID_PARAM, "a short input is rejected", 1,
+		             1, &bad);
+		groups++;
+	}
+
+	/* ---- 10. enumerate, look up, and forward ----------------------- */
+	{
+		core_device_entry d1, d2;
+		core_state cs1, cs2;
+		core_sched sch1;
+
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+		core_init(&cs1, 0, 0);
+		core_init(&cs2, 0, 0);
+		core_sched_init(&sch1, sched_test_alloc, sched_test_free, 0);
+		cs1.instance_id = 137;
+		cs2.instance_id = 642;
+		d1.handle = 0xAAAA; d1.cs = &cs1; d1.sched = &sch1; d1.live = 0;
+		d2.handle = 0xBBBB; d2.cs = &cs2; d2.sched = 0;     d2.live = 0;
+		core_registry_add(&reg, &d1);
+		core_registry_add(&reg, &d2);
+		core_registry_set_live(&reg, &d1, 1);
+		core_registry_set_live(&reg, &d2, 1);
+
+		/* walk from the start */
+		wr32_test(g_ioc_in, 0);
+		st = ctl_call(&reg, CORE_CTL_ENUM_DEVICES, 4, 8, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS &&
+		             rd32_test(g_ioc_out) == 0xAAAA, "the first adapter",
+		             (long)rd32_test(g_ioc_out), 0xAAAA, &bad);
+		sched_expect(rd32_test(g_ioc_out + 4) == 2, "and the live count",
+		             (long)rd32_test(g_ioc_out + 4), 2, &bad);
+
+		wr32_test(g_ioc_in, 0xAAAA);
+		ctl_call(&reg, CORE_CTL_ENUM_DEVICES, 4, 8, 0, &info);
+		sched_expect(rd32_test(g_ioc_out) == 0xBBBB, "then the second",
+		             (long)rd32_test(g_ioc_out), 0xBBBB, &bad);
+
+		wr32_test(g_ioc_in, 0xBBBB);
+		ctl_call(&reg, CORE_CTL_ENUM_DEVICES, 4, 8, 0, &info);
+		sched_expect(rd32_test(g_ioc_out) == 0, "then the end",
+		             (long)rd32_test(g_ioc_out), 0, &bad);
+
+		wr32_test(g_ioc_in, 0x9999);
+		sched_expect(ctl_call(&reg, CORE_CTL_ENUM_DEVICES, 4, 8, 0,
+		                      &info) == CORE_ST_NO_SUCH_DEVICE,
+		             "a stale handle is reported", 1, 1, &bad);
+
+		/* look up by instance number */
+		wr32_test(g_ioc_in, 642);
+		st = ctl_call(&reg, CORE_CTL_LOOKUP_DEVICE, 4, 4, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS &&
+		             rd32_test(g_ioc_out) == 0xBBBB,
+		             "an instance number resolves to its handle",
+		             (long)rd32_test(g_ioc_out), 0xBBBB, &bad);
+		wr32_test(g_ioc_in, 999);
+		sched_expect(ctl_call(&reg, CORE_CTL_LOOKUP_DEVICE, 4, 4, 0,
+		                      &info) == CORE_ST_NO_SUCH_DEVICE,
+		             "an unknown one does not", 1, 1, &bad);
+
+		/* forward a per-device request: handle, then that surface's input */
+		cs1.stick_clip = 88;
+		wr32_test(g_ioc_in, 0xAAAA);
+		st = ctl_call(&reg, CORE_IOC_STICK_CLIP, 4, 4, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS &&
+		             rd32_test(g_ioc_out) == 88,
+		             "a forwarded read reaches the right adapter",
+		             (long)rd32_test(g_ioc_out), 88, &bad);
+
+		wr32_test(g_ioc_in, 0xBBBB);
+		wr32_test(g_ioc_in + 4, 55);
+		st = ctl_call(&reg, CORE_IOC_STICK_CLIP, 8, 0, 0, &info);
+		sched_expect(st == CORE_ST_SUCCESS && cs2.stick_clip == 55,
+		             "and a forwarded write does too", cs2.stick_clip, 55,
+		             &bad);
+		sched_expect(cs1.stick_clip == 88, "without touching the other",
+		             cs1.stick_clip, 88, &bad);
+
+		wr32_test(g_ioc_in, 0xDEAD);
+		sched_expect(ctl_call(&reg, CORE_IOC_STICK_CLIP, 8, 0, 0, &info) ==
+		             CORE_ST_NO_SUCH_DEVICE,
+		             "forwarding to a stranger is refused", 1, 1, &bad);
+		sched_expect(ctl_call(&reg, CORE_IOC_STICK_CLIP, 3, 0, 0, &info) ==
+		             CORE_ST_INVALID_PARAM,
+		             "and so is one with no room for a handle", 1, 1,
+		             &bad);
+		core_sched_unload(&sch1);
+		groups++;
+	}
+
+	/* ---- 11. waiting through the dispatcher ------------------------ */
+	{
+		core_device_entry d1;
+		core_state cs1;
+
+		core_registry_init(&reg);
+		core_notify_init(&reg.notify, ctl_claim, ctl_deliver, ctl_abort, 0);
+		ctl_reset_log();
+		core_init(&cs1, 0, 0);
+		d1.handle = 1; d1.cs = &cs1; d1.sched = 0; d1.live = 0;
+
+		/* with no adapter present there will never be an event */
+		sched_expect(ctl_call(&reg, CORE_CTL_WAIT_NOTIFY, 0,
+		                      CORE_NOTIFY_BYTES, &w[0], &info) ==
+		             CORE_ST_DELETE_PENDING,
+		             "waiting with no adapter is refused", 1, 1, &bad);
+
+		core_registry_add(&reg, &d1);
+		core_registry_set_live(&reg, &d1, 1);
+		reg.notify.count = 0;           /* drop the arrival event */
+
+		w[0].request = &w[0];
+		sched_expect(ctl_call(&reg, CORE_CTL_WAIT_NOTIFY, 0,
+		                      CORE_NOTIFY_BYTES, &w[0], &info) ==
+		             CORE_ST_PENDING, "with nothing queued it parks", 1, 1,
+		             &bad);
+
+		core_notify_post(&reg.notify, CORE_EVENT_FAULT, 10, 0);
+		sched_expect(g_ctl_delcount == 1, "and is served on a post",
+		             g_ctl_delcount, 1, &bad);
+
+		/* an event already waiting is served without parking */
+		core_notify_post(&reg.notify, CORE_EVENT_DEBUG, 1, 2);
+		w[1].request = &w[1];
+		st = ctl_call(&reg, CORE_CTL_WAIT_NOTIFY, 0, CORE_NOTIFY_BYTES,
+		              &w[1], &info);
+		sched_expect(st == CORE_ST_SUCCESS && info == CORE_NOTIFY_BYTES,
+		             "a queued event is served at once", (long)info,
+		             CORE_NOTIFY_BYTES, &bad);
+
+		sched_expect(ctl_call(&reg, CORE_CTL_WAIT_NOTIFY, 0, 8, &w[2],
+		                      &info) == CORE_ST_INVALID_PARAM,
+		             "the output must be twelve bytes", 1, 1, &bad);
+		groups++;
+	}
+
+	hlog("Control device surface : %s (%d groups)\n", bad ? "FAIL" : "ok",
+	     groups);
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -4527,6 +5084,7 @@ int main(int argc, char **argv)
 	bad += test_n64_transaction();
 	bad += test_hid_reports();
 	bad += test_ioctl();
+	bad += test_control_device();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);

@@ -174,14 +174,38 @@ Table of Contents
    | 0xb98c2060 | 0x818 |   0 |  12 | drv_IoctlWaitNotification, async          |
    | 0xb98c2084 | 0x821 |   4 |   8 | enumerate: in = previous device id,       |
    |            |       |     |     | out = {next id, device count}             |
-   | 0xb98c2088 | 0x822 |   4 |   4 | look up a device id by the value at       |
-   |            |       |     |     | devext+0x2d                               |
+   | 0xb98c2088 | 0x822 |   4 |   4 | look up a device handle by the instance   |
+   |            |       |     |     | id at devext+0x3F8                        |
    | 18 codes   |       | >=4 |   - | device id prefix, then forwarded to       |
    |            |       |     |     | drv_IoctlDeviceCommand (section 4)        |
    +------------+-------+-----+-----+-------------------------------------------+
 
    0x811 returning {2, 1, 0, 0} matches the 2.01 in the binary file
    names wishk201.sys and wishd201.exe.
+
+   FN 0x822 LOOKS UP BY THE DEVICE INSTANCE ID, the value drv_AddDevice
+   assigns at devext+0x3F8 as (counter % 1100) + 50. That is the same number
+   virtual mode reports as the stick position, so a user can read an
+   adapter's identity off the stick and hand it straight back to this call.
+   See driver-structures.txt and hid-descriptor.txt section 5.2.
+
+   FN 0x818 IS THE ONLY ASYNCHRONOUS CODE ON EITHER SURFACE. The request is
+   parked on a waiter list and completed when an event arrives, with the
+   standard cancel-safe handshake: the cancel routine is installed with an
+   InterlockedExchange, and delivery re-exchanges it to zero and proceeds
+   only if it won. A waiter that cancellation claimed first is dropped
+   WITHOUT consuming its event, because the event is still owed to somebody.
+
+   THE NOTIFICATION QUEUE IS DRIVER-WIDE AND CAPPED AT A HUNDRED. Every
+   adapter posts into the one queue on the control device, any waiter can
+   receive any adapter's event, and a full queue drops its OLDEST entry.
+   That cap is LIVE here, unlike the identical-looking guard in
+   drv_QueueEvent which nothing ever arms - see script-bytecode.txt.
+
+   Refusing to wait when no adapter is present, STATUS_DELETE_PENDING, is
+   deliberate: there would never be an event to serve the request. The last
+   adapter going away releases everyone already parked, for the same
+   reason.
 
    0x821 is a standard iterator: pass 0 to get the first device, then
    pass each returned id to get the next. The device list is the

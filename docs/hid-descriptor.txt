@@ -381,20 +381,27 @@ Table of Contents
    control-device setting rather than a per-device one.
 
    With the mode non-zero the controller is bypassed entirely: a real report
-   is DROPPED, and a NULL submit synthesises one instead from
-   VirtualStickValue at devext+0x3F8:
+   is DROPPED, and a NULL submit synthesises one instead from the device
+   instance id at devext+0x3F8:
 
        byte 0    1
-       byte 1    (VirtualStickValue & 0x0F) << 4
-       byte 2    VirtualStickValue >> 4
+       byte 1    (InstanceId & 0x0F) << 4
+       byte 2    InstanceId >> 4
        byte 3    0
        byte 4    0
 
    Read through the 12-bit packing in section 5, that is X = 1 and
-   Y = VirtualStickValue with no buttons - a FIXED deflection, not a sweep.
-   VirtualStickValue is written only by drv_AddDevice and never changes
-   afterwards, so this is a diagnostic that parks the stick at a known
-   position, not an input source.
+   Y = InstanceId with no buttons - a fixed deflection, not a sweep.
+
+   WHAT IT PARKS THE STICK AT IS THE ADAPTER'S IDENTITY. drv_AddDevice
+   assigns that field as (counter % 1100) + 50, a per-adapter number in
+   50..1149, and the range is chosen to be a legal stick coordinate. So
+   virtual mode is not a fixed test pattern - it makes every adapter report
+   a DIFFERENT, known stick position, which is how a user with several
+   plugged in can tell which one is which. Control-device function 0x822
+   resolves a device handle from the same number. An earlier revision of
+   this note called the field VirtualStickValue and read it as a
+   calibration constant; see driver-structures.txt.
 
 6.  Device Identity
 

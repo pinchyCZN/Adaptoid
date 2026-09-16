@@ -129,4 +129,191 @@ u32 core_ioctl_dispatch(core_ioctl_env *env, const core_ioctl *req, u32 *info);
  */
 int core_effect_slot_active(core_state *cs, s32 slot, s32 now_tick);
 
+/* ======================================================================
+ * THE CONTROL DEVICE
+ *
+ * A second surface on a second device object. drv_CreateControlDevice makes
+ * one singleton control device for the whole driver, with its own extension,
+ * its own symbolic link and its own dispatcher, drv_IoctlControlDevice
+ * (0001061f). Nothing on the per-device surface above touches it.
+ *
+ * It does three things: it answers questions about the DRIVER rather than
+ * about one adapter, it owns the user-mode notification queue, and it
+ * forwards the eighteen per-device codes after stripping a four-byte device
+ * handle off the front of the input.
+ *
+ * The device object itself - IoCreateDevice, the symlink, the open count -
+ * is wdm.c's business. What lives here is the registry those handles name,
+ * the queue, and the dispatch.
+ * ====================================================================== */
+
+/* Control-device function codes. Same encoding as the per-device ones. */
+#define CORE_CTL_DEVICE_COUNT   0x801u  /* out 1: live adapters           */
+#define CORE_CTL_RESERVED_802   0x802u  /* in 0x40 out 0x40, does nothing */
+#define CORE_CTL_RESERVED_803   0x803u  /* the same handler               */
+#define CORE_CTL_VERSION        0x811u  /* out >= 4: the driver version   */
+#define CORE_CTL_GENERATION     0x812u  /* out 4: list generation counter */
+#define CORE_CTL_UNIMPLEMENTED  0x814u  /* validated, then not supported  */
+#define CORE_CTL_SET_REPORTS    0x816u  /* in 4: the virtual-mode switch  */
+#define CORE_CTL_BUTTON_MAP     0x817u  /* get and set the global map     */
+#define CORE_CTL_WAIT_NOTIFY    0x818u  /* out 0xc: park until an event   */
+#define CORE_CTL_ENUM_DEVICES   0x821u  /* in 4 out 8: walk the registry  */
+#define CORE_CTL_LOOKUP_DEVICE  0x822u  /* in 4 out 4: resolve an id      */
+
+/* Two more statuses this surface returns. */
+#define CORE_ST_NO_SUCH_DEVICE  0xC000000Eu
+#define CORE_ST_DELETE_PENDING  0xC0000056u
+
+/* The driver version this reports, as four bytes. */
+#define CORE_CTL_VERSION_BYTES  4
+
+/* An event delivered to a waiter is three dwords. */
+#define CORE_NOTIFY_BYTES       12
+
+/*
+ * THE NOTIFICATION QUEUE.
+ *
+ * Events that are not HID input - script faults, the absolute mouse, _debug,
+ * interface state changes - end up here rather than in a report. User mode
+ * parks a request on function 0x818 and gets twelve bytes back when one
+ * arrives.
+ *
+ * THE HUNDRED-EVENT CAP IS LIVE HERE, unlike the identical-looking guard in
+ * drv_QueueEvent that nothing ever arms (see sched.h). A full queue drops
+ * its OLDEST entry, so a listener that stops reading loses history rather
+ * than blocking the driver.
+ *
+ * THE QUEUE IS DRIVER-WIDE, NOT PER DEVICE. Every adapter posts into this
+ * one queue and any waiter can receive any adapter's event, which is why an
+ * event carries no device identity and a listener has to re-enumerate to
+ * find out what changed.
+ */
+#define CORE_NOTIFY_MAX         100
+
+/*
+ * A parked waiter. The queue never touches the request itself; it holds an
+ * opaque handle and asks the owner to claim it before delivering, because
+ * whether a request is still ours is a cancellation question and therefore
+ * the OS's to answer.
+ */
+typedef struct core_notify_waiter {
+	struct core_notify_waiter *flink;
+	struct core_notify_waiter *blink;
+	void *request;
+} core_notify_waiter;
+
+/*
+ * Claim a waiter for delivery. Return non-zero if it is still ours; zero
+ * means cancellation got there first and the queue must drop it silently -
+ * the canceller owns completing it. This is the InterlockedExchange on the
+ * cancel routine that drv_CompleteNotificationIrps does.
+ */
+typedef int (*core_notify_claim_fn)(void *ctx, core_notify_waiter *w);
+
+/* Hand one event to one claimed waiter, twelve bytes. */
+typedef void (*core_notify_deliver_fn)(void *ctx, core_notify_waiter *w,
+                                       u32 type, u32 arg1, u32 arg2);
+
+/* Complete a waiter that will never be served, on teardown. */
+typedef void (*core_notify_abort_fn)(void *ctx, core_notify_waiter *w);
+
+typedef struct core_notify {
+	core_sched_event events[CORE_NOTIFY_MAX];
+	s32 head;
+	s32 count;
+	u32 dropped;
+
+	core_notify_waiter waiters;     /* list head sentinel */
+	s32 waiter_count;
+
+	/*
+	 * The delivery latch. Posting and parking both try to pump, and the
+	 * pump runs with the lock dropped; this keeps exactly one pump in
+	 * flight so an event cannot be handed to two waiters.
+	 */
+	int delivering;
+
+	core_notify_claim_fn   claim;
+	core_notify_deliver_fn deliver;
+	core_notify_abort_fn   abort;
+	void                  *ctx;
+} core_notify;
+
+void core_notify_init(core_notify *n, core_notify_claim_fn claim,
+                      core_notify_deliver_fn deliver,
+                      core_notify_abort_fn abort, void *ctx);
+
+/* Append an event and deliver what can be delivered. */
+void core_notify_post(core_notify *n, u32 type, u32 arg1, u32 arg2);
+
+/* Park a waiter. Returns 1 if it was delivered to before returning. */
+int  core_notify_wait(core_notify *n, core_notify_waiter *w);
+
+/* Withdraw a waiter that is being cancelled. Returns 1 if it was still
+ * queued, 0 if delivery had already taken it. */
+int  core_notify_cancel(core_notify *n, core_notify_waiter *w);
+
+/* Abort every parked waiter. The last adapter going away does this, and so
+ * does closing the control device. */
+void core_notify_flush(core_notify *n);
+
+/* ---- the device registry ---------------------------------------------- */
+
+/*
+ * One registered adapter. The entry is owned by the caller and lives in its
+ * device extension, so the registry is an intrusive list and has no bound -
+ * matching the original, whose list is also unbounded even though the count
+ * is reported as a single byte.
+ */
+typedef struct core_device_entry {
+	struct core_device_entry *flink;
+	struct core_device_entry *blink;
+
+	u32         handle;     /* what user mode passes back; a PDO pointer
+	                         * in the original */
+	core_state *cs;
+	core_sched *sched;
+	int         live;       /* its device interface is enabled */
+	int         needs_resubmit;
+} core_device_entry;
+
+typedef struct core_registry {
+	core_device_entry devices;      /* list head sentinel */
+	s32 count;
+	s32 live_count;
+	u32 generation;
+
+	/*
+	 * THE BUTTON MAP IS DRIVER-WIDE in the original: one drv_ButtonMap
+	 * array, shared by every adapter. Setting it here writes through to
+	 * every registered device, because core_decode_buttons reads a
+	 * per-device copy.
+	 */
+	u8 button_map[CORE_RAW_BUTTON_BITS];
+
+	/* The virtual-joystick switch, function 0x816. */
+	int reports_enabled;
+
+	core_notify notify;
+} core_registry;
+
+void core_registry_init(core_registry *reg);
+void core_registry_add(core_registry *reg, core_device_entry *dev);
+void core_registry_remove(core_registry *reg, core_device_entry *dev);
+
+/* Mark an adapter's interface up or down. Bumps the generation counter and
+ * the live count, and posts the interface-changed event. */
+void core_registry_set_live(core_registry *reg, core_device_entry *dev,
+                            int live);
+
+/*
+ * Dispatch one control-device request. env supplies the clock and the seams
+ * for whichever adapter a forwarded request names; reg is the registry.
+ *
+ * A waiter is supplied only for CORE_CTL_WAIT_NOTIFY and may be null, in
+ * which case that one function answers CORE_ST_INVALID_PARAM.
+ */
+u32 core_ctl_dispatch(core_registry *reg, const core_ioctl *req,
+                      core_notify_waiter *waiter, u64 now_100ns, u32 *info);
+
 #endif /* ADAPTOID_IOCTL_H */
