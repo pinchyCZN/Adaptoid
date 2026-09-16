@@ -619,10 +619,18 @@ Table of Contents
    +/-1200 range the descriptor declares, in this order:
 
        1. negate Y, converting N64 up-positive to HID down-positive
+          IN 8 BITS, so a raw -128 negates to -128 rather than +128
        2. X = rawX * 16,  Y = rawY * 16
-       3. if devext+0x3F0 != 0, CORNER STRETCH, IOCTL fn 0x83f:
-              X += (|Y| * stretch * X) / 256
-              Y += (|X| * stretch * Y) / 256
+       3. if devext+0x3F0 != 0, CORNER STRETCH, IOCTL fn 0x83f.
+          NOTE WHICH VALUES THE PRODUCT USES: the three factors are all
+          RAW axes, and only the result is added to the scaled value.
+              X += (|rawY| * stretch * rawX) / 256
+              Y += (|rawX| * stretch * rawY) / 256
+          An earlier revision of this list wrote the factors as X and Y
+          with no qualifier, which reads as the scaled values and is
+          wrong by a factor of 16. The worked example in known-defects
+          .txt section 3 was right; this list was not. Confirmed by
+          reading 00015150 directly and by emulating it.
        4. if devext+0x3EC is neither 0 nor 0x4B, RANGE CLIPPING,
           IOCTL fn 0x83e:
               value = value * 0x4B / clip

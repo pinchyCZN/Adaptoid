@@ -293,15 +293,39 @@ Table of Contents
        [2]  0x00   }  the 0x05 0x00 controller identifier,
        [3]  0x05   }  in reverse order
 
-   which is exactly what both classify steps test: [0] must be 0x03, then [3]
-   == 0x05 and [2] == 0x00 confirms an N64 controller replied, and [1] is
-   kept at devext+0x3E8. So the value stored as the "accessory id" is the N64
-   controller status byte, whose bit 0 means a Pak is present and bit 1 means
-   one was removed since the last query.
+   which is exactly what both classify steps test: [3] == 0x05 and [2] ==
+   0x00 confirms an N64 controller replied, and [1] is kept at devext+0x3E8.
+   So the value stored as the "accessory id" is the N64 controller status
+   byte, whose bit 0 means a Pak is present and bit 1 means one was removed
+   since the last query.
 
-   If [0] is not 0x03 the probe is abandoned and devext+0x3E4 returns to 0
-   for a later retry. Between the two attempts a vendor OUT 0x74 is issued,
-   with wValue 0x00C6 after the first failure and 0x00A6 on the final one.
+   THE TWO CLASSIFY STEPS DO NOT BEHAVE THE SAME WAY ON FAILURE, and an
+   earlier revision of this section said they did. The outcomes are:
+
+   +---------------------------+---------------------------------------------+
+   | Condition                 | Result                                      |
+   +===========================+=============================================+
+   | first classify, [0] != 3  | probe ABANDONED, devext+0x3E4 back to 0 so  |
+   |                           | a later poll retries. No reselect is sent.  |
+   | first classify, identity  | devext+0x3E4 = 2, status byte kept          |
+   | matches                   |                                             |
+   | first classify, otherwise | OUT 0x74 wValue 0x00C6 reselects the port,  |
+   |                           | then the read is repeated                   |
+   | second classify, identity | devext+0x3E4 = 3, status byte kept          |
+   | matches                   |                                             |
+   | second classify, anything | devext+0x3E4 = 4, then OUT 0x74 wValue      |
+   | else                      | 0x00A6. NOT 0, so the probe does not retry  |
+   |                           | and input stays gated off.                  |
+   +---------------------------+---------------------------------------------+
+
+   Note that the second classify does NOT test [0] separately: any reply that
+   is not the expected identity lands in state 4. Note also that state 4 is
+   committed BEFORE the final 0x74 goes out, and that transfer carries no
+   completion routine - the probe is over either way.
+
+   State 4 therefore means "probe finished, nothing identified", which is
+   distinct from 0, "probe needed". Since drv_BuildJoystickReport requires
+   devext+0x3E4 to be 2 or more, state 4 still lets reports flow.
 
    INFERENCE: the 0x74 request puts the accessory port into a different
    select or power state, and the two attempts exist so that a device needing

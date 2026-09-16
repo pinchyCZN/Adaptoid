@@ -42,7 +42,8 @@ Table of Contents
    | wdm.h wdm.c     | DriverEntry, AddDevice, PnP, power, IOCTLs        |
    | kstub.h         | Fake kernel ABI for user-mode builds              |
    | harness.c       | main() plus the kernel stub implementations       |
-   | origin.txt      | Where each function came from in Ghidra           |
+   | origin.tsv      | Where each function came from in Ghidra           |
+   | origin.txt      | What the rows in origin.tsv mean                  |
    | build/          | All output. Not tracked.                          |
    +-----------------+---------------------------------------------------+
 
@@ -57,15 +58,15 @@ Table of Contents
 
 1.1.  Where Each Function Came From
 
-   origin.txt maps every function here to the address and name of the original
+   origin.tsv maps every function here to the address and name of the original
    it derives from, because the names have already diverged and no rule
    recovers that - core_pak_addr_crc5 was drv_N64PakAddrCrc5. Add a row in the
    same change that adds a function.
 
        python tools/originmap.py --check    report drift, exit 1 if any
-       python tools/originmap.py --fix      re-align the table
+       python tools/originmap.py --fix      sort and normalise
 
-   Section 3 of origin.txt explains the entries that are not one to one.
+   origin.txt section 3 explains the entries that are not one to one.
 
 2.  Building
 

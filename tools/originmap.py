@@ -1,41 +1,52 @@
 #!/usr/bin/env python3
 """
-originmap.py -- keep src_drv/origin.txt honest.
+originmap.py -- keep src_drv/origin.tsv honest.
 
-origin.txt records, for every function in the replacement driver, which
+origin.tsv records, for every function in the replacement driver, which
 function in which original binary it came from. It exists so that when
 the reconstruction misbehaves you can get back to the evidence in Ghidra
 without guessing, and it is a FILE rather than a tag in a comment so it
 stays out of the source and can be diffed, grepped and checked.
 
     python tools/originmap.py --check    report drift, exit 1 if any
-    python tools/originmap.py --fix      rewrite the table aligned
+    python tools/originmap.py --fix      sort and normalise
 
-WHAT --check ACTUALLY VERIFIES
+WHY TAB-SEPARATED AND NOT AN RFC TABLE
 
-  - every function defined in src_drv/*.c has a row;
-  - every row names a function that still exists;
-  - every row is well formed: a known kind, a plausible address, and a
-    binary this project actually has;
-  - a row whose kind is new carries no address, and one whose kind is
-    port or part carries one.
+    It used to be an aligned table inside origin.txt. That cost about
+    four bytes on disk per byte of content - half the table was padding
+    and the +---+ separators outweighed the data - and, worse, the fixed
+    column widths had exactly one character of headroom. Any new name a
+    character longer than the current longest would have aborted the
+    tool, and widening a column rewrites every row, so each such name
+    churned the whole file. At a few hundred functions that is
+    unworkable. A row here touches exactly one line and column widths do
+    not exist.
+
+    The prose that used to sit around the table stays in origin.txt:
+    what the kinds mean, the entries that are not one to one, and how
+    the addresses were established.
+
+WHAT --check VERIFIES
+
+  - every function defined in src_drv/*.c has a row, and every row names
+    a function that still exists, in the file the row claims;
+  - the schema: six fields, no empty or space-padded field, a known kind
+    and binary, and an address that is eight lowercase hex digits;
+  - a row whose kind is new carries no address or origin, and one whose
+    kind is port or part carries both;
+  - no duplicate rows;
+  - ASCII only. asciify.py does not walk .tsv, so that check lives here
+    now rather than being silently lost in the move from .txt.
 
 WHAT IT CANNOT VERIFY
 
-  That an address still names the function the row claims. The Ghidra
-  database is not reachable from here and decomp/ is not in git. The
-  addresses were read out of the database by hand when the row was
-  written. They do not rot - the binaries are immutable primary evidence
-  and are never rebuilt - so the risk is a typo at entry, not decay.
-  Check a row against Ghidra when you rely on it.
-
-WHY THE TABLE IS SPACE-ALIGNED AND NOT A TSV
-
-  A .tsv is not in the extension set asciify.py walks, so it would get
-  no ASCII check and no column check at all. As an RFC table in a .txt
-  it gets both, and asciify.py additionally verifies that every row is
-  exactly as wide as its border - which is a free check that --fix did
-  its job.
+    That an address still names the function the row claims. The Ghidra
+    database is not reachable from here and decomp/ is not in git. The
+    addresses were read out of the database by hand when the row was
+    written. They do not rot - the binaries are immutable primary
+    evidence and are never rebuilt - so the risk is a typo at entry, not
+    decay. Check a row against Ghidra when you rely on it.
 """
 
 import argparse
@@ -44,23 +55,29 @@ import os
 import re
 import sys
 
-MAP_PATH = os.path.join("src_drv", "origin.txt")
+MAP_PATH = os.path.join("src_drv", "origin.tsv")
+DOC_PATH = os.path.join("src_drv", "origin.txt")
 SRC_DIR = "src_drv"
 
-# (heading, inner width). One leading space is part of the width.
-COLS = [
-    ("Replacement", 26),
-    ("File", 11),
-    ("Kind", 6),
-    ("Binary", 14),
-    ("Addr", 10),
-    ("Original", 35),
-]
-
+FIELDS = ("function", "file", "kind", "binary", "addr", "original")
 KINDS = ("port", "part", "new")
 BINARIES = ("wishk201.sys", "wishd201.exe", "wishh201.dll", "-")
 
-INDENT = "   "
+HEADER = """# origin.tsv - where each function in the replacement came from.
+#
+# One tab-separated row per correspondence. A function may have several rows
+# when it covers more than one original, or when one original splits across
+# the core seam. See origin.txt for what the kinds mean and for the entries
+# that are not one to one.
+#
+# THE ADDRESS IS THE DURABLE KEY, not the name: the binaries are immutable
+# primary evidence and are never rebuilt, so an address cannot rot, while a
+# Ghidra name can still be changed by later analysis.
+#
+# Checked and sorted by tools/originmap.py --check / --fix.
+#
+# %s
+""" % "\t".join(FIELDS)
 
 # A function DEFINITION in this tree starts at column 0 - the source is
 # retabbed, so anything nested is indented - names an identifier before
@@ -78,80 +95,32 @@ SKIP_PREFIX = ("#", "/", "*", "}", "typedef", "extern", "struct ", "union ",
                "enum ")
 
 
-def cell(text, width):
-    s = " " + text
-    if len(s) > width:
-        raise SystemExit("originmap: cell %r needs %d columns, have %d"
-                         % (text, len(s), width))
-    return s.ljust(width)
-
-
-def border(fill):
-    return INDENT + "+" + "+".join(fill * w for _, w in COLS) + "+"
-
-
-def render(rows):
-    out = [border("-"),
-           INDENT + "|" + "|".join(cell(h, w) for h, w in COLS) + "|",
-           border("=")]
-    for r in rows:
-        out.append(INDENT + "|"
-                   + "|".join(cell(v, w) for v, (_, w) in zip(r, COLS))
-                   + "|")
-        out.append(border("-"))
-    widths = set(len(l) for l in out)
-    assert len(widths) == 1, "ragged table: %s" % sorted(widths)
-    return out
-
-
-def is_table_line(line):
-    s = line.strip()
-    return (s.startswith("+") and s.endswith("+")) or \
-           (s.startswith("|") and s.endswith("|"))
-
-
-def parse_map(text):
-    """
-    Return (rows, first_line_index, last_line_index) for THE MAP TABLE.
-
-    The document contains more than one table - section 2 explains the
-    kinds in a two-column one - so the table is located by its header
-    row rather than by being the first thing that looks like a table,
-    and the span is then walked outward over contiguous table lines.
-    """
-    lines = text.split("\n")
-
-    head = None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if s.startswith("|") and s.endswith("|"):
-            if s[1:-1].split("|")[0].strip() == COLS[0][0]:
-                head = i
-                break
-    if head is None:
-        return [], None, None
-
-    lo = head
-    while lo > 0 and is_table_line(lines[lo - 1]):
-        lo -= 1
-    hi = head
-    while hi + 1 < len(lines) and is_table_line(lines[hi + 1]):
-        hi += 1
-
+def load(path):
+    """Return (rows, problems) for the tsv."""
     rows = []
-    for i in range(lo, hi + 1):
-        s = lines[i].strip()
-        if not (s.startswith("|") and s.endswith("|")):
-            continue
-        cells = [c.strip() for c in s[1:-1].split("|")]
-        if len(cells) != len(COLS):
-            raise SystemExit("originmap: %s line %d has %d cells, expected %d"
-                             % (MAP_PATH, i + 1, len(cells), len(COLS)))
-        if cells[0] in (COLS[0][0], ""):
-            continue
-        rows.append(cells)
+    bad = []
+    with io.open(path, "r", encoding="utf-8", newline="") as f:
+        raw = f.read()
 
-    return rows, lo, hi
+    for n, line in enumerate(raw.split("\n"), 1):
+        if not line or line.startswith("#"):
+            continue
+        try:
+            line.encode("ascii")
+        except UnicodeEncodeError:
+            bad.append("%s:%d: non-ASCII byte" % (path, n))
+            continue
+        parts = line.split("\t")
+        if len(parts) != len(FIELDS):
+            bad.append("%s:%d: %d fields, expected %d"
+                       % (path, n, len(parts), len(FIELDS)))
+            continue
+        for i, p in enumerate(parts):
+            if p != p.strip() or p == "":
+                bad.append("%s:%d: field %s is empty or space-padded: %r"
+                           % (path, n, FIELDS[i], p))
+        rows.append((n, parts))
+    return rows, bad
 
 
 def source_functions():
@@ -177,50 +146,46 @@ def source_functions():
 
 
 def check(rows, funcs):
-    bad = 0
-    seen = {}
-    for cells in rows:
-        fn, fl, kind, binary, addr, origin = cells
+    bad = []
+    seen = set()
+    covered = set()
+
+    for n, (fn, fl, kind, binary, addr, origin) in rows:
+        key = (fn, fl, kind, binary, addr, origin)
+        if key in seen:
+            bad.append("%s:%d: duplicate row" % (MAP_PATH, n))
+        seen.add(key)
+        covered.add(fn)
 
         if kind not in KINDS:
-            print("%s: unknown kind %r" % (fn, kind))
-            bad += 1
+            bad.append("%s:%d: %s: unknown kind %r" % (MAP_PATH, n, fn, kind))
         if binary not in BINARIES:
-            print("%s: unknown binary %r" % (fn, binary))
-            bad += 1
+            bad.append("%s:%d: %s: unknown binary %r"
+                       % (MAP_PATH, n, fn, binary))
 
         if kind == "new":
             if addr != "-" or origin != "-":
-                print("%s: kind new must have no address or origin" % fn)
-                bad += 1
+                bad.append("%s:%d: %s: kind new must have no address or origin"
+                           % (MAP_PATH, n, fn))
         else:
             if not re.match(r"^[0-9a-f]{8}$", addr):
-                print("%s: address %r is not 8 lowercase hex digits"
-                      % (fn, addr))
-                bad += 1
-            if not origin or origin == "-":
-                print("%s: kind %s needs an original function name"
-                      % (fn, kind))
-                bad += 1
+                bad.append("%s:%d: %s: address %r is not 8 lowercase hex digits"
+                           % (MAP_PATH, n, fn, addr))
+            if origin == "-":
+                bad.append("%s:%d: %s: kind %s needs an original function name"
+                           % (MAP_PATH, n, fn, kind))
 
         if fn not in funcs:
-            print("%s: row names a function that is not defined in %s/"
-                  % (fn, SRC_DIR))
-            bad += 1
+            bad.append("%s:%d: %s: not defined in %s/"
+                       % (MAP_PATH, n, fn, SRC_DIR))
         elif funcs[fn] != fl:
-            print("%s: row says %s, definition is in %s"
-                  % (fn, fl, funcs[fn]))
-            bad += 1
-
-        seen.setdefault(fn, 0)
-        seen[fn] += 1
+            bad.append("%s:%d: %s: row says %s, definition is in %s"
+                       % (MAP_PATH, n, fn, fl, funcs[fn]))
 
     for fn in sorted(funcs):
-        if fn not in seen:
-            print("%s (%s): defined but has no row in %s"
-                  % (fn, funcs[fn], MAP_PATH))
-            bad += 1
-
+        if fn not in covered:
+            bad.append("%s (%s): defined but has no row in %s"
+                       % (fn, funcs[fn], MAP_PATH))
     return bad
 
 
@@ -232,28 +197,32 @@ def main():
     if not (args.check or args.fix):
         ap.error("one of --check or --fix is required")
 
-    text = io.open(MAP_PATH, encoding="ascii").read()
-    rows, lo, hi = parse_map(text)
-    if lo is None:
-        raise SystemExit("originmap: no table found in %s" % MAP_PATH)
-
+    rows, problems = load(MAP_PATH)
     funcs = source_functions()
 
     if args.fix:
-        lines = text.split("\n")
-        new = lines[:lo] + render(rows) + lines[hi + 1:]
-        out = "\n".join(new)
-        if out != text:
+        if problems:
+            for p in problems:
+                print(p)
+            print("\nrefusing to sort a file with malformed rows.")
+            return 1
+        data = [r for _, r in rows]
+        data.sort(key=lambda r: (r[1], r[0], r[4]))
+        out = HEADER + "".join("\t".join(r) + "\n" for r in data)
+        old = io.open(MAP_PATH, encoding="ascii").read()
+        if out != old:
             io.open(MAP_PATH, "w", encoding="ascii", newline="\n").write(out)
-            print("rewrote %s (%d rows)" % (MAP_PATH, len(rows)))
+            print("sorted %s (%d rows)" % (MAP_PATH, len(data)))
         else:
-            print("%s already aligned (%d rows)" % (MAP_PATH, len(rows)))
+            print("%s already sorted (%d rows)" % (MAP_PATH, len(data)))
         return 0
 
-    bad = check(rows, funcs)
+    problems += check(rows, funcs)
+    for p in problems:
+        print(p)
     print("\n%d row(s), %d function(s) in %s/, %d problem(s)."
-          % (len(rows), len(funcs), SRC_DIR, bad))
-    return 1 if bad else 0
+          % (len(rows), len(funcs), SRC_DIR, len(problems)))
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

@@ -187,12 +187,24 @@ Table of Contents
    | 0xB4C  | RingCount                | int                          | capped at 0x60                           |
    | 0xB50  | RingBaseTime             | longlong                     | timestamp of RingHead                    |
    | 0xB58  | EffectRing               | ADAPTOID_EFFECT_TICK[96]     | 0xA80 bytes, ends at 0x15D8              |
-   | 0x15D8 | TuneDutyComplement       | int                          | on-controller tuning mode,               |
-   | 0x15DC | TuneDuty                 | int                          | entered with L+R+Z+Start                 |
-   | 0x15E0 | TunePeriod               | int                          |                                          |
+   | 0x15D8 | TuneDutyComplement       | int                          | MOTOR CALIBRATION, default 50            |
+   | 0x15DC | TuneDuty                 | int                          | MOTOR CALIBRATION, default 50            |
+   | 0x15E0 | TunePeriod               | int                          | MOTOR CALIBRATION, default 500           |
    | 0x15E4 | TuneMode                 | dword                        | bit0 active, bit1 combination held       |
-   | 0x15E8 | TuneStrength             | int                          | D-pad preset 0/12/25/50/100              |
+   | 0x15E8 | TuneStrength             | int                          | MOTOR CALIBRATION, default 100           |
    +--------+--------------------------+------------------------------+------------------------------------------+
+
+   THE FOUR FIELDS MARKED MOTOR CALIBRATION ARE NOT TUNING-MODE-ONLY STATE,
+   which an earlier revision of this note implied by grouping them all under
+   the on-controller tuning mode. drv_AddDevice SEEDS THEM at device start -
+   TunePeriod 500, TuneDuty 50, TuneDutyComplement 50, TuneStrength 100 - and
+   drv_EffectEvaluate multiplies its intensity by duty * period. With all four
+   left at zero the effect engine emits no pulses at all, so these are the
+   motor drive calibration and the tuning mode entered with L+R+Z+Start is a
+   LIVE EDITOR for them, not their only writer.
+
+   TuneMode itself is genuinely tuning-mode-only.
+
 
 2.7.  The Script Engine
 

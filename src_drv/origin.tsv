@@ -1,0 +1,86 @@
+# origin.tsv - where each function in the replacement came from.
+#
+# One tab-separated row per correspondence. A function may have several rows
+# when it covers more than one original, or when one original splits across
+# the core seam. See origin.txt for what the kinds mean and for the entries
+# that are not one to one.
+#
+# THE ADDRESS IS THE DURABLE KEY, not the name: the binaries are immutable
+# primary evidence and are never rebuilt, so an address cannot rot, while a
+# Ghidra name can still be changed by later analysis.
+#
+# Checked and sorted by tools/originmap.py --check / --fix.
+#
+# function	file	kind	binary	addr	original
+core_decode	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
+core_decode_buttons	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
+core_decode_stick	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
+core_effect_axis_value	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_effect_intensity	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_effect_pulse	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_effect_wave	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_effect_window	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
+core_effect_window	core.c	part	wishk201.sys	00013f10	drv_EffectEvaluate
+core_emit	core.c	part	wishk201.sys	00014de8	drv_SubmitHidReport
+core_init	core.c	new	-	-	-
+core_on_raw_packet	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
+core_pack_joystick	core.c	part	wishk201.sys	00015150	drv_BuildJoystickReport
+core_pak_addr_crc5	core.c	part	wishk201.sys	000136f0	drv_N64PakAddrCrc5
+core_pak_addr_encode	core.c	port	wishk201.sys	000136f0	drv_N64PakAddrCrc5
+core_pak_data_crc8	core.c	port	wishk201.sys	00013730	drv_N64PakDataCrc8
+core_probe_abandon	core.c	part	wishk201.sys	00018d30	drv_AccessoryProbeStart
+core_probe_complete	core.c	part	wishk201.sys	00018f40	drv_AccessoryProbeClassify
+core_probe_identified	core.c	part	wishk201.sys	00018f40	drv_AccessoryProbeClassify
+core_probe_issue	core.c	part	wishk201.sys	00018da0	drv_AccessoryProbeStep1
+core_probe_start	core.c	port	wishk201.sys	00018d30	drv_AccessoryProbeStart
+core_reset	core.c	new	-	-	-
+core_set_vendor	core.c	new	-	-	-
+core_sine_lerp	core.c	port	wishk201.sys	000149a0	drv_SineLerp
+core_tick	core.c	part	wishk201.sys	00013ac0	drv_EffectTick
+core_tick	core.c	part	wishk201.sys	00017980	drv_ScriptScheduler
+core_zero	core.c	new	-	-	-
+ExAllocatePoolWithTag	harness.c	new	-	-	-
+ExFreePool	harness.c	new	-	-	-
+HidRegisterMinidriver	harness.c	new	-	-	-
+InterlockedDecrement	harness.c	new	-	-	-
+InterlockedExchange	harness.c	new	-	-	-
+InterlockedIncrement	harness.c	new	-	-	-
+KeInitializeEvent	harness.c	new	-	-	-
+KeInitializeSpinLock	harness.c	new	-	-	-
+KeQueryInterruptTime	harness.c	new	-	-	-
+KeSetEvent	harness.c	new	-	-	-
+KfAcquireSpinLock	harness.c	new	-	-	-
+KfReleaseSpinLock	harness.c	new	-	-	-
+bus_reset	harness.c	new	-	-	-
+clock_advance_ms	harness.c	new	-	-	-
+effect_arm_constant	harness.c	new	-	-	-
+harness_pump	harness.c	new	-	-	-
+harness_sink	harness.c	new	-	-	-
+harness_vendor	harness.c	new	-	-	-
+hlog	harness.c	new	-	-	-
+htrace	harness.c	new	-	-	-
+hverbose	harness.c	new	-	-	-
+main	harness.c	new	-	-	-
+popcount32	harness.c	new	-	-	-
+probe_check_prefix	harness.c	new	-	-	-
+report_name	harness.c	new	-	-	-
+simulate_add_device	harness.c	new	-	-	-
+test_accessory_probe	harness.c	new	-	-	-
+test_effect_engine	harness.c	new	-	-	-
+test_joystick_report	harness.c	new	-	-	-
+test_pak_crcs	harness.c	new	-	-	-
+usage	harness.c	new	-	-	-
+AdaptoidAddDevice	wdm.c	port	wishk201.sys	0001236e	drv_AddDevice
+AdaptoidCleanup	wdm.c	port	wishk201.sys	00011880	drv_CleanupTriage
+AdaptoidClose	wdm.c	port	wishk201.sys	00011910	drv_CloseTriage
+AdaptoidCreate	wdm.c	port	wishk201.sys	000117f0	drv_CreateTriage
+AdaptoidDeviceControl	wdm.c	port	wishk201.sys	00011a80	drv_DeviceControlTriage
+AdaptoidIntDeviceControl	wdm.c	port	wishk201.sys	000128d2	drv_DispatchInternalDeviceControl
+AdaptoidPnp	wdm.c	port	wishk201.sys	00011b10	drv_PnpTriage
+AdaptoidPower	wdm.c	port	wishk201.sys	00011b70	drv_PowerTriage
+AdaptoidRead	wdm.c	port	wishk201.sys	000119a0	drv_ReadTriage
+AdaptoidReportSink	wdm.c	part	wishk201.sys	00014de8	drv_SubmitHidReport
+AdaptoidReportSink	wdm.c	part	wishk201.sys	00014ec0	drv_CompleteReadReport
+AdaptoidUnload	wdm.c	port	wishk201.sys	000117e0	drv_Unload
+AdaptoidWrite	wdm.c	port	wishk201.sys	00011a10	drv_WriteTriage
+DriverEntry	wdm.c	port	wishk201.sys	000115f0	drv_DriverEntry

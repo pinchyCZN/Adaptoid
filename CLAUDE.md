@@ -247,9 +247,11 @@ Two traps, both already hit on the MotoRacer project this convention comes from:
 
 ## Origin map: every function records where it came from
 
-`src_drv/origin.txt` maps each function in the replacement to the address and
-name of the original it derives from. Add a row in the same change that adds
-the function - not afterwards.
+`src_drv/origin.tsv` maps each function in the replacement to the address and
+name of the original it derives from, one tab-separated row per
+correspondence. Add a row in the same change that adds the function - not
+afterwards. `src_drv/origin.txt` is the prose beside it: what the kinds mean
+and which entries are not one to one.
 
 ```
 python tools/originmap.py --check    report drift, exit 1 if any
@@ -259,8 +261,12 @@ python tools/originmap.py --fix      re-align the table
 Deliberately a **file, not an `[origin]` tag in a comment**: it stays out of the
 source, and it can be diffed, grepped and mechanically checked. `--check`
 verifies both directions - a function with no row, and a row naming a function
-that no longer exists - and `--fix` re-aligns, so a row can be typed loosely
-between the borders without counting columns.
+that no longer exists - plus the schema and ASCII. `--fix` sorts; it refuses to
+touch a file with malformed rows.
+
+**Tab-separated, not an aligned table.** It was a table once; the fixed columns
+had one character of headroom, so any longer name aborted the tool and widening
+a column rewrote every row. See `origin.txt` section 5.
 
 Three kinds: `port` (one to one), `part` (covers some of an original, or one of
 several - there may be several rows for one function), `new` (no original;
