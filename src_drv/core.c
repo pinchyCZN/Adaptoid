@@ -857,6 +857,147 @@ void core_effect_window(core_state *cs, s32 start_tick, u8 *payload)
 }
 
 /* ------------------------------------------------------------------ */
+/* The effect send chain                                               */
+/* ------------------------------------------------------------------ */
+
+static int core_effect_send_periodic(core_state *cs, u64 now_100ns);
+
+/* Hand one transfer to the transport and record who owns its completion. */
+static int core_effect_issue(core_state *cs, u8 request, u16 value,
+                             u16 index, u8 next)
+{
+	core_vendor_req req;
+
+	if (cs->vendor == 0) {
+		return 0;
+	}
+	core_zero(&req, (u32)sizeof(req));
+	req.bmRequestType = (u8)CORE_VENDOR_OUT;
+	req.bRequest      = request;
+	req.wValue        = value;
+	req.wIndex        = index;
+
+	cs->effect_next = next;
+	return cs->vendor(cs->vendor_ctx, &req) ? 1 : 0;
+}
+
+/*
+ * The bitmap travels in the setup packet rather than a data stage: four
+ * bytes fit exactly in wValue and wIndex, which is presumably why the
+ * design needs no data stage at all.
+ */
+static int core_effect_send_bitmap(core_state *cs, u8 request,
+                                   const u8 *payload, u8 next)
+{
+	u16 value = (u16)(payload[0] | ((u16)payload[1] << 8));
+	u16 index = (u16)(payload[2] | ((u16)payload[3] << 8));
+
+	return core_effect_issue(cs, request, value, index, next);
+}
+
+/*
+ * Poke a vendor register at most once every three seconds, then continue to
+ * the periodic send.
+ *
+ * The test is that the last poke is in the past AND no more than three
+ * seconds old. Failing EITHER half pokes again, so a clock that jumps
+ * backwards re-arms rather than going quiet - which matters, because the
+ * whole point is that the accessory stops rumbling if it stops hearing from
+ * the driver.
+ */
+static int core_effect_keepalive(core_state *cs, u64 now_100ns)
+{
+	if (cs->claim_effect_tick) {
+		return core_effect_tick(cs, now_100ns);
+	}
+
+	if (cs->keepalive_time <= now_100ns &&
+	    now_100ns <= cs->keepalive_time + CORE_FX_KEEPALIVE_100NS) {
+		return core_effect_send_periodic(cs, now_100ns);
+	}
+
+	cs->keepalive_time = now_100ns;
+	return core_effect_issue(cs, CORE_FX_CMD_KEEPALIVE,
+	                         CORE_FX_KEEPALIVE_VALUE,
+	                         CORE_FX_KEEPALIVE_INDEX,
+	                         CORE_FX_NEXT_PERIODIC);
+}
+
+/*
+ * Extend the ring by one window and send it. This transfer carries NO
+ * completion: the chain ends here and the next timer tick starts it again.
+ */
+static int core_effect_send_periodic(core_state *cs, u64 now_100ns)
+{
+	u8 payload[CORE_EFFECT_PAYLOAD];
+
+	if (cs->claim_effect_tick) {
+		return core_effect_tick(cs, now_100ns);
+	}
+
+	cs->effect_state = CORE_FX_STATE_PERIODIC;
+	core_effect_evaluate(cs, 0, cs->next_tick, payload);
+	cs->next_tick += CORE_EFFECT_WINDOW;
+
+	return core_effect_send_bitmap(cs, CORE_FX_CMD_PERIODIC, payload,
+	                               CORE_FX_NEXT_NONE);
+}
+
+int core_effect_tick(core_state *cs, u64 now_100ns)
+{
+	u8  payload[CORE_EFFECT_PAYLOAD];
+	s32 tick;
+
+	if (cs == 0) {
+		return 0;
+	}
+	cs->claim_effect_tick = 0;
+	tick = (s32)(now_100ns / CORE_TICK_100NS);
+
+	if (core_effect_evaluate(cs, 1, tick, payload) == 0) {
+		/* The bitmap changed, so it has to go out. */
+		cs->next_tick    = tick + CORE_EFFECT_WINDOW;
+		cs->effect_state = CORE_FX_STATE_TICK;
+		/*
+		 * TODO: the original also clears its pending pak-insert and
+		 * pak-remove claims here, which this layer does not own yet.
+		 */
+		return core_effect_send_bitmap(cs, CORE_FX_CMD_TICK, payload,
+		                               CORE_FX_NEXT_KEEPALIVE);
+	}
+
+	/*
+	 * Nothing changed. If the last thing sent was a tick window, keep the
+	 * chain alive anyway - otherwise the accessory would eventually stop
+	 * hearing from the driver.
+	 */
+	if (cs->effect_state == CORE_FX_STATE_TICK) {
+		return core_effect_keepalive(cs, now_100ns);
+	}
+	return 0;
+}
+
+int core_effect_complete(core_state *cs, u64 now_100ns)
+{
+	u8 next;
+
+	if (cs == 0) {
+		return 0;
+	}
+	next = cs->effect_next;
+	cs->effect_next = CORE_FX_NEXT_NONE;
+
+	switch (next) {
+	case CORE_FX_NEXT_KEEPALIVE:
+		return core_effect_keepalive(cs, now_100ns);
+	case CORE_FX_NEXT_PERIODIC:
+		return core_effect_send_periodic(cs, now_100ns);
+	default:
+		return 0;
+	}
+}
+
+/* ------------------------------------------------------------------ */
 /* The accessory probe                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -894,8 +1035,6 @@ void core_effect_window(core_state *cs, s32 start_tick, u8 *payload)
 #define CORE_PROBE_STEP_SEL2    (CORE_PROBE_OUT_STEPS + 3)  /* 8 */
 #define CORE_PROBE_STEP_DONE    (CORE_PROBE_OUT_STEPS + 4)  /* 9 */
 
-#define CORE_VENDOR_OUT         0x40u
-#define CORE_VENDOR_IN          0xC0u
 #define CORE_VENDOR_REG_WRITE   0x72u   /* the five setup writes  */
 #define CORE_VENDOR_N64         0x21u   /* short-form transaction */
 #define CORE_VENDOR_RESELECT    0x74u   /* accessory port select  */

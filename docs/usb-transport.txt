@@ -185,6 +185,37 @@ Table of Contents
    bit per 1/64-second tick. Four bytes fit exactly in wValue and wIndex,
    which is presumably why the design needs no data stage.
 
+   THREE MORE REQUESTS BELONG TO THE SAME ENGINE, and the four together form
+   a chain in which each transfer's completion routine starts the next step:
+
+   Sender names below drop their common drv_Effect prefix.
+
+   +---------+----------------+---------------------------------------------+
+   | Request | Sent by        | Meaning                                     |
+   +=========+================+=============================================+
+   | 0x36    | Tick           | a re-armed window. Its completion runs      |
+   |         |                | KeepAlive.                                  |
+   | 0x72    | KeepAlive      | wValue 0xFF22, wIndex 0x0094. A register    |
+   |         |                | poke sent AT MOST ONCE EVERY THREE SECONDS. |
+   |         |                | Its completion runs SendPeriodic.           |
+   | 0x35    | SendPeriodic   | the continuation window. NO completion      |
+   |         |                | routine - the chain ends here and the next  |
+   |         |                | timer tick restarts it.                     |
+   | 0x32    | SendUpdate     | motor stop, once EffectIdleTicks passes 4.  |
+   |         |                | Also clears RingCount.                      |
+   +---------+----------------+---------------------------------------------+
+
+   THE KEEP-ALIVE TEST is that the last poke is in the past AND no more than
+   three seconds old, 30000000 in 100ns units. Failing EITHER half pokes
+   again and restamps, so a clock that jumps backwards re-arms rather than
+   going quiet. Verified by emulation: 2.9 seconds and exactly 3.0 seconds
+   are treated as fresh, 3.1 seconds is stale, and a backwards clock pokes.
+
+   0x35 and 0x36 carry an identical payload; they differ only in which step
+   of the chain sent them. Note also that every step first checks a pending
+   timer-tick claim and defers to drv_EffectTick if one is waiting, so a new
+   tick always preempts a chain already in flight.
+
    3.3.  The Two Accessory CRCs
 
    Accessory reads and writes carry two checksums, computed by

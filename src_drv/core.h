@@ -123,6 +123,10 @@ typedef struct core_vendor_req {
  */
 typedef int (*core_vendor_fn)(void *ctx, const core_vendor_req *req);
 
+/* Transfer direction, the two values bmRequestType ever takes here. */
+#define CORE_VENDOR_OUT         0x40u   /* host to device */
+#define CORE_VENDOR_IN          0xC0u   /* device to host */
+
 /* The N64 request-info reply is four bytes; see ../docs/usb-transport.txt. */
 #define CORE_PROBE_REPLY_BYTES  4
 
@@ -247,7 +251,46 @@ typedef struct core_effect_slot {
  */
 #define CORE_RING_SIZE          96
 
-typedef struct core_effect_tick {
+/*
+ * THE SEND CHAIN. The engine is not driven by a loop; each USB transfer's
+ * completion kicks the next step, so the motor stays fed for as long as
+ * something is playing:
+ *
+ *     core_effect_tick        timer entry. Evaluates against the ring and,
+ *                             if the bitmap changed, sends 0x36.
+ *       -> completion         core_effect_keepalive
+ *     core_effect_keepalive   poke a vendor register at most once every
+ *                             three seconds, then
+ *       -> completion         core_effect_send_periodic
+ *     core_effect_send_periodic  extend the ring by one window and send
+ *                             0x35. NO completion - the chain ends here and
+ *                             the next timer tick restarts it.
+ *
+ * Both 0x35 and 0x36 carry the same thing: the 32-bit pulse bitmap, packed
+ * into wValue and wIndex rather than a data stage.
+ */
+#define CORE_FX_CMD_STOP        0x32    /* motor off, idle path       */
+#define CORE_FX_CMD_PERIODIC    0x35    /* continuation window        */
+#define CORE_FX_CMD_TICK        0x36    /* re-armed window            */
+#define CORE_FX_CMD_KEEPALIVE   0x72    /* the register poke          */
+
+#define CORE_FX_KEEPALIVE_VALUE 0xFF22
+#define CORE_FX_KEEPALIVE_INDEX 0x0094
+
+/* Three seconds, in 100ns units: how stale a keep-alive may get. */
+#define CORE_FX_KEEPALIVE_100NS 30000000
+
+/* EffectState in the original: which kind of send was last issued. */
+#define CORE_FX_STATE_IDLE      0
+#define CORE_FX_STATE_TICK      1
+#define CORE_FX_STATE_PERIODIC  2
+
+/* Which step owns the completion of the transfer now in flight. */
+#define CORE_FX_NEXT_NONE       0
+#define CORE_FX_NEXT_KEEPALIVE  1
+#define CORE_FX_NEXT_PERIODIC   2
+
+typedef struct core_effect_ring_entry {
 	s32 pulse;              /* the bit that ships          */
 	s32 intensity;
 	s32 filtered_x;
@@ -255,7 +298,7 @@ typedef struct core_effect_tick {
 	s32 accumulator;
 	s32 dither_burst;
 	s32 tune_counter;
-} core_effect_tick;
+} core_effect_ring_entry;
 
 /*
  * Core state. Mirrors the parts of the 0x1800-byte device extension that hold
@@ -307,10 +350,17 @@ typedef struct core_state {
 	 * window is being evaluated; they are seeded from the entry before the
 	 * window starts and written back into each entry as it is computed.
 	 */
-	core_effect_tick ring[CORE_RING_SIZE];
+	core_effect_ring_entry ring[CORE_RING_SIZE];
 	s32             ring_head;      /* index of the oldest valid entry     */
 	s32             ring_count;     /* 0..CORE_RING_SIZE                   */
 	s32             ring_base_tick; /* the tick ring_head stands for       */
+
+	/* The send chain. */
+	s32             effect_state;   /* CORE_FX_STATE_*                     */
+	s32             next_tick;      /* first tick of the next window       */
+	u64             keepalive_time; /* raw 100ns of the last register poke */
+	int             claim_effect_tick; /* a timer tick is waiting          */
+	u8              effect_next;    /* CORE_FX_NEXT_*, owns the completion */
 
 	/*
 	 * Motor drive calibration. These are NOT tuning-mode-only values: the
@@ -430,6 +480,21 @@ void core_effect_window(core_state *cs, s32 start_tick, u8 *payload);
 
 /* Drop every precomputed tick, as the idle motor-stop path does. */
 void core_effect_ring_reset(core_state *cs);
+
+/*
+ * THE SEND CHAIN.
+ *
+ * core_effect_tick is the timer entry point; now_100ns is raw interrupt time,
+ * which it divides by CORE_TICK_100NS to get the 1/64-second tick.
+ *
+ * core_effect_complete is called when the transfer the core last issued has
+ * finished, and runs whichever step owns that completion. It returns zero
+ * once the chain has run out, which is the normal end of a round.
+ *
+ * Both return non-zero if they issued a transfer.
+ */
+int core_effect_tick(core_state *cs, u64 now_100ns);
+int core_effect_complete(core_state *cs, u64 now_100ns);
 
 void core_set_vendor(core_state *cs, core_vendor_fn fn, void *ctx);
 int  core_probe_start(core_state *cs);

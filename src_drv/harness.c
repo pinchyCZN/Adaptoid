@@ -1171,6 +1171,159 @@ static int test_effect_engine(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* The effect send chain                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Drive the chain to exhaustion: complete whatever is outstanding and let
+ * each completion issue its successor, exactly as USB completions would.
+ */
+static void effect_pump(core_state *cs, u64 now)
+{
+	int guard = 0;
+
+	while (g_bus_busy && guard++ < BUS_LOG_MAX) {
+		g_bus_busy = 0;
+		if (!core_effect_complete(cs, now)) {
+			break;
+		}
+	}
+}
+
+static void effect_arm_chain(core_state *cs)
+{
+	core_init(cs, 0, 0);
+	core_set_vendor(cs, harness_vendor, 0);
+	cs->effect[0].type       = CORE_FX_CONSTANT;
+	cs->effect[0].running    = 1;
+	cs->effect[0].start_tick = 0;
+	cs->effect[0].duration   = CORE_FX_INFINITE;
+	cs->effect[0].axis[0].periodic.magnitude = 40;
+	cs->effect[0].axis[1].periodic.magnitude = 40;
+	bus_reset(0);
+}
+
+/*
+ * The keep-alive decision, against the ORIGINAL. Emulated out of
+ * drv_EffectKeepAlive with the clock forced to a chosen value: within three
+ * seconds of the last poke it goes straight to the periodic send, otherwise
+ * it pokes the register again and restamps.
+ */
+static int test_effect_chain(void)
+{
+	core_state cs;
+	int bad = 0;
+	int k;
+
+	static const struct {
+		u64  last;          /* keepalive_time going in  */
+		u64  now;
+		int  pokes;         /* does it poke the register */
+		u64  after;         /* keepalive_time coming out */
+		const char *what;
+	} KA[] = {
+		{          0, 100000000, 1, 100000000, "never poked"       },
+		{  100000000, 110000000, 0, 100000000, "one second later"  },
+		{  100000000, 129000000, 0, 100000000, "2.9s, still fresh" },
+		{  100000000, 130000000, 0, 100000000, "exactly 3s"        },
+		{  100000000, 131000000, 1, 131000000, "3.1s, stale"       },
+		{  200000000, 100000000, 1, 100000000, "clock went back"   }
+	};
+
+	/* 1. The full chain from cold: bitmap, poke, periodic, then stop. */
+	effect_arm_chain(&cs);
+	core_effect_tick(&cs, 100000000);
+	effect_pump(&cs, 100000000);
+	if (g_bus_count != 3) {
+		hlog("  FAIL chain: %d transfers, want 3\n", g_bus_count);
+		bad++;
+	} else if (g_bus_log[0].bRequest != CORE_FX_CMD_TICK ||
+	           g_bus_log[1].bRequest != CORE_FX_CMD_KEEPALIVE ||
+	           g_bus_log[2].bRequest != CORE_FX_CMD_PERIODIC) {
+		hlog("  FAIL chain order: %02X %02X %02X, want %02X %02X %02X\n",
+		     g_bus_log[0].bRequest, g_bus_log[1].bRequest,
+		     g_bus_log[2].bRequest, CORE_FX_CMD_TICK,
+		     CORE_FX_CMD_KEEPALIVE, CORE_FX_CMD_PERIODIC);
+		bad++;
+	} else if (g_bus_log[1].wValue != CORE_FX_KEEPALIVE_VALUE ||
+	           g_bus_log[1].wIndex != CORE_FX_KEEPALIVE_INDEX) {
+		hlog("  FAIL keepalive packet: val=%04X idx=%04X, want %04X %04X\n",
+		     g_bus_log[1].wValue, g_bus_log[1].wIndex,
+		     CORE_FX_KEEPALIVE_VALUE, CORE_FX_KEEPALIVE_INDEX);
+		bad++;
+	}
+	/* The window sent as 0x36 must be the one the ring holds. */
+	if (g_bus_count >= 1 && g_bus_log[0].wValue == 0 &&
+	    g_bus_log[0].wIndex == 0) {
+		hlog("  FAIL chain: the tick transfer carried an empty bitmap\n");
+		bad++;
+	}
+
+	/* 2. The keep-alive decision itself. */
+	for (k = 0; k < (int)(sizeof(KA) / sizeof(KA[0])); k++) {
+		int poked;
+
+		effect_arm_chain(&cs);
+		cs.keepalive_time = KA[k].last;
+		core_effect_tick(&cs, KA[k].now);
+		effect_pump(&cs, KA[k].now);
+
+		poked = (g_bus_count >= 2 &&
+		         g_bus_log[1].bRequest == CORE_FX_CMD_KEEPALIVE) ? 1 : 0;
+		if (poked != KA[k].pokes) {
+			hlog("  FAIL keepalive %s: %s, want %s\n", KA[k].what,
+			     poked ? "poked" : "skipped",
+			     KA[k].pokes ? "poked" : "skipped");
+			bad++;
+		}
+		if (cs.keepalive_time != KA[k].after) {
+			hlog("  FAIL keepalive %s: stamp %llu, want %llu\n", KA[k].what,
+			     (unsigned long long)cs.keepalive_time,
+			     (unsigned long long)KA[k].after);
+			bad++;
+		}
+		/* The periodic send closes every round either way. */
+		if (g_bus_count != (KA[k].pokes ? 3 : 2)) {
+			hlog("  FAIL keepalive %s: %d transfers\n",
+			     KA[k].what, g_bus_count);
+			bad++;
+		}
+		htrace("keepalive %-18s last=%10llu now=%10llu -> %s, %d transfers\n",
+		       KA[k].what, (unsigned long long)KA[k].last,
+		       (unsigned long long)KA[k].now,
+		       poked ? "poke" : "skip", g_bus_count);
+	}
+
+	/*
+	 * 3. A waiting timer tick preempts the chain: both the keep-alive and
+	 *    the periodic step defer to it rather than carrying on.
+	 */
+	effect_arm_chain(&cs);
+	core_effect_tick(&cs, 100000000);
+	cs.claim_effect_tick = 1;
+	g_bus_busy = 0;
+	core_effect_complete(&cs, 100000000);
+	if (cs.claim_effect_tick != 0) {
+		hlog("  FAIL preempt: the claim was not consumed\n");
+		bad++;
+	}
+
+	/* 4. With nothing playing there is nothing to send. */
+	core_init(&cs, 0, 0);
+	core_set_vendor(&cs, harness_vendor, 0);
+	bus_reset(0);
+	core_effect_tick(&cs, 100000000);
+	if (g_bus_count != 1) {
+		hlog("  FAIL idle: %d transfers, want 1\n", g_bus_count);
+		bad++;
+	}
+	effect_pump(&cs, 100000000);
+
+	hlog("Effect send chain      : %s (4 groups)\n", bad ? "FAIL" : "ok");
+	return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1240,6 +1393,7 @@ int main(int argc, char **argv)
 	bad += test_joystick_report();
 	bad += test_accessory_probe();
 	bad += test_effect_engine();
+	bad += test_effect_chain();
 
 	/* 1. Load. */
 	status = DriverEntry(&driver, &regpath);
