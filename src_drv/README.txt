@@ -347,6 +347,33 @@ Table of Contents
       GET_SELECT_CONFIGURATION_REQUEST_SIZE(0, 0) underflows. None of those
       is visible from Win32 Debug alone.
 
+   -  WHERE HARNESS.C SUPPLIES A FUNCTION, THE SUITE TESTS THE STUB AND NOT
+      THE DRIVER. This is the sharpest limit in the tree and it has hidden
+      three separate bugs, each of which reached hardware with every group
+      green:
+
+         AdaptoidCompleteRead     the real one released RemoveLockB, the
+                                  stub did not. The reference count ran to
+                                  -1103 on a live device.
+         the cancel-routine tests they set Cancel and called the routine
+                                  but left Irp->CancelRoutine installed,
+                                  which the I/O manager clears first. A
+                                  routine that re-claimed the IRP therefore
+                                  passed here and leaked it on hardware,
+                                  wedging the calling thread and the
+                                  process with it.
+
+      The rule that follows: a stub is a claim about the real function, and
+      an untrue claim is worse than no test. When a bug is found in code the
+      harness replaces, FIX THE STUB IN THE SAME CHANGE and confirm the test
+      goes red against the old code - otherwise the suite certifies the
+      opposite of what happened.
+
+      Prefer compiling the real function into the harness over modelling it.
+      AdaptoidCompleteRead could be, given read fixtures that carry a
+      UserBuffer and an OutputBufferLength; it is still a stub only because
+      that work has not been done.
+
 
 6.2.  Specifications For What Remains
 

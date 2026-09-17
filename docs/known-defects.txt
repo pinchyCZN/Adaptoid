@@ -969,6 +969,27 @@ Table of Contents
    motor-off cannot be lost. The mechanism to do the right thing is already
    there and this path does not use it.
 
+   In the replacement:  REPRODUCED, and it is the only defect in this
+   document that is. core_cmd_exec in src_drv/ioctl.c returns without
+   setting CORE_CMD_FAILED when cmd_claim refuses, and says so in a comment
+   at the point it happens.
+
+   The reason is that the command block is a published contract with SDK
+   clients rather than an internal path. What a client reads back is the
+   reply space and the 0x80 bit, and a replacement that set the bit here
+   would report a failure where the original reported none - so software
+   written against the original could take an error path it has never
+   taken before, on a condition that arises routinely whenever rumble is
+   running.
+
+   THAT REASONING IS WORTH RE-EXAMINING RATHER THAN INHERITING. It trades a
+   silent wrong answer for compatibility with clients that may not exist,
+   and the doubt is the whole point of recording it here: a caller cannot
+   distinguish "the controller answered this" from "nothing ran", which is
+   the one thing the 0x80 bit exists to tell it. Deferring the work the way
+   drv_SetDeviceEnable does would be better than either, and the transport
+   already has the deferred-work queue to do it with.
+
 
 21. Defect 19: A Notification Wait Returns A Status It Has Forfeited
 
