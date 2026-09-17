@@ -5510,6 +5510,55 @@ static int test_wdm_transport(void)
 		groups++;
 	}
 
+	/* ---- a submit that fails must put everything back --------------
+	 *
+	 * THE BUG THIS EXISTS FOR, and it needed Driver Verifier's
+	 * low-resources injection to find on hardware even though it was
+	 * always reachable from here: g_urb_ret has been a knob the whole
+	 * time and nothing ever turned it.
+	 *
+	 * AdaptoidVendorSend takes RemoveLockB on entry and moves the slot to
+	 * IN_FLIGHT, then hands off to AdaptoidVendorSubmitUrb. That routine
+	 * frees only what IT allocated, so when its allocation fails the
+	 * caller's lock reference and the slot are both abandoned - no
+	 * completion will ever run to undo them.
+	 *
+	 * The symptom is not a crash. RemoveLockB never reaches zero, so
+	 * AdaptoidLockReleaseAndWait waits forever, the driver cannot unload,
+	 * and the device sits half torn down: present to the driver, gone
+	 * from Windows. Measured on the live driver as RemoveLockB.IoCount
+	 * stuck at 1 with Removed already set.
+	 */
+	{
+		wdm_reset(&dx);
+		g_urb_count = 0;
+		g_urb_ret   = STATUS_INSUFFICIENT_RESOURCES;
+
+		sched_expect(AdaptoidVendorTryClaim(&dx) != 0,
+		             "the slot is claimed", 1, 1, &bad);
+
+		setup.bmRequestType = ADAPTOID_VENDOR_OUT;
+		setup.bRequest      = 0x72;
+		setup.wValue        = 0;
+		setup.wIndex        = 0;
+		st = AdaptoidVendorSend(&dx, &setup, 0, 0, 0);
+
+		sched_expect(!NT_SUCCESS(st),
+		             "a failed submit is reported", 1, 1, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "the remove lock is given back",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		sched_expect(dx.Vendor.State == ADAPTOID_SLOT_FREE,
+		             "and the slot is free again",
+		             dx.Vendor.State, ADAPTOID_SLOT_FREE, &bad);
+
+		/* A second transfer must still be possible. */
+		g_urb_ret = STATUS_PENDING;
+		sched_expect(AdaptoidVendorTryClaim(&dx) != 0,
+		             "so the next transfer can claim it", 1, 1, &bad);
+		groups++;
+	}
+
 	hlog("WDM lock and transport : %s (%d groups)\n", bad ? "FAIL" : "ok",
 	     groups);
 	return bad;

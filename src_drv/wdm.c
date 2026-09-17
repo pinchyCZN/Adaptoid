@@ -626,8 +626,40 @@ NTSTATUS AdaptoidVendorSend(PADAPTOID_DEVEXT DevExt,
 	}
 
 	slot->SubmitTime = KeQueryInterruptTime();
-	return AdaptoidVendorSubmitUrb(DevExt, Setup, TransferLength,
-	                               TransferBuffer);
+	status = AdaptoidVendorSubmitUrb(DevExt, Setup, TransferLength,
+	                                 TransferBuffer);
+	if (!NT_SUCCESS(status)) {
+		/*
+		 * THE TRANSFER NEVER REACHED THE BUS, so no completion will
+		 * ever run to undo what this routine did on the way in.
+		 * AdaptoidVendorSubmitUrb frees only what it allocated; the
+		 * claim and the remove lock are ours to put back.
+		 *
+		 * WITHOUT THIS THE DRIVER CANNOT BE UNLOADED AGAIN. The
+		 * reference taken on entry is stranded, RemoveLockB never
+		 * reaches zero, AdaptoidLockReleaseAndWait waits forever and
+		 * the device stays half torn down - present to us, gone from
+		 * Windows. It takes an allocation failure to reach, which is
+		 * why it needed Driver Verifier's low-resources injection to
+		 * find: measured as RemoveLockB.IoCount stuck at 1 with
+		 * Removed already set.
+		 *
+		 * The slot has to go back too. It was moved to IN_FLIGHT just
+		 * above, and VendorFail only releases a CLAIMED one, so
+		 * without the rollback the single vendor slot is stranded
+		 * instead - the same bug wearing a different hat.
+		 */
+		KeAcquireSpinLock(&slot->Lock, &irql);
+		if (slot->State == ADAPTOID_SLOT_IN_FLIGHT) {
+			slot->State    = ADAPTOID_SLOT_CLAIMED;
+			slot->Callback = NULL;
+		}
+		KeReleaseSpinLock(&slot->Lock, irql);
+
+		VendorFail(DevExt, status);
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
+	}
+	return status;
 }
 
 /*
