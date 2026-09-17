@@ -495,7 +495,8 @@ void IoSetCompletionRoutine(PIRP Irp, PIO_COMPLETION_ROUTINE Routine,
                             BOOLEAN OnError, BOOLEAN OnCancel);
 
 /* Pool types. The driver only ever asks for non-paged. */
-typedef enum _POOL_TYPE { NonPagedPool = 0, PagedPool = 1 } POOL_TYPE;
+typedef enum _POOL_TYPE { NonPagedPool = 0, PagedPool = 1,
+                          NonPagedPoolNx = 512 } POOL_TYPE;
 
 /* Timers and DPCs, for the script scheduler. */
 void    KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context);

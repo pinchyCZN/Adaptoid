@@ -1307,7 +1307,7 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 	ULONG    size = ADAPTOID_CONFIG_FIRST_TRY;
 	NTSTATUS st;
 
-	urb = (PURB)ExAllocatePoolWithTag(NonPagedPool, sizeof(DESC_REQUEST),
+	urb = (PURB)ExAllocatePoolWithTag(ADAPTOID_NONPAGED, sizeof(DESC_REQUEST),
 	                                  ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -1317,7 +1317,7 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 		PUSB_CONFIGURATION_DESCRIPTOR cd;
 
 		DevExt->ConfigDescriptor =
-		        ExAllocatePoolWithTag(NonPagedPool, size,
+		        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, size,
 		                              ADAPTOID_POOL_TAG);
 		if (DevExt->ConfigDescriptor == NULL) {
 			ExFreePool(urb);
@@ -1401,7 +1401,7 @@ NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
 
 	info = list[0].Interface;
 	DevExt->InterfaceInfo =
-	        ExAllocatePoolWithTag(NonPagedPool, info->Length,
+	        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, info->Length,
 	                              ADAPTOID_POOL_TAG);
 	if (DevExt->InterfaceInfo == NULL) {
 		ExFreePool(urb);
@@ -1446,7 +1446,7 @@ void AdaptoidUnconfigureDevice(PADAPTOID_DEVEXT DevExt)
 	if (DevExt->ConfigurationHandle == NULL) {
 		return;
 	}
-	urb = (PURB)ExAllocatePoolWithTag(NonPagedPool, size,
+	urb = (PURB)ExAllocatePoolWithTag(ADAPTOID_NONPAGED, size,
 	                                  ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return;
@@ -1563,7 +1563,7 @@ NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
 	ULONG              flags;
 
 	urb = (struct _URB_CONTROL_VENDOR_OR_CLASS_REQUEST *)
-	        ExAllocatePoolWithTag(NonPagedPool, sizeof(*urb),
+	        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, sizeof(*urb),
 	                              ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -1638,7 +1638,7 @@ NTSTATUS AdaptoidPollSubmit(PADAPTOID_DEVEXT DevExt, ULONG Slot)
 		return STATUS_INVALID_PARAMETER;
 	}
 	urb = (struct _URB_BULK_OR_INTERRUPT_TRANSFER *)
-	        ExAllocatePoolWithTag(NonPagedPool, sizeof(*urb),
+	        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, sizeof(*urb),
 	                              ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -3161,7 +3161,7 @@ static void AdaptoidScriptArm(void *ctx, u64 wake_time)
 static void *AdaptoidSchedAlloc(void *ctx, u32 bytes)
 {
 	UNREFERENCED_PARAMETER(ctx);
-	return ExAllocatePoolWithTag(NonPagedPool, bytes, ADAPTOID_POOL_TAG);
+	return ExAllocatePoolWithTag(ADAPTOID_NONPAGED, bytes, ADAPTOID_POOL_TAG);
 }
 
 static void AdaptoidSchedFree(void *ctx, void *block)

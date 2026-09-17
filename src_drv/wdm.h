@@ -230,6 +230,21 @@ int AdaptoidRouteOf(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 #define ADAPTOID_POOL_TAG       0x30706441UL
 
 /*
+ * NON-EXECUTABLE non-paged pool, which is what every allocation here uses.
+ *
+ * SPELLED OUT BECAUSE WDK 7.1 PREDATES IT. NonPagedPoolNx arrived in
+ * Windows 8; the headers this builds against know only NonPagedPool, which
+ * is EXECUTABLE. Modern Windows treats executable kernel pool as a security
+ * defect and Driver Verifier's pool-type check bugchecks on it - caught in
+ * AdaptoidFetchDeviceDescriptor with nt!VfCheckPoolType on the stack.
+ *
+ * 512 is the value NonPagedPoolNx has in every WDM header that defines the
+ * enum, so this is that constant rather than a guess. When this moves to a
+ * modern WDK the definition can be replaced by the enum itself.
+ */
+#define ADAPTOID_NONPAGED       ((POOL_TYPE)512)
+
+/*
  * How large the first configuration-descriptor fetch asks for. Generous on
  * purpose - this adapter's is a small fraction of it, so the fetch normally
  * costs one round trip rather than two. wTotalLength drives the retry when
