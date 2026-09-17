@@ -26,6 +26,7 @@ rem ----------------------------------------------------------------------
 
 set "INFNAME=adaptoid.inf"
 set "HWID=USB\VID_06F7&PID_0001"
+for %%H in ("USB\VID_06F7&PID_0001") do set "HWLEAF=%%~nxH"
 
 net session >nul 2>&1
 if errorlevel 1 (
@@ -41,10 +42,16 @@ for /f "usebackq tokens=*" %%K in (
     `reg query "HKLM\SYSTEM\CurrentControlSet\Enum\%HWID%" 2^>nul`
 ) do (
     set "KEY=%%K"
+    rem SKIP THE PARENT KEY. reg query prints the queried key itself as
+    rem well as its subkeys, and taking its last component yields the
+    rem hardware id rather than an instance id - a removal that always
+    rem fails and reports itself as pnputil being unavailable.
+    set "INST="
     rem The instance id is the last path component of the enum key.
     for %%I in ("!KEY!") do set "INST=%%~nxI"
+    if /i "!INST!"=="!HWLEAF!" set "INST="
     if defined INST (
-        echo   removing %HWID%\!INST!
+        echo   removing !HWID!\!INST!
         pnputil /remove-device "%HWID%\!INST!" 2>nul
         if errorlevel 1 (
             echo     pnputil /remove-device unavailable or refused;

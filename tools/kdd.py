@@ -128,9 +128,11 @@ class Session(object):
     def _drain(self, timeout):
         """Collect output until kd prompts again, or time runs out.
 
-        RETURNS WHAT IT HAS EITHER WAY. A timeout usually means the target
-        is running rather than that anything is wrong -- `g` never prompts
-        until something breaks in -- so partial output is the answer.
+        RETURNS WHAT IT HAS EITHER WAY, and a timeout is AMBIGUOUS: it can
+        mean the target is running and will not prompt until something
+        breaks in, or that the command is simply still producing output.
+        Nothing here can tell those apart, so nothing here decides - see
+        send(), which only ever treats a PROMPT as evidence of a halt.
         """
         deadline = time.time() + timeout
         buf = bytearray()
@@ -175,7 +177,16 @@ class Session(object):
         backlog = self._flush()
         self._write(command + "\r\n")
         text = self._drain(timeout)
-        self.halted = bool(PROMPT.search(text.encode("utf-8", "replace")))
+        # A DRAIN TIMEOUT IS NOT EVIDENCE THE TARGET IS RUNNING. It far
+        # more often means the command is still producing output - a long
+        # !drvobj, a .reload - and commands are only ever sent to a target
+        # that break_in already halted. Inferring "running" from a timeout
+        # made status report a free-running VM while it was in fact frozen
+        # at a prompt, which is worse than useless: it is confidently
+        # wrong, and it sends whoever is reading it off diagnosing a hang
+        # that is really a stopped debugger. Only a prompt is evidence.
+        if PROMPT.search(text.encode("utf-8", "replace")):
+            self.halted = True
         return backlog + text
 
     # -- halt and resume ----------------------------------------------
@@ -239,18 +250,26 @@ class Session(object):
                 return {"ok": False, "error": "kd is not running"}
 
             out = [self.break_in()]
-            for line in lines:
-                stripped = line.strip()
-                if not stripped or stripped.startswith(".echo "):
-                    out.append(stripped[6:] if stripped else "")
-                    continue
-                if stripped.lower() in ("q", "qd", "qq"):
-                    out.append("[refused: %s would abandon the session]"
-                               % stripped)
-                    continue
-                out.append(self.send(stripped, timeout))
-            if not hold:
-                self.resume()
+            try:
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith(".echo "):
+                        out.append(stripped[6:] if stripped else "")
+                        continue
+                    if stripped.lower() in ("q", "qd", "qq"):
+                        out.append("[refused: %s would abandon the "
+                                   "session]" % stripped)
+                        continue
+                    out.append(self.send(stripped, timeout))
+            finally:
+                # RESUME EVEN IF A COMMAND THREW. The client may already
+                # have given up and disconnected - it has its own, shorter
+                # timeout - but the guest is frozen until something here
+                # releases it, and nothing else will. Leaving it stopped
+                # because of an exception on this side is the one outcome
+                # that costs the user a reboot.
+                if not hold:
+                    self.resume()
             return {"ok": True, "halted": self.halted,
                     "break_method": self.break_method,
                     "text": "\n".join(out)}
