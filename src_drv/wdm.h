@@ -230,19 +230,26 @@ int AdaptoidRouteOf(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 #define ADAPTOID_POOL_TAG       0x30706441UL
 
 /*
- * NON-EXECUTABLE non-paged pool, which is what every allocation here uses.
+ * The pool type every allocation here uses, CHOSEN AT RUNTIME.
  *
- * SPELLED OUT BECAUSE WDK 7.1 PREDATES IT. NonPagedPoolNx arrived in
- * Windows 8; the headers this builds against know only NonPagedPool, which
- * is EXECUTABLE. Modern Windows treats executable kernel pool as a security
- * defect and Driver Verifier's pool-type check bugchecks on it - caught in
- * AdaptoidFetchDeviceDescriptor with nt!VfCheckPoolType on the stack.
+ * NonPagedPoolNx - non-executable non-paged pool - is Windows 8 and later.
+ * Plain NonPagedPool is EXECUTABLE, which modern Windows treats as a
+ * security defect: Driver Verifier's pool-type check bugchecks on it, and
+ * that is how it was found here, with nt!VfCheckPoolType above
+ * AdaptoidFetchDeviceDescriptor.
  *
- * 512 is the value NonPagedPoolNx has in every WDM header that defines the
- * enum, so this is that constant rather than a guess. When this moves to a
- * modern WDK the definition can be replaced by the enum itself.
+ * IT CANNOT SIMPLY BE HARDCODED, because this driver has to load on
+ * Windows 7 as well, where the value 512 names no pool type at all. So
+ * AdaptoidInitPoolType asks the running OS once, at DriverEntry, and every
+ * allocation uses what it decided. 512 is the value NonPagedPoolNx carries
+ * in every WDM header that defines the enum; it is spelled out because the
+ * WDK 7.1 headers this builds against predate it.
  */
-#define ADAPTOID_NONPAGED       ((POOL_TYPE)512)
+#define ADAPTOID_POOL_NX        ((POOL_TYPE)512)
+
+extern POOL_TYPE AdaptoidPoolType;
+
+void AdaptoidInitPoolType(void);
 
 /*
  * How large the first configuration-descriptor fetch asks for. Generous on

@@ -45,6 +45,13 @@ static PDEVICE_OBJECT g_ControlDevice;
 static LONG           g_ControlRefCount;
 static KMUTEX         g_ControlMutex;
 
+/*
+ * Non-executable where the OS understands it, plain non-paged where it does
+ * not. Set once by AdaptoidInitPoolType before any allocation happens, and
+ * read-only thereafter. See the note in wdm.h.
+ */
+POOL_TYPE AdaptoidPoolType = NonPagedPool;
+
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
                            PUNICODE_STRING RegistryPath)
 {
@@ -57,6 +64,9 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	 * the whole reason the original can present a composite keyboard, mouse
 	 * and joystick device; see ../docs/replacement-architecture.txt section 2.
 	 */
+	/* Before anything allocates. */
+	AdaptoidInitPoolType();
+
 	mj = DriverObject->MajorFunction;
 
 	/*
@@ -1218,6 +1228,30 @@ NTSTATUS NTAPI AdaptoidPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
  */
 #ifndef ADAPTOID_USERMODE
 
+/*
+ * Decide once whether this OS understands non-executable pool.
+ *
+ * NonPagedPoolNx is Windows 8 (6.2) and later. On Windows 7 the value names
+ * nothing, so the plain type is used there and the driver keeps loading on
+ * every target from Win7 x64 to Win11. Called from DriverEntry, before any
+ * allocation, and never written again.
+ */
+void AdaptoidInitPoolType(void)
+{
+	RTL_OSVERSIONINFOW osv;
+
+	RtlZeroMemory(&osv, sizeof(osv));
+	osv.dwOSVersionInfoSize = sizeof(osv);
+
+	if (NT_SUCCESS(RtlGetVersion(&osv)) &&
+	    (osv.dwMajorVersion > 6 ||
+	     (osv.dwMajorVersion == 6 && osv.dwMinorVersion >= 2))) {
+		AdaptoidPoolType = ADAPTOID_POOL_NX;
+	} else {
+		AdaptoidPoolType = NonPagedPool;
+	}
+}
+
 PADAPTOID_DEVEXT AdaptoidDevExtOf(PDEVICE_OBJECT DeviceObject)
 {
 	/* hidclass owns the first level; ours hangs off it. */
@@ -1307,7 +1341,7 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 	ULONG    size = ADAPTOID_CONFIG_FIRST_TRY;
 	NTSTATUS st;
 
-	urb = (PURB)ExAllocatePoolWithTag(ADAPTOID_NONPAGED, sizeof(DESC_REQUEST),
+	urb = (PURB)ExAllocatePoolWithTag(AdaptoidPoolType, sizeof(DESC_REQUEST),
 	                                  ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -1317,7 +1351,7 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 		PUSB_CONFIGURATION_DESCRIPTOR cd;
 
 		DevExt->ConfigDescriptor =
-		        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, size,
+		        ExAllocatePoolWithTag(AdaptoidPoolType, size,
 		                              ADAPTOID_POOL_TAG);
 		if (DevExt->ConfigDescriptor == NULL) {
 			ExFreePool(urb);
@@ -1401,7 +1435,7 @@ NTSTATUS AdaptoidSelectConfiguration(PADAPTOID_DEVEXT DevExt)
 
 	info = list[0].Interface;
 	DevExt->InterfaceInfo =
-	        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, info->Length,
+	        ExAllocatePoolWithTag(AdaptoidPoolType, info->Length,
 	                              ADAPTOID_POOL_TAG);
 	if (DevExt->InterfaceInfo == NULL) {
 		ExFreePool(urb);
@@ -1446,7 +1480,7 @@ void AdaptoidUnconfigureDevice(PADAPTOID_DEVEXT DevExt)
 	if (DevExt->ConfigurationHandle == NULL) {
 		return;
 	}
-	urb = (PURB)ExAllocatePoolWithTag(ADAPTOID_NONPAGED, size,
+	urb = (PURB)ExAllocatePoolWithTag(AdaptoidPoolType, size,
 	                                  ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return;
@@ -1563,7 +1597,7 @@ NTSTATUS AdaptoidVendorSubmitUrb(PADAPTOID_DEVEXT DevExt,
 	ULONG              flags;
 
 	urb = (struct _URB_CONTROL_VENDOR_OR_CLASS_REQUEST *)
-	        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, sizeof(*urb),
+	        ExAllocatePoolWithTag(AdaptoidPoolType, sizeof(*urb),
 	                              ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -1638,7 +1672,7 @@ NTSTATUS AdaptoidPollSubmit(PADAPTOID_DEVEXT DevExt, ULONG Slot)
 		return STATUS_INVALID_PARAMETER;
 	}
 	urb = (struct _URB_BULK_OR_INTERRUPT_TRANSFER *)
-	        ExAllocatePoolWithTag(ADAPTOID_NONPAGED, sizeof(*urb),
+	        ExAllocatePoolWithTag(AdaptoidPoolType, sizeof(*urb),
 	                              ADAPTOID_POOL_TAG);
 	if (urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -3161,7 +3195,7 @@ static void AdaptoidScriptArm(void *ctx, u64 wake_time)
 static void *AdaptoidSchedAlloc(void *ctx, u32 bytes)
 {
 	UNREFERENCED_PARAMETER(ctx);
-	return ExAllocatePoolWithTag(ADAPTOID_NONPAGED, bytes, ADAPTOID_POOL_TAG);
+	return ExAllocatePoolWithTag(AdaptoidPoolType, bytes, ADAPTOID_POOL_TAG);
 }
 
 static void AdaptoidSchedFree(void *ctx, void *block)

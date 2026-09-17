@@ -5576,6 +5576,15 @@ NTSTATUS IofCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 void IoCopyCurrentIrpStackLocationToNext(PIRP Irp) { (void)Irp; }
 void IoSkipCurrentIrpStackLocation(PIRP Irp)       { (void)Irp; }
 
+/*
+ * The variable itself lives in wdm.c, shared by both builds. Only the
+ * decision is OS-specific, so only the decision is stubbed.
+ */
+void AdaptoidInitPoolType(void)
+{
+	AdaptoidPoolType = NonPagedPoolNx;
+}
+
 PADAPTOID_DEVEXT AdaptoidDevExtOf(PDEVICE_OBJECT DeviceObject)
 {
 	(void)DeviceObject;
