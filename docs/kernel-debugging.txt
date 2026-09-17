@@ -28,7 +28,72 @@ Table of Contents
    3.  The Host Debugger
    4.  Order Of Operations
    5.  Driving It From An Agent
-   6.  Working Without Symbols
+   5.1.  Never Quit While The Target Is Halted
+
+   ONE kd RUNS FOR THE LIFE OF THE VM. tools/kdd.py is a daemon that owns
+   that process; tools/kdc.py is a one-shot client that talks to it.
+
+       python tools/kdd.py --pipe adaptoid-dbg        leave this open
+       python tools/kdc.py "lm m wish*" "dd wishk201+0x9d94 L1"
+
+   The daemon listens on 127.0.0.1:8097 and never disconnects from the
+   pipe, so a hundred queries still open it once. Section 5.1 is why that
+   matters.
+
+   A CLIENT CALL SENDS ITS COMMANDS AS ONE BATCH: the daemon breaks in,
+   runs them all, and resumes. The guest is frozen for the length of the
+   batch, not once per command, and it is left running afterwards. Only
+   --hold leaves it halted, and then only because another batch follows.
+
+   q, qd and qq are refused by the daemon rather than passed through.
+
+   THE BREAK REQUEST MUST BE A CONSOLE CONTROL EVENT. Writing 0x03 to kd's
+   stdin does nothing when stdin is a pipe - Ctrl+C is a console event, not
+   a byte in the stream, so it is read as data and discarded. kd is spawned
+   in its own process group and halted with GenerateConsoleCtrlEvent, which
+   is what os.kill delivers on Windows. A break-in that silently never
+   happens looks exactly like a debugger that has hung.
+
+   tools/kdmcp.py exposes the same session as MCP tools instead, for use
+   when the agent can register a stdio server:
+
+       command  C:\Program Files\Python310\python.exe
+       args     N:\DEV\ADAPTOID\tools\kdmcp.py
+
+   THE GHIDRA BRIDGE'S OWN DEBUGGER TOOLS CANNOT DO THIS. They proxy to a
+   separate server on port 8099 that is not installed here, and their
+   attach call takes a process name or a PID - there is no transport or
+   connection string anywhere in that API, so they reach user-mode
+   processes on the host and nothing else. Do not spend time trying to
+   point them at a VM.
+
+   Kernel work lives in extension commands - !process, !irp, !devobj,
+   !devstack, !drvobj - so passing arbitrary command text through is the
+   main interface, not a fallback.
+
+5.1.  Never Quit While The Target Is Halted
+
+   A DEBUGGER THAT EXITS WITHOUT RESUMING LEAVES THE GUEST STOPPED FOREVER.
+   The target halts at an int 3 and waits for a debugger to release it;
+   nothing else in the system will. Detaching does not resume it. The guest
+   then shows a black or frozen screen, ignores the VM console, and needs a
+   hard restart - which reads as "the pipe is wedged" or "kd is flaky" and
+   is neither.
+
+   This is the shape that causes it, and it fails every time:
+
+       kd -b -k com:pipe,... -cf script.kd     where script.kd ends in qd
+
+   -b breaks in on connect, and no g is ever issued. Always resume before
+   letting go of the connection, and prefer not letting go at all.
+
+   VirtualBox contributes a second, independent failure: its pipe server
+   does not reliably accept a new client after one disconnects, so the pipe
+   can refuse a fresh kd even with none running. Holding one connection
+   open for the life of the VM avoids both problems at once.
+
+
+6.  Working Without Symbols
    7.  When It Does Not Connect
 
 

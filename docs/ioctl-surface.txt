@@ -25,6 +25,9 @@ Abstract
 Table of Contents
 
    1.  How User Mode Reaches The Driver
+   1.1.  The Wrapper Table
+   1.2.  The Control Device
+   1.3.  What The Saved Pointers Actually Contain
    2.  IOCTL Encoding
    3.  Control-Device Commands
    3.1.  The SDK Simple Interface
@@ -33,6 +36,8 @@ Table of Contents
    5.  The Macro Slot Engine
    6.  Controller Pak Access
    7.  The Button Map
+   7.1.  Stick Scaling
+   7.2.  The Script Bypass
    8.  Consequences For The Replacement Driver
    9.  Open Questions
 
@@ -98,6 +103,7 @@ Table of Contents
    calling PoStartNextPowerIrp, which is a rule violation should a power IRP
    ever reach the control device.
 
+
 1.2.  The Control Device
 
    drv_CreateControlDevice at 000103be creates it, called from drv_AddDevice
@@ -133,6 +139,48 @@ Table of Contents
    path carries a 4-byte device id at the front of the input buffer and
    strips it; the 'q' path has the device implied by the file object and
    forwards the buffer unchanged.
+
+1.3.  What The Saved Pointers Actually Contain
+
+   MEASURED ON A LIVE DRIVER. The eight saved pointers were read out of a
+   running wishk201.sys, with hidclass.sys loaded at 9193d000-91950000 and
+   the driver at 91979000:
+
+       drv_g_HidCreate         9193fa8c    HIDCLASS!HidpMajorHandler
+       drv_g_HidCleanup        828e9024    nt!IopInvalidDeviceRequest
+       drv_g_HidClose          9193fa8c    HIDCLASS!HidpMajorHandler
+       drv_g_HidRead           9193fa8c    HIDCLASS!HidpMajorHandler
+       drv_g_HidWrite          9193fa8c    HIDCLASS!HidpMajorHandler
+       drv_g_HidDeviceControl  9193fa8c    HIDCLASS!HidpMajorHandler
+       drv_g_HidPnp            9193fa8c    HIDCLASS!HidpMajorHandler
+       drv_g_HidPower          9193fa8c    HIDCLASS!HidpMajorHandler
+
+   HIDCLASS USES ONE COMMON ENTRY POINT for every major function it claims,
+   so seven of the eight slots hold the same address. Chaining to the saved
+   pointer is therefore a call into a single router, not into per-major
+   handlers.
+
+   A SAVED POINTER IS NOT NECESSARILY A HIDCLASS ROUTINE. CLEANUP is the
+   exception: hidclass does not handle it, so the slot still held the I/O
+   manager's default, nt!IopInvalidDeviceRequest, when the driver saved it.
+   Chaining a CLEANUP for a hidclass-owned device is correct and yields
+   STATUS_INVALID_DEVICE_REQUEST. A replacement that assumes every saved
+   pointer belongs to hidclass, or that treats that status as a failure to
+   be repaired, is wrong on this path.
+
+   The live driver object also shows that the minidriver does NOT wrap
+   everything hidclass installs:
+
+       IRP_MJ_INTERNAL_DEVICE_CONTROL   HIDCLASS!HidpMajorHandler
+       IRP_MJ_SYSTEM_CONTROL            HIDCLASS!HidpMajorHandler
+       DriverUnload                     HIDCLASS!HidpDriverUnload
+       AddDevice                        HIDCLASS!HidpAddDevice
+
+   Those four are left to hidclass outright. The minidriver's own IOCTL
+   handling is reached through the hidclass callback contract, not through
+   the driver object, which is why drv_DispatchInternalDeviceControl has no
+   wrapper and no saved pointer.
+
 
 2.  IOCTL Encoding
 
@@ -689,6 +737,26 @@ Table of Contents
    the table above exactly. So the bit order and the map are each confirmed
    by the driver, the configurator and the INF independently.
 
+   A FOURTH SOURCE IS THE HARDWARE ITSELF, measured on a live driver with
+   a kernel debugger. With the A button held and nothing else touched, the
+   device extension read:
+
+       LastRawReport   00 00 82 00 80      X, Y, status, byteB, byteA
+       CurStickX       00000000
+       CurStickY       00000000
+       CurButtons      00000001
+       ScriptState     ffffffff            negative, so no script
+
+   byteA is 0x80, which is bit 7 and therefore index 0 walking MSB first;
+   drv_ButtonMap[0] is 0; and CurButtons came out as 1 << 0. Every link in
+   the chain from a physical button to a HID bit is confirmed against
+   hardware, including that the A button byte is LastRawReport+4, not +3.
+
+   ScriptState being negative is part of the measurement, not an aside:
+   the native mapping path runs ONLY when no script is loaded, so the same
+   reading taken with a script active would say nothing at all about
+   drv_ButtonMap. See section 7.2.
+
    Indices 8 and 9 are the Reset and unused bit positions and hold 0. The
    builder does not special-case them, so either bit being set asserts HID
    button 1, the same bit as A. The configurator names those two slots
@@ -779,6 +847,36 @@ Table of Contents
 
    The field cannot be understood from the DPC alone; only fn 0x83C, which
    writes its distinguished values, names it.
+
+7.2.  The Script Bypass
+
+   A LOADED SCRIPT REPLACES THE BUTTON MAP AND THE STICK SCALING ENTIRELY
+   rather than filtering their output. drv_BuildJoystickReport reads
+   DevExt->ScriptState once, under DeviceSpinLock, and branches on it:
+
+   +---------------+---------------------------------------------------+
+   | ScriptState   | What builds the report                            |
+   +===============+===================================================+
+   | >= 0          | drv_ScriptDispatchInput runs; the report is taken |
+   |               | from CurStickX, CurStickY and CurButtons as the   |
+   |               | script left them                                  |
+   | -1            | the native path: drv_ButtonMap and the stick      |
+   |               | scaling of section 7.1                            |
+   | -2 or -3      | neither runs; CurStickX, CurStickY and CurButtons |
+   |               | keep their previous values                        |
+   +---------------+---------------------------------------------------+
+
+   When the value is 0 or greater it is incremented on entry and
+   decremented after the dispatch, so it is a nesting count and not just a
+   flag.
+
+   THE USER-VISIBLE CONSEQUENCE, confirmed on hardware: with a script
+   loaded that maps buttons to mouse clicks, the Game Controllers control
+   panel shows the stick moving and no buttons at all. Nothing is broken -
+   the script consumed the buttons and never wrote CurButtons. Any
+   measurement of button behaviour must therefore check ScriptState first,
+   or it is measuring the script rather than the driver.
+
 
 8.  Consequences For The Replacement Driver
 

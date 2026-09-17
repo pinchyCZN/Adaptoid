@@ -219,6 +219,33 @@ Table of Contents
 
    TuneMode itself is genuinely tuning-mode-only.
 
+   ALL OF THIS IS CONFIRMED ON HARDWARE, read out of a running driver with
+   a kernel debugger. Before the mode had ever been entered the four fields
+   held exactly their seeded values - TunePeriod 500, TuneDuty 50,
+   TuneDutyComplement 50, TuneStrength 100 - with TuneMode 0.
+
+   Entering with L+R+Z+Start set TuneMode to 3, and the stick then drove
+   TunePeriod live: exactly 250 with the stick centred and exactly 1000 at
+   full right, matching 1e9 / (2400000 / v)^2 at v = 1200 and v = 2400.
+   TuneDuty read 50 for a centred Y, and TuneStrength was left alone
+   because no D-pad direction was held. Releasing every button walked
+   TuneMode 3 -> 1 -> 0 as described.
+
+   THE EDIT PERSISTS. After the mode exits, TunePeriod keeps the value the
+   stick last set; it does not revert to the seeded 500. So a user who
+   enters the combination by accident - L+R+Start is reachable in ordinary
+   play, and it also asserts Reset - leaves the motor calibration changed
+   for the life of that device instance. That is the strongest evidence
+   that these fields are the calibration itself rather than scratch state
+   belonging to the mode.
+
+   ENTRY AND EXIT USE DIFFERENT TESTS, which matters to anyone trying to
+   reproduce the above. Entry needs the full chord within one 8ms poll;
+   the mode then stays live until EVERY button is released, so any single
+   one of L, R, C, A, B, Z or Start holds it open. Releasing everything to
+   reposition a hand drops the mode, and a single button cannot re-enter
+   it.
+
 
 2.7.  The Script Engine
 

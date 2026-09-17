@@ -49,7 +49,6 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
                            PUNICODE_STRING RegistryPath)
 {
 	HID_MINIDRIVER_REGISTRATION reg;
-	ULONG                       i;
 	PDRIVER_DISPATCH           *mj;
 	NTSTATUS                    status;
 
@@ -60,9 +59,28 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	 */
 	mj = DriverObject->MajorFunction;
 
-	for (i = 0; i < IRP_MJ_MAXIMUM_FUNCTION + 1; i++) {
-		mj[i] = 0;
-	}
+	/*
+	 * DO NOT ZERO MajorFunction. The I/O manager has already filled every
+	 * slot with nt!IopInvalidDeviceRequest, and that default is load
+	 * bearing twice over:
+	 *
+	 *   - It is what a major NOBODY claims resolves to. The I/O manager
+	 *     calls MajorFunction[n] without checking it, so a NULL there is a
+	 *     bugcheck the first time such an IRP arrives - QUERY_INFORMATION
+	 *     and SET_INFORMATION reach a file handle on the control device
+	 *     through ordinary Win32 calls.
+	 *
+	 *   - CLEANUP is saved below and chained to. hidclass does NOT claim
+	 *     CLEANUP, so the slot still holds the I/O manager default when we
+	 *     save it, and chaining must produce STATUS_INVALID_DEVICE_REQUEST.
+	 *     Zeroing first makes the saved pointer NULL and silently turns
+	 *     that into STATUS_NOT_SUPPORTED.
+	 *
+	 * CONFIRMED on the original running under a kernel debugger: its
+	 * drv_g_HidCleanup holds nt!IopInvalidDeviceRequest while the other
+	 * seven saved slots hold HIDCLASS!HidpMajorHandler. See
+	 * ../docs/ioctl-surface.txt section 1.3.
+	 */
 
 	/*
 	 * STEP 1: the MINIDRIVER's own handlers. HidRegisterMinidriver captures

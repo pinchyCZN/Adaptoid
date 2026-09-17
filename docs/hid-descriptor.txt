@@ -418,12 +418,18 @@ Table of Contents
    A submit with a NULL report means "send the last one again", and it is
    also the ONLY place the mode is re-evaluated:
 
-       VirtualDeviceMode = ReportsEnabled ? 3 : 0
+       VirtualDeviceMode = VirtualModeEnable ? 3 : 0
 
    so toggling the switch takes effect on the next idle resubmit rather than
-   immediately. ReportsEnabled is a driver-wide global at 00019d70, written
-   in exactly one place - drv_IoctlControlDevice - which makes it a
+   immediately. drv_g_VirtualModeEnable is a driver-wide global at 00019d70,
+   written in exactly one place - drv_IoctlControlDevice - which makes it a
    control-device setting rather than a per-device one.
+
+   THE SENSE IS INVERTED FROM WHAT THE OBVIOUS NAME WOULD SUGGEST, and that
+   is why the global is not called anything like ReportsEnabled. Zero is
+   NORMAL operation, with real controller reports flowing; non-zero is what
+   silences the controller. Read as 0 on a running driver that was feeding
+   real joystick reports to an open joy.cpl.
 
    With the mode non-zero the controller is bypassed entirely: a real report
    is DROPPED, and a NULL submit synthesises one instead from the device
