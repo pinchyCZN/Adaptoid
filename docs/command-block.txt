@@ -32,6 +32,7 @@ Table of Contents
    6.  Byte Order
    7.  Failure Reporting
    8.  Dead Code
+   8.1.  The Channel Is Confirmed End To End
    9.  Open Questions
 
 
@@ -350,6 +351,26 @@ Table of Contents
 
    Neither affects behaviour. The first looks like the start of a
    validity check that was never finished.
+
+
+8.1.  The Channel Is Confirmed End To End
+
+   tools/pakread.c is the first client written against this specification
+   and it works against a live driver and a real Controller Pak. It stages
+   one entry - command length 3, reply length 33, joybus 0x02 plus the
+   CRC-5 address word - terminates with 0xFE, leaves the dword at 0x3C zero
+   and sets byte 0x3F, then writes 64 bytes and reads 64 back on the same
+   handle.
+
+   THE WRITE-THEN-READ ORDER IS NOT OPTIONAL AND NOT SYMMETRIC. The write
+   is what runs pass 0, which is the pass that reaches the controller; the
+   read only runs pass 1 over a copy. A client that reads without writing
+   gets whatever the previous write left, and an accessory read never
+   happens at all.
+
+   Reply bytes land at the offset the reply space occupied, so for this
+   entry the 32 data bytes and their CRC-8 begin at byte 5. See
+   ioctl-surface.txt section 6.1 for what the hardware returned.
 
 
 9.  Open Questions

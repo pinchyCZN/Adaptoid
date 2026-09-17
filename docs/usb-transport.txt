@@ -442,9 +442,29 @@ Table of Contents
        8  drv_AccessoryProbeRead2    IN  0x21   only if 7 did not conclude
        9  drv_AccessoryProbeClassify2
 
-   INFERENCE: steps 1 to 3 write consecutive values 0x38, 0x39, 0x3A with
-   differing wIndex, which reads as three register writes. Steps 4 and 5 use
-   a different form. Not established.
+   THE WHOLE CHAIN IS CONFIRMED ON HARDWARE. A kernel breakpoint on
+   drv_SendVendorRequest, stepped across an adapter replug with a Controller
+   Pak inserted, produced exactly these six setup packets in this order and
+   no others, read out of devext+0x3A4:
+
+       40 72 38 00 15 00        40 72 20 ff 04 00
+       40 72 39 00 12 00        40 72 23 fd 00 00
+       40 72 3a 00 23 00        c0 21 00 00 00 00
+
+   STEPS 1 TO 5 HAVE NO DATA STAGE. TransferBufferLength was 0 and
+   TransferBuffer was NULL for every 0x72 request, so the entire command
+   travels in wValue and wIndex. That is what a register write looks like
+   and it is the strongest evidence for reading steps 1 to 3 that way,
+   though what the registers ARE is still not established. Steps 4 and 5
+   use the same no-data form despite their different wValue shape.
+
+   STEP 6 READS STRAIGHT INTO devext+0x3AA. Its TransferBufferLength was 4
+   and its TransferBuffer pointed at devext+0x3AA exactly, so the reply is
+   deposited in place rather than copied afterwards.
+
+   ONLY SIX TRANSFERS APPEAR because the classify at step 7 concluded, which
+   is also why devext+0x3E4 settled at 2 rather than 3. Steps 8 and 9 are
+   not on this path when the first read is enough.
 
    Steps 6 and 8 are now intelligible in light of section 3.1. Request 0x21
    is the short-form N64 transaction with ONE command byte, and wValue is
@@ -511,6 +531,44 @@ Table of Contents
        4  no accessory found
 
    devext+0x3E8 holds the accessory id byte from a successful probe.
+
+   CONFIRMED ON HARDWARE, reading both fields on the same adapter with and
+   without a Controller Pak fitted:
+
+       +-----------------+--------------+----------------+----------------+
+       | Accessory       | devext+0x3AA | devext+0x3E4   | devext+0x3E8   |
+       +=================+==============+================+================+
+       | Controller Pak  | 03 01 00 05  | 2              | 1              |
+       | none            | 03 02 00 05  | 2              | 2              |
+       +-----------------+--------------+----------------+----------------+
+
+   Byte [1] moving between 0x01 and 0x02 is the N64 status byte behaving
+   exactly as section 5 describes it - bit 0 accessory present, bit 1
+   accessory removed since the last status query - and devext+0x3E8 is that
+   same byte kept. Bytes [0], [2] and [3] did not move: 0x03 reply length
+   and the 0x05 0x00 controller identifier.
+
+   INSERTING AN ACCESSORY INTO A RUNNING ADAPTER IS NOT DETECTED, shown on
+   hardware. With the adapter enumerated and polling, a Controller Pak was
+   fitted to the controller and devext+0x3E4 stayed 2 and devext+0x3E8 kept
+   its previous value; forcing fresh polls by moving the stick did not
+   change either. Unplugging and replugging the adapter, which builds a new
+   device extension with devext+0x3E4 at 0, ran the probe and recognised
+   the Pak on the first attempt.
+
+   The reason is the re-arm condition in drv_BuildJoystickReport: it resets
+   devext+0x3E4 to 0 only on a FALLING edge of bit 1 of the per-poll status
+   byte. That byte was measured stable at 0x82 across the insertion, so bit
+   1 never fell and the edge never arrived.
+
+   THE TWO ACCESSORY SOURCES DISAGREE, and it is the probe that is
+   authoritative. After a successful probe with a Pak fitted, devext+0x3E8
+   held 1 - accessory present - while the per-poll status byte still read
+   0x82, whose bit 0 is clear. Only the probe result reaches user mode.
+
+   A replacement inherits the consequence whether or not it reproduces the
+   cause: a Pak fitted after the adapter is running will not be seen until
+   the adapter is replugged.
 
    Two consumers matter. IOCTL fn 0x836 selector 4 reports devext+0x3E4
    to user mode, which is how the configurator knows what is plugged in.

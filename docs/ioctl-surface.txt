@@ -35,6 +35,7 @@ Table of Contents
    4.1.  Confirmed User-Mode Usage
    5.  The Macro Slot Engine
    6.  Controller Pak Access
+   6.1.  Confirmed Against A Real Controller Pak
    7.  The Button Map
    7.1.  Stick Scaling
    7.2.  The Script Bypass
@@ -686,6 +687,41 @@ Table of Contents
        CRC matches        STATUS_SUCCESS
        returned CRC 0x80  STATUS_DEVICE_NOT_READY (0xC0000013)
        otherwise          STATUS_CRC_ERROR (0xC000003F)
+
+6.1.  Confirmed Against A Real Controller Pak
+
+   BOTH CRC ROUTINES ARE VALIDATED ON HARDWARE. tools/pakread.c drives the
+   SDK command-block channel of command-block.txt directly - joybus command
+   0x02, a three-byte command and a 33-byte reply - and was run against a
+   real Controller Pak on a live driver. Twenty-four blocks were read across
+   three runs and core_pak_data_crc8 reproduced the controller's CRC byte
+   EXACTLY in every case where an accessory answered, with no mismatches.
+
+   THE ADDRESS CRC-5 IS VALIDATED BY THE READS SUCCEEDING AT ALL. A read
+   whose address word carries a wrong CRC-5 is rejected by the controller,
+   so eight accepted address words are eight confirmations:
+
+       block 0  0x0000      block 4  0x008b
+       block 1  0x0035      block 5  0x00be
+       block 2  0x005f      block 6  0x00d4
+       block 3  0x006a      block 7  0x00e1
+
+   AN INVERTED DATA CRC MEANS NO ACCESSORY ANSWERED. Where nothing
+   responded the reply was thirty-two 0x00 bytes with a CRC byte of 0xFF,
+   which is CRC-8(zeros) = 0x00 XOR 0xFF. That is the N64 convention, and
+   it is worth stating because the payload alone is indistinguishable from
+   a legitimately blank block - only the CRC separates "blank" from
+   "absent".
+
+   A BANK-SWITCHING PAK NEEDS A REPLUG, exactly as an inserted one does.
+   A multi-page cart set to page 1 read real data; switching it to page 2
+   with the adapter running made every block read back as absent by the
+   inverted-CRC test; replugging the adapter with page 2 still selected
+   produced real data again, different from page 1 and with all CRCs
+   matching. So the banks are genuinely independent storage, and the
+   accessory probe of usb-transport.txt section 6 is what the switch is
+   waiting on.
+
 
 7.  The Button Map
 
