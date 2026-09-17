@@ -32,6 +32,7 @@ Table of Contents
    5.  Report Layouts
    5.1.  How The Report State Is Kept
    5.2.  The Virtual Joystick Mode
+   5.3.  All Three Layouts Confirmed On Hardware
    6.  Device Identity
    7.  Minidriver IOCTL Surface
    7.1.  The Details That Are Easy To Get Wrong
@@ -453,6 +454,53 @@ Table of Contents
    resolves a device handle from the same number. It is an identifier that
    doubles as a stick position, not a calibration constant - see
    driver-structures.txt.
+
+5.3.  All Three Layouts Confirmed On Hardware
+
+   Each of the three was captured off a live driver with a kernel
+   breakpoint on drv_SubmitHidReport, whose second argument points at the
+   length byte followed by the report proper.
+
+   JOYSTICK, report 1. With the stick at full right and nothing pressed:
+
+       06 01 b0 04 b5 00 00
+       ^^ length 6
+          ^^ report ID 1
+             b0 04 b5      X = 0x4B0 = 1200, Y = -1200 packed 12/12
+                      00 00 no buttons
+
+   MOUSE, report 3. Captured with a script driving the stick as a mouse,
+   breaking first on drv_HidMouseMoveEvent to see the arguments and then
+   on the submit:
+
+       drv_HidMouseMoveEvent(devext, 0x0C, 0)
+       05 03 00 0c 00 00
+       ^^ length 5
+          ^^ report ID 3
+             00 buttons
+                0c X, the dx argument arriving unchanged
+                   00 Y
+                      00 wheel
+
+   KEYBOARD, report 2. The same script binds C-Up to _key('w'):
+
+       0d 02 00 00 1a 00 00 00 00 00 00 00 00
+       ^^ length 13
+          ^^ report ID 2
+             00 modifiers
+                00 reserved
+                   1a first key slot, then nine empty
+
+   THE SCRIPT ENGINE EMITS HID USAGES, NOT CHARACTERS. _key('w') produced
+   0x1A, which is the HID Usage Tables code for the W key, not the ASCII
+   0x77. A replacement that passes the character through would type
+   nothing recognisable.
+
+   THE KEY ARRAY IS TEN SLOTS, NOT THE USUAL SIX. The descriptor says so -
+   95 0A 75 08 - and the captured report is 13 bytes, which only works
+   with ten. Sizing a replacement's payload from the familiar boot
+   keyboard layout gives a report four bytes short.
+
 
 6.  Device Identity
 
