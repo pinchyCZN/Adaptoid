@@ -258,6 +258,18 @@ void core_sched_set_native(core_sched *s, core_script_native_fn fn,
  */
 int  core_sched_load(core_sched *s, const u32 *code, s32 code_count,
                      s32 var_count, u64 now);
+
+/*
+ * The same, from a LITTLE-ENDIAN BYTE STREAM - the form bytecode arrives in
+ * from user mode. Identical in every other respect, including the unload.
+ *
+ * It exists so that the words can be assembled straight into the allocation
+ * instead of through an intermediate array. code_le is read once and is not
+ * retained, so it may be the caller's own IOCTL buffer.
+ */
+int  core_sched_load_le(core_sched *s, const u8 *code_le, s32 code_count,
+                        s32 var_count, u64 now);
+
 void core_sched_unload(core_sched *s);
 
 /*

@@ -282,6 +282,7 @@ wr32	ioctl.c	new	-	-	-
 clamp_s32	sched.c	new	-	-	-
 core_sched_init	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
 core_sched_load	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
+core_sched_load_le	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
 core_sched_native	sched.c	port	wishk201.sys	000186a0	drv_ScriptNativeCall
 core_sched_on_input	sched.c	port	wishk201.sys	00017550	drv_ScriptDispatchInput
 core_sched_post_event	sched.c	port	wishk201.sys	00015e00	drv_QueueEvent
@@ -309,6 +310,8 @@ sched_drain_events	sched.c	part	wishk201.sys	00015e70	drv_DispatchEvents
 sched_execute	sched.c	part	wishk201.sys	00017b90	drv_ScriptExecute
 sched_fault	sched.c	part	wishk201.sys	00017b90	drv_ScriptExecute
 sched_free	sched.c	new	-	-	-
+sched_load_body	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
+sched_rd32	sched.c	new	-	-	-
 sched_spawn_handler	sched.c	part	wishk201.sys	00017550	drv_ScriptDispatchInput
 thread_release	sched.c	part	wishk201.sys	00017b90	drv_ScriptExecute
 core_script_init	script.c	part	wishk201.sys	00017b90	drv_ScriptExecute

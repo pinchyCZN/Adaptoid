@@ -2472,6 +2472,64 @@ static int test_sched(void)
 		groups++;
 	}
 
+	/* ---- 11. the little-endian entry point loads the same script ----
+	 *
+	 * core_sched_load_le is how bytecode arrives from user mode: the words
+	 * are assembled out of the caller's byte buffer straight into the
+	 * allocation, with no intermediate array.
+	 *
+	 * THE BYTE ORDER IS STATED, NOT ASSUMED. The stream below is written
+	 * out a byte at a time in the order the wire carries, so this fails on
+	 * a host where the two entry points would disagree rather than passing
+	 * by coincidence.
+	 */
+	{
+		core_sched s;
+		/* PROG_MARK as it appears on the wire: 0x181, 0x40000002, 0x082 */
+		static const u8 PROG_MARK_LE[] = {
+			0x81, 0x01, 0x00, 0x00,
+			0x02, 0x00, 0x00, 0x40,
+			0x82, 0x00, 0x00, 0x00
+		};
+
+		g_sched_live = 0;
+		sched_test_open(&s);
+
+		sched_expect(core_sched_load_le(&s, PROG_MARK_LE, 3, 4, 100) == 1,
+		             "a byte stream loads", 1, 1, &bad);
+		sched_expect(s.vm.code_count == 3, "with the right length",
+		             s.vm.code_count, 3, &bad);
+		sched_expect(s.vm.code[0] == 0x181u, "word 0 reassembled",
+		             (long)s.vm.code[0], 0x181, &bad);
+		sched_expect(s.vm.code[1] == 0x40000002u, "word 1 reassembled",
+		             (long)(s.vm.code[1] == 0x40000002u), 1, &bad);
+		sched_expect(s.vm.code[2] == 0x082u, "word 2 reassembled",
+		             (long)s.vm.code[2], 0x082, &bad);
+
+		/*
+		 * AND IT OWNS THE COPY. The source may be the caller's IOCTL
+		 * buffer, which is gone the moment the request completes, so
+		 * nothing may still point into it.
+		 */
+		sched_expect((const u8 *)s.vm.code != PROG_MARK_LE,
+		             "into its own allocation", 1, 1, &bad);
+
+		core_sched_unload(&s);
+		sched_expect(g_sched_live == 0, "and gives it all back",
+		             g_sched_live, 0, &bad);
+
+		/* A load with no code unloads, exactly as the word path does. */
+		sched_test_open(&s);
+		core_sched_load_le(&s, PROG_MARK_LE, 3, 4, 100);
+		sched_expect(core_sched_load_le(&s, PROG_MARK_LE, 0, 4, 100) == 0,
+		             "a zero count is the unload", 1, 1, &bad);
+		sched_expect(s.vm.code_count == 0, "and clears the script",
+		             s.vm.code_count, 0, &bad);
+		sched_expect(g_sched_live == 0, "leaking nothing",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
 	hlog("Script scheduler       : %s (%d groups)\n", bad ? "FAIL" : "ok",
 	     groups);
 	return bad;

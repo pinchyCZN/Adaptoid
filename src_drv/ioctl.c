@@ -324,7 +324,6 @@ static u32 ioc_pak_write(core_ioctl_env *env, const core_ioctl *r, u32 *info)
 static u32 ioc_script_load(core_ioctl_env *env, const core_ioctl *r, u32 *info)
 {
 	s32 code_count, var_count;
-	u32 i;
 	u32 need;
 
 	if (r->in_len < 8) {
@@ -367,19 +366,37 @@ static u32 ioc_script_load(core_ioctl_env *env, const core_ioctl *r, u32 *info)
 		*info = 0;
 		return CORE_ST_SUCCESS;
 	}
-	{
-		/* The bytecode is little-endian dwords in the buffer. */
-		static u32 words[4096];
-		s32 n = code_count;
-
-		if (n > (s32)(sizeof(words) / sizeof(words[0]))) {
-			return CORE_ST_INVALID_PARAM;
-		}
-		for (i = 0; i < (u32)n; i++) {
-			words[i] = rd32(r->in + 8 + i * 4);
-		}
-		core_sched_load(env->sched, words, n, var_count, env->now_100ns);
-	}
+	/*
+	 * THE BYTECODE IS READ STRAIGHT OUT OF THE CALLER'S BUFFER. It is
+	 * little-endian dwords, and core_sched_load_le assembles them directly
+	 * into the allocation it makes, which is what the original does too.
+	 *
+	 * NO STAGING ARRAY, and its absence is the point. This used to convert
+	 * into a file-scope static and hand that to the word-taking entry
+	 * point, which copied it a second time. That array was shared by every
+	 * device on the machine with nothing serialising two adapters loading
+	 * at once, it held 16KB resident whether or not any script was loaded,
+	 * and its size imposed a ceiling on script length that the original
+	 * does not have.
+	 *
+	 * The length is already exact - in_len was required to equal
+	 * code_count * 4 + 8 above - so the allocation is bounded by what user
+	 * mode actually transferred, the same way the original's is.
+	 */
+	/*
+	 * THE RETURN VALUE IS DISCARDED, which is the original's behaviour and
+	 * is preserved here rather than improved: drv_ScriptLoad returns void,
+	 * so fn 0x83C answers success whether or not the allocation succeeded.
+	 * A caller is told its script loaded when the device in fact has none.
+	 *
+	 * That is worth revisiting - it is the same shape as Defect 18 in
+	 * ../docs/known-defects.txt, a path that reports success for work it
+	 * did not do - but it is a behaviour change on a published IOCTL and
+	 * belongs in its own decision, not in a refactor of where the bytes
+	 * are copied.
+	 */
+	(void)core_sched_load_le(env->sched, r->in + 8, code_count, var_count,
+	                         env->now_100ns);
 	*info = 0;
 	return CORE_ST_SUCCESS;
 }

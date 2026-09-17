@@ -377,8 +377,36 @@ void core_sched_unload(core_sched *s)
 	s->event_count = 0;
 }
 
-int core_sched_load(core_sched *s, const u32 *code, s32 code_count,
-                    s32 var_count, u64 now)
+/*
+ * One little-endian word out of a byte stream.
+ *
+ * DELIBERATELY A SECOND COPY of the one in ioctl.c rather than a shared
+ * header. It is a leaf with no state and no room to drift - a little-endian
+ * dword read has exactly one correct implementation - and the alternative is
+ * putting a wire-format helper into a header two modules include.
+ *
+ * It is not a byte swap. On the platforms this targets it produces the same
+ * value a dword read would; what it avoids is DEPENDING on that, and on the
+ * stream being four-byte aligned, neither of which the caller's buffer
+ * guarantees.
+ */
+static u32 sched_rd32(const u8 *p)
+{
+	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) |
+	       ((u32)p[3] << 24);
+}
+
+/*
+ * The body of both load entry points. EXACTLY ONE of Code and CodeLe is
+ * non-null; the two differ only in how a word is fetched, so everything
+ * either side of the copy lives here once.
+ *
+ * NOTE THE ORDER: the teardown runs BEFORE the arguments are judged, so a
+ * call with no code unloads and returns failure, which is how a caller asks
+ * for an unload.
+ */
+static int sched_load_body(core_sched *s, const u32 *code, const u8 *code_le,
+                           s32 code_count, s32 var_count, u64 now)
 {
 	core_sched_thread *t;
 	s32 i;
@@ -388,7 +416,7 @@ int core_sched_load(core_sched *s, const u32 *code, s32 code_count,
 	}
 	core_sched_unload(s);
 
-	if (code == 0 || code_count <= 0 || var_count <= 0) {
+	if ((code == 0 && code_le == 0) || code_count <= 0 || var_count <= 0) {
 		return 0;
 	}
 
@@ -409,8 +437,22 @@ int core_sched_load(core_sched *s, const u32 *code, s32 code_count,
 		return 0;
 	}
 
-	for (i = 0; i < code_count; i++) {
-		s->code[i] = code[i];
+	/*
+	 * SWAP ON THE WAY IN, straight into the allocation. The byte-stream
+	 * path used to convert into a static staging array and hand that to
+	 * the word path, which copied it again - two copies, a fixed ceiling
+	 * on script size, and one buffer shared by every device on the
+	 * machine. The original copies its caller's buffer directly into the
+	 * allocation too.
+	 */
+	if (code != 0) {
+		for (i = 0; i < code_count; i++) {
+			s->code[i] = code[i];
+		}
+	} else {
+		for (i = 0; i < code_count; i++) {
+			s->code[i] = sched_rd32(code_le + (u32)i * 4u);
+		}
 	}
 	for (i = 0; i < var_count; i++) {
 		s->vm.vars[i] = 0;
@@ -435,6 +477,24 @@ int core_sched_load(core_sched *s, const u32 *code, s32 code_count,
 
 	core_sched_run(s, now);
 	return 1;
+}
+
+/* Load from an array of words already in host order. */
+int core_sched_load(core_sched *s, const u32 *code, s32 code_count,
+                    s32 var_count, u64 now)
+{
+	return sched_load_body(s, code, 0, code_count, var_count, now);
+}
+
+/*
+ * Load from a LITTLE-ENDIAN BYTE STREAM, which is how bytecode arrives from
+ * user mode. The stream is the caller's buffer and is read once, so nothing
+ * is staged and nothing is shared between devices.
+ */
+int core_sched_load_le(core_sched *s, const u8 *code_le, s32 code_count,
+                       s32 var_count, u64 now)
+{
+	return sched_load_body(s, 0, code_le, code_count, var_count, now);
 }
 
 /* ---- running one thread ------------------------------------------------ */
