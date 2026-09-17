@@ -92,13 +92,26 @@ if not exist "%INF2CAT%" (
     goto done
 )
 
+rem DELETE THE OLD CATALOGUE FIRST, AND TEST THAT A NEW ONE APPEARED.
+rem Inf2Cat EXITS 0 EVEN WHEN ITS SIGNABILITY TEST FAILS - it reports the
+rem failure only in its output text. Relying on errorlevel therefore leaves
+rem a STALE adaptoid.cat from an earlier good run sitting in the package,
+rem and signtool will happily sign it. The result is a correctly signed
+rem catalogue whose hashes do not match the .sys and .inf beside it, which
+rem installs and then fails with a hash mismatch that looks nothing like
+rem its cause. Absence of the file is the only reliable signal.
+del "%PKG%\adaptoid.cat" >nul 2>&1
+
 "%INF2CAT%" /driver:"%PKG%" /os:7_X64,7_X86 /verbose
-if errorlevel 1 (
+if not exist "%PKG%\adaptoid.cat" (
     echo.
-    echo   Inf2Cat FAILED. Common cause: the INF names a CatalogFile that
-    echo   does not match, or references a file not present in %PKG%.
-    echo   The .sys is still signed and will load.
-    goto done
+    echo   Inf2Cat FAILED - no catalogue was produced. Read its output
+    echo   above; the message names the INF directive at fault. Common
+    echo   causes: DriverVer missing, in the wrong format, or dated in the
+    echo   future; a CatalogFile name that does not match; or a file the
+    echo   INF references not being present in %PKG%.
+    echo   The .sys is still signed, but the package is NOT installable.
+    exit /b 1
 )
 
 "%SIGNTOOL%" sign /fd SHA256 /f "%PFX%" /p "%PFXPASS%" ^

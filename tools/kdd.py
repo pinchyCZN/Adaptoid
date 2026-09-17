@@ -46,10 +46,18 @@ PROMPT = re.compile(rb"\r?\n?(?:\d+:\s*(?:kd|kernel)>|kd>)\s*$")
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_PORT = 8097
 
+# x64 FIRST, AND FOR BOTH TARGETS. kd is a cross debugger: the build's
+# bitness is the host process, not the machine being debugged, and an x64
+# kd debugs an x86 kernel target perfectly well. The reverse is the awkward
+# direction - an x86 kd against an x64 target loads x86 extensions that
+# then have to reason about 64-bit pointers, and !process, !drvobj and
+# friends misbehave. Preferring x64 is therefore right for the 64-bit guest
+# and harmless for the 32-bit one, so there is one answer rather than a
+# choice to get wrong.
 KD_ROOTS = [
-    r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x86",
     r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64",
     r"C:\Program Files\Windows Kits\10\Debuggers\x64",
+    r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x86",
     r"E:\DEV\WinDDK\Debuggers",
 ]
 
