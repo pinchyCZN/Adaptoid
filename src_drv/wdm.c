@@ -750,14 +750,37 @@ int AdaptoidClaimIrp(PIRP Irp)
 NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
                               const UCHAR *Data, UCHAR Length)
 {
-	UCHAR *out = (UCHAR *)Irp->AssociatedIrp.SystemBuffer;
-	ULONG  i;
+	PIO_STACK_LOCATION sl  = IoGetCurrentIrpStackLocation(Irp);
+	UCHAR             *out = (UCHAR *)Irp->UserBuffer;
+	ULONG              room = sl->Parameters.DeviceIoControl.OutputBufferLength;
+	ULONG              n    = Length;
+	ULONG              i;
 
+	/*
+	 * THE BUFFER IS Irp->UserBuffer, NOT AssociatedIrp.SystemBuffer.
+	 * IOCTL_HID_READ_REPORT reaches a minidriver as METHOD_NEITHER, so
+	 * there is no system buffer at all and SystemBuffer reads as NULL -
+	 * writing through it is an immediate bugcheck 0xA at DISPATCH_LEVEL,
+	 * on the very first report the driver ever delivers. Read out of
+	 * drv_CompleteReadReport at 00014ec0, which takes Irp->UserBuffer.
+	 *
+	 * AND THE COUNT IS CLAMPED TO OutputBufferLength, which the original
+	 * does before copying anything. Without it a report longer than the
+	 * caller's buffer overruns it - the composite descriptor's three
+	 * report sizes differ, so this is reachable, not theoretical.
+	 */
 	UNREFERENCED_PARAMETER(DevExt);
-	for (i = 0; i < Length; i++) {
-		out[i] = Data[i];
+	if (n > room) {
+		n = room;
 	}
-	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, Length);
+	if (out != NULL) {
+		for (i = 0; i < n; i++) {
+			out[i] = Data[i];
+		}
+	} else {
+		n = 0;
+	}
+	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, n);
 	AdaptoidLockRelease(&DevExt->RemoveLockB);
 	return STATUS_SUCCESS;
 }
@@ -2169,7 +2192,9 @@ void AdaptoidCancelPendingReads(PADAPTOID_DEVEXT DevExt)
 	PIRP irp;
 
 	while ((irp = AdaptoidDequeueRead(DevExt)) != NULL) {
-		AdaptoidCompleteIrp(irp, STATUS_DELETE_PENDING, 0);
+		/* STATUS_CANCELLED, which is what drv_CancelPendingReads at
+		 * 00014d90 completes these with - it stores 0xC0000120. */
+		AdaptoidCompleteIrp(irp, STATUS_CANCELLED, 0);
 		AdaptoidLockRelease(&DevExt->RemoveLockB);
 	}
 }

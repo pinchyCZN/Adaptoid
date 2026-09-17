@@ -1231,9 +1231,31 @@ static int core_effect_issue(core_state *cs, u8 request, u16 value,
 	req.wValue        = value;
 	req.wIndex        = index;
 
-	cs->effect_next  = next;
-	cs->vendor_owner = CORE_VENDOR_OWNER_EFFECT;
-	return cs->vendor(cs->vendor_ctx, &req) ? 1 : 0;
+	/*
+	 * A REFUSED SEND MUST NOT CHANGE THE OWNER. The owner says who the
+	 * NEXT completion belongs to, so setting it before a send that then
+	 * fails hands somebody else's completion to this layer.
+	 *
+	 * That is not theoretical: the effect engine runs from core_tick,
+	 * which runs on the same packet that starts the accessory probe. With
+	 * the probe's transfer in flight this send is refused - the slot is
+	 * taken - but it had already overwritten PROBE with EFFECT, so the
+	 * probe's completion was routed to core_effect_complete and the probe
+	 * never heard back. It stalled at step 0 with accessory_state stuck
+	 * at PROBING, and because the probe gates every report the driver
+	 * delivered no input at all while reporting no error.
+	 */
+	{
+		u8 prev = cs->vendor_owner;
+
+		cs->effect_next  = next;
+		cs->vendor_owner = CORE_VENDOR_OWNER_EFFECT;
+		if (!cs->vendor(cs->vendor_ctx, &req)) {
+			cs->vendor_owner = prev;
+			return 0;
+		}
+	}
+	return 1;
 }
 
 /*
@@ -2045,6 +2067,16 @@ static int core_probe_issue(core_state *cs)
 		return 0;
 	}
 
+	/*
+	 * NO CLAIM HERE, DELIBERATELY. This runs twice over: once from
+	 * core_probe_start with the slot free, and once per step from
+	 * core_probe_complete with the slot STILL CLAIMED - the transport
+	 * holds it across the completion callback precisely so a chain like
+	 * this one can continue without re-claiming. Claiming here would
+	 * therefore succeed on the first transfer and fail on every
+	 * subsequent one, which looks like a probe that starts and then stops
+	 * dead at step 0. The claim belongs in core_probe_start.
+	 */
 	cs->vendor_owner = CORE_VENDOR_OWNER_PROBE;
 	if (cs->vendor == 0 || !cs->vendor(cs->vendor_ctx, &req)) {
 		/*
@@ -2065,6 +2097,24 @@ int core_probe_start(core_state *cs)
 	}
 	if (cs->accessory_state == CORE_ACC_PROBING) {
 		return 0;               /* already running */
+	}
+	/*
+	 * CLAIM THE SINGLE VENDOR SLOT BEFORE STARTING, because the transport
+	 * refuses a send that has not: the driver's AdaptoidVendorSend answers
+	 * STATUS_DEVICE_BUSY unless the slot is already CLAIMED.
+	 *
+	 * WITHOUT THIS THE DRIVER DELIVERS NO INPUT AT ALL, silently. The
+	 * probe gates every report, so the loop is: a packet arrives, the
+	 * probe starts, the unclaimed send is refused, the probe is abandoned
+	 * back to NEEDED, and the next packet repeats it forever. The device
+	 * enumerates, serves all three descriptors and binds correctly while
+	 * nothing reports an error anywhere.
+	 *
+	 * Failing to claim leaves the state at NEEDED rather than PROBING, so
+	 * a later poll simply tries again.
+	 */
+	if (cs->vendor_claim != 0 && !cs->vendor_claim(cs->vendor_ctx)) {
+		return 0;
 	}
 	cs->accessory_state = CORE_ACC_PROBING;
 	cs->probe_step      = 0;

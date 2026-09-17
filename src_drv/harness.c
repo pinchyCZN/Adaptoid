@@ -557,6 +557,45 @@ static void bus_reset(const u8 *reply)
 	}
 }
 
+/*
+ * THE SLOT HAS TO BE CLAIMED BEFORE IT CAN BE USED, and this stub enforces
+ * it because the driver does. AdaptoidVendorSend answers STATUS_DEVICE_BUSY
+ * to any send whose slot is not already CLAIMED, so a transport here that
+ * accepted unclaimed sends would be MORE PERMISSIVE THAN THE REAL ONE - and
+ * every test would pass while the driver deadlocked its own input path.
+ * That is exactly what happened: core_probe_issue sent without claiming,
+ * nothing here objected, and on hardware the probe was refused forever.
+ */
+static int g_bus_claimed;
+
+static int harness_vendor_claim(void *ctx)
+{
+	(void)ctx;
+	if (g_bus_busy || g_bus_claimed) {
+		return 0;
+	}
+	g_bus_claimed = 1;
+	return 1;
+}
+
+/*
+ * The strict transport: refuses anything that has not claimed the slot,
+ * which is what AdaptoidVendorSend does. Used only by the scenario that
+ * exists to check the claim, because turning arbitration on globally would
+ * change the meaning of every effect test - core_effect_claim treats an
+ * absent claim seam as "no arbitration installed" and proceeds.
+ */
+static int harness_vendor(void *ctx, const core_vendor_req *req);
+
+static int harness_vendor_strict(void *ctx, const core_vendor_req *req)
+{
+	if (!g_bus_claimed) {
+		return 0;
+	}
+	g_bus_claimed = 0;
+	return harness_vendor(ctx, req);
+}
+
 static int harness_vendor(void *ctx, const core_vendor_req *req)
 {
 	(void)ctx;
@@ -580,6 +619,16 @@ static void harness_pump(core_state *cs)
 	while (g_bus_busy && guard++ < BUS_LOG_MAX * 2) {
 		int is_in = (g_bus_cur.bmRequestType & 0x80) != 0;
 		g_bus_busy = 0;
+		/*
+		 * THE SLOT STAYS CLAIMED ACROSS THE CALLBACK, as the driver's
+		 * completion path does - it parks the slot at CLAIMED before
+		 * calling back "while the chain below decides", so a multi-step
+		 * sequence can issue its next transfer without re-claiming.
+		 * Model it, or the strict transport refuses every step after
+		 * the first and the failure looks like a stalled probe rather
+		 * than a mis-modelled slot.
+		 */
+		g_bus_claimed = 1;
 		if (g_bus_fail_next) {
 			g_bus_fail_next = 0;
 			core_probe_complete(cs, 0, 0, 0);
@@ -589,6 +638,8 @@ static void harness_pump(core_state *cs)
 		} else {
 			core_probe_complete(cs, 1, 0, 0);
 		}
+		/* Whatever the chain did not take, the transport reclaims. */
+		g_bus_claimed = 0;
 	}
 }
 
@@ -761,7 +812,92 @@ static int test_accessory_probe(void)
 		bad++;
 	}
 
-	hlog("Accessory probe        : %s (6 scenarios)\n", bad ? "FAIL" : "ok");
+	/*
+	 * 7. THE PROBE MUST CLAIM THE SLOT BEFORE IT SENDS.
+	 *
+	 * harness_vendor is deliberately permissive - it accepts any send
+	 * while the bus is free - because most tests want to drive the
+	 * transport without modelling arbitration. THE DRIVER IS NOT
+	 * PERMISSIVE: AdaptoidVendorSend answers STATUS_DEVICE_BUSY to a send
+	 * whose slot is not already CLAIMED. A core path that sends without
+	 * claiming therefore passes every test here and cannot work on
+	 * hardware.
+	 *
+	 * That is not hypothetical. core_probe_issue shipped without the
+	 * claim, and because the probe gates every report the result was a
+	 * driver that enumerated, served all three descriptors, bound
+	 * correctly - and delivered no input at all, with no error reported
+	 * anywhere. The loop was: packet arrives, probe starts, unclaimed
+	 * send refused, probe abandoned back to NEEDED, repeat forever.
+	 *
+	 * harness_vendor_strict enforces what the driver enforces, so this
+	 * scenario fails the moment the claim is dropped again.
+	 */
+	core_init(&cs, 0, 0);
+	core_set_vendor(&cs, harness_vendor_strict, 0);
+	core_set_vendor_claim(&cs, harness_vendor_claim);
+	bus_reset(good);
+	core_probe_start(&cs);
+	harness_pump(&cs);
+	if (g_bus_count == 0) {
+		hlog("  FAIL probe claim: the strict transport refused every "
+		     "send - the probe did not claim the slot\n");
+		bad++;
+	}
+	if (cs.accessory_state != CORE_ACC_FOUND_1) {
+		hlog("  FAIL probe claim: state %u, want %u\n",
+		       cs.accessory_state, CORE_ACC_FOUND_1);
+		bad++;
+	}
+
+	/*
+	 * 8. A REFUSED SEND MUST NOT STEAL THE OWNER.
+	 *
+	 * vendor_owner says who the NEXT completion belongs to. The effect
+	 * engine runs from core_tick on the very packet that starts the
+	 * probe, so it tries to send while the probe's transfer is still in
+	 * flight and is refused - the single slot is taken. If it has already
+	 * written EFFECT over PROBE by then, the probe's completion is
+	 * delivered to core_effect_complete instead, and the probe waits for
+	 * an answer that was handed to somebody else.
+	 *
+	 * The symptom is the whole driver going quiet: accessory_state stuck
+	 * at PROBING, probe_step stuck at 0, every report gated, and not one
+	 * error reported anywhere.
+	 */
+	core_init(&cs, 0, 0);
+	core_set_vendor(&cs, harness_vendor, 0);
+	bus_reset(good);
+
+	core_probe_start(&cs);              /* claims nothing here, but issues */
+	if (cs.vendor_owner != CORE_VENDOR_OWNER_PROBE) {
+		hlog("  FAIL probe owner: after issue owner is %u, want %u\n",
+		       cs.vendor_owner, CORE_VENDOR_OWNER_PROBE);
+		bad++;
+	}
+
+	/* The slot is busy, so this send is refused. */
+	if (core_effect_send_idle(&cs)) {
+		hlog("  FAIL probe owner: the busy slot accepted a send\n");
+		bad++;
+	}
+	if (cs.vendor_owner != CORE_VENDOR_OWNER_PROBE) {
+		hlog("  FAIL probe owner: a refused send took the owner - "
+		     "got %u, want %u\n", cs.vendor_owner,
+		       CORE_VENDOR_OWNER_PROBE);
+		bad++;
+	}
+
+	/* And the probe still finishes, because its completion still routes
+	 * back to it. */
+	harness_pump(&cs);
+	if (cs.accessory_state != CORE_ACC_FOUND_1) {
+		hlog("  FAIL probe owner: state %u, want %u\n",
+		       cs.accessory_state, CORE_ACC_FOUND_1);
+		bad++;
+	}
+
+	hlog("Accessory probe        : %s (8 scenarios)\n", bad ? "FAIL" : "ok");
 	return bad;
 }
 
@@ -6736,9 +6872,9 @@ static int test_input_path(void)
 		             dx.PendingReadCount, 0, &bad);
 		sched_expect(g_irp_count == 3, "and completed", g_irp_count, 3,
 		             &bad);
-		sched_expect(g_irp_status == STATUS_DELETE_PENDING,
-		             "as delete-pending", (long)g_irp_status,
-		             (long)STATUS_DELETE_PENDING, &bad);
+		sched_expect(g_irp_status == STATUS_CANCELLED,
+		             "as cancelled", (long)g_irp_status,
+		             (long)STATUS_CANCELLED, &bad);
 		groups++;
 	}
 
