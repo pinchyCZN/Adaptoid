@@ -150,6 +150,18 @@ LONG InterlockedExchange(LONG volatile *Target, LONG Value)
 	return old;
 }
 
+/*
+ * The pointer-width twin. It exists because the 32-bit one silently
+ * truncates a 64-bit pointer, which on x64 leaves half of a cancel routine
+ * in the IRP and trips Verifier's 0xC9/7.
+ */
+PVOID InterlockedExchangePointer(PVOID volatile *Target, PVOID Value)
+{
+	PVOID old = *Target;
+	*Target = Value;
+	return old;
+}
+
 void KeInitializeSpinLock(PKSPIN_LOCK SpinLock)
 {
 	if (SpinLock) {

@@ -38,7 +38,7 @@ Signature   = "$WINDOWS NT$"
 Class       = HIDClass
 ClassGuid   = {745A17A0-74D3-11D0-B6FE-00A0C90F57DA}
 Provider    = %ProviderName%
-DriverVer   = 09/17/2026,3.0.0917.0215
+DriverVer   = 09/17/2026,3.0.0917.0224
 CatalogFile = adaptoid.cat
 PnpLockdown = 1
 
