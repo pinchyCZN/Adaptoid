@@ -1338,8 +1338,9 @@ typedef struct _URB_CONTROL_DESCRIPTOR_REQUEST DESC_REQUEST;
 NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 {
 	PURB     urb;
-	ULONG    size = ADAPTOID_CONFIG_FIRST_TRY;
-	NTSTATUS st;
+	ULONG    size  = ADAPTOID_CONFIG_FIRST_TRY;
+	ULONG    tries = 0;
+	NTSTATUS st    = STATUS_SUCCESS;
 
 	urb = (PURB)ExAllocatePoolWithTag(AdaptoidPoolType, sizeof(DESC_REQUEST),
 	                                  ADAPTOID_POOL_TAG);
@@ -1347,8 +1348,29 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 
+	/*
+	 * A FAILED FETCH MUST NOT LEAVE A BUFFER BEHIND, and this is a
+	 * deliberate improvement on the original rather than a port of it.
+	 *
+	 * drv_GetConfigDescriptor at 00016620 ignores drv_SubmitUrbSync's
+	 * return value completely, breaks only on a zero transfer length, and
+	 * then hands DevExt->ConfigDescriptor to drv_SelectConfiguration
+	 * whatever happened. An earlier version here was worse still: it
+	 * noticed the failure, broke out of the loop, and then returned
+	 * STATUS_SUCCESS because the pointer was non-null.
+	 *
+	 * Either way USBD_ParseConfigurationDescriptorEx is given a buffer
+	 * that was allocated and never filled. It reads wTotalLength out of
+	 * uninitialised pool and walks that far - bugcheck 0x50,
+	 * PAGE_FAULT_IN_NONPAGED_AREA, inside USBD!USBD_ParseDescriptors.
+	 * Driver Verifier's low-resources injection reaches it in seconds.
+	 *
+	 * So: zero what is allocated, believe only what actually arrived, and
+	 * propagate the failure with the buffer released.
+	 */
 	for (;;) {
 		PUSB_CONFIGURATION_DESCRIPTOR cd;
+		ULONG got;
 
 		DevExt->ConfigDescriptor =
 		        ExAllocatePoolWithTag(AdaptoidPoolType, size,
@@ -1357,19 +1379,44 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 			ExFreePool(urb);
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
+		RtlZeroMemory(DevExt->ConfigDescriptor, size);
 
 		UsbBuildGetDescriptorRequest(urb, (USHORT)sizeof(DESC_REQUEST),
 		        USB_CONFIGURATION_DESCRIPTOR_TYPE, 0, 0,
 		        DevExt->ConfigDescriptor, NULL, size, NULL);
 		st = SubmitUrbSync(DevExt, urb);
+		got = urb->UrbControlDescriptorRequest.TransferBufferLength;
 
-		cd = (PUSB_CONFIGURATION_DESCRIPTOR)DevExt->ConfigDescriptor;
 		if (!NT_SUCCESS(st) ||
-		    urb->UrbControlDescriptorRequest.TransferBufferLength == 0) {
+		    got < sizeof(USB_CONFIGURATION_DESCRIPTOR)) {
+			/* Nothing usable arrived. */
+			ExFreePool(DevExt->ConfigDescriptor);
+			DevExt->ConfigDescriptor = NULL;
+			if (NT_SUCCESS(st)) {
+				st = STATUS_DEVICE_DATA_ERROR;
+			}
 			break;
 		}
-		if (cd->wTotalLength <= size) {
+
+		cd = (PUSB_CONFIGURATION_DESCRIPTOR)DevExt->ConfigDescriptor;
+		/*
+		 * AGAINST WHAT ARRIVED, not against what was asked for. The
+		 * original compares wTotalLength with the buffer size, which
+		 * accepts a descriptor claiming more bytes than the device
+		 * actually sent and parses the difference out of the tail.
+		 */
+		if (cd->wTotalLength <= got) {
+			st = STATUS_SUCCESS;
 			break;              /* the whole of it arrived */
+		}
+		if (cd->wTotalLength > ADAPTOID_CONFIG_MAX ||
+		    ++tries > ADAPTOID_CONFIG_TRIES) {
+			/* A device naming an ever larger descriptor would
+			 * otherwise loop here reallocating forever. */
+			ExFreePool(DevExt->ConfigDescriptor);
+			DevExt->ConfigDescriptor = NULL;
+			st = STATUS_DEVICE_DATA_ERROR;
+			break;
 		}
 		/* Truncated. Try again at the size the device named. */
 		size = cd->wTotalLength;
@@ -1379,7 +1426,7 @@ NTSTATUS AdaptoidFetchDeviceDescriptor(PADAPTOID_DEVEXT DevExt)
 
 	ExFreePool(urb);
 	if (DevExt->ConfigDescriptor == NULL) {
-		return STATUS_DEVICE_DATA_ERROR;
+		return NT_SUCCESS(st) ? STATUS_DEVICE_DATA_ERROR : st;
 	}
 	/*
 	 * The original tail-calls drv_SelectConfiguration from here.

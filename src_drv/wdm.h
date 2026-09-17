@@ -260,6 +260,16 @@ void AdaptoidInitPoolType(void);
 #define ADAPTOID_CONFIG_FIRST_TRY 0x209
 
 /*
+ * Bounds on the grow-and-retry fetch. The original has neither: a device
+ * that keeps naming a larger wTotalLength than it just sent would have it
+ * reallocating forever. A configuration descriptor is a 16-bit length, so
+ * 64K is the most that can honestly be claimed, and two growths is one
+ * more than a well-behaved device needs.
+ */
+#define ADAPTOID_CONFIG_MAX       0x10000
+#define ADAPTOID_CONFIG_TRIES     2
+
+/*
  * What a poll completion is handed. The slot NUMBER rather than a pointer to
  * it, so the completion can reach the extension as well - and embedded in
  * the extension so submitting a read allocates nothing but the URB and IRP.

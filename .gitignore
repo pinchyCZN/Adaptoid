@@ -32,3 +32,5 @@ build/
 *.opendb
 *.ilk
 *.pdb
+
+tools/testing/
