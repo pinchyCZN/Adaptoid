@@ -5788,6 +5788,26 @@ static LONG g_mutex_max;
 
 void ExInitializeFastMutex(PFAST_MUTEX Mutex) { Mutex->Held = 0; }
 
+/*
+ * The control-device lock is a KMUTEX in the driver, waited on through
+ * KeWaitForSingleObject. Model it the same way the fast mutex is modelled:
+ * a depth counter, so a lock held across a call that takes it again is
+ * still caught.
+ */
+void KeInitializeMutex(PKMUTEX Mutex, ULONG Level)
+{
+	(void)Level;
+	Mutex->Signalled = 1;           /* unheld == available */
+}
+
+LONG KeReleaseMutex(PKMUTEX Mutex, BOOLEAN Wait)
+{
+	(void)Wait;
+	Mutex->Signalled = 1;
+	g_mutex_depth--;
+	return 0;
+}
+
 void ExAcquireFastMutex(PFAST_MUTEX Mutex)
 {
 	Mutex->Held++;
@@ -6461,14 +6481,28 @@ void AdaptoidCancelIrp(PIRP Irp)
 void AdaptoidQueuePollRestart(PADAPTOID_DEVEXT DevExt)
 { (void)DevExt; g_poll_restarts++; pnp_note("pollrestart"); }
 
+/*
+ * THE REAL HANDSHAKE, NOT A FLAG. This used to ignore the request and
+ * answer 1, which made every claim succeed whether or not a cancel routine
+ * had ever been installed - so a queue that parked requests WITHOUT one
+ * passed every test here and then, on hardware, dropped every report and
+ * deadlocked hidclass on removal. Modelling the exchange is what makes a
+ * missing IoSetCancelRoutine visible to the suite.
+ *
+ * g_claim_refuse stays as a deliberate override for tests that want to
+ * force the losing side of the race.
+ */
 int AdaptoidClaimIrp(PIRP Irp)
 {
-	(void)Irp;
+	PVOID prev;
+
 	if (g_claim_refuse > 0) {
 		g_claim_refuse--;
 		return 0;
 	}
-	return 1;
+	prev = Irp->CancelRoutine;
+	Irp->CancelRoutine = NULL;
+	return prev != NULL;
 }
 
 /* What the last completed read carried. */

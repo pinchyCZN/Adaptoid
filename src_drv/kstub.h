@@ -147,6 +147,18 @@ typedef struct _KDPC {
 typedef struct _FAST_MUTEX { LONG Held; } FAST_MUTEX, *PFAST_MUTEX;
 
 /*
+ * A KMUTEX waits at PASSIVE_LEVEL where a FAST_MUTEX raises to APC_LEVEL.
+ * See the note in wdm.c on why that matters.
+ *
+ * SHAPED LIKE A KEVENT ON PURPOSE. The harness waits on it through the
+ * same KeWaitForSingleObject that serves events, and that stub reads the
+ * first LONG as "is it signalled". An unheld mutex must therefore read as
+ * signalled, or every acquisition reports that the driver would have
+ * blocked forever.
+ */
+typedef struct _KMUTEX { LONG Signalled; } KMUTEX, *PKMUTEX;
+
+/*
  * DEVICE_OBJECT and IRP are opaque to the skeleton. Only the members the
  * driver layer actually touches are declared; the rest is deliberately absent
  * so that reaching for an undeclared field is a compile error rather than a
@@ -392,6 +404,8 @@ void     ExFreePool(PVOID P);
 LONG     InterlockedIncrement(LONG volatile *Addend);
 LONG     InterlockedDecrement(LONG volatile *Addend);
 LONG     InterlockedExchange(LONG volatile *Target, LONG Value);
+PVOID    InterlockedExchangePointer(PVOID volatile *Target,
+                                    PVOID Value);
 
 void     KeInitializeSpinLock(PKSPIN_LOCK SpinLock);
 KIRQL    KfAcquireSpinLock(PKSPIN_LOCK SpinLock);
@@ -493,6 +507,8 @@ BOOLEAN KeCancelTimer(PKTIMER Timer);
 void     ExInitializeFastMutex(PFAST_MUTEX Mutex);
 void     ExAcquireFastMutex(PFAST_MUTEX Mutex);
 void     ExReleaseFastMutex(PFAST_MUTEX Mutex);
+void     KeInitializeMutex(PKMUTEX Mutex, ULONG Level);
+LONG     KeReleaseMutex(PKMUTEX Mutex, BOOLEAN Wait);
 
 #define FILE_DEVICE_UNKNOWN 0x00000022
 #define DO_BUFFERED_IO      0x00000004

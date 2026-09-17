@@ -43,7 +43,7 @@
  */
 static PDEVICE_OBJECT g_ControlDevice;
 static LONG           g_ControlRefCount;
-static FAST_MUTEX     g_ControlMutex;
+static KMUTEX         g_ControlMutex;
 
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
                            PUNICODE_STRING RegistryPath)
@@ -103,14 +103,26 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 
 	/*
 	 * THE CONTROL DEVICE'S MUTEX MUST BE INITIALISED HERE. A zeroed
-	 * FAST_MUTEX is not an unheld one - its count reads as already taken
-	 * and its event is unsignalled - so the first adapter to arrive would
+	 * mutex is not an unheld one, so the first adapter to arrive would
 	 * block in AdaptoidCreateControlDevice and never come back. The
 	 * original does the same thing inline at 000115fd.
 	 *
-	 * The harness cannot see this: its fast mutex is a counter.
+	 * A KMUTEX, NOT THE ORIGINAL'S FAST_MUTEX, AND DELIBERATELY. This
+	 * lock is held across IoCreateDevice, IoCreateSymbolicLink,
+	 * IoDeleteSymbolicLink and IoDeleteDevice, every one of which
+	 * requires PASSIVE_LEVEL. ExAcquireFastMutex raises IRQL to
+	 * APC_LEVEL, so the original violates that rule on both the arrival
+	 * and the teardown path - Driver Verifier bugchecks 0xC4 with
+	 * SLIC_IoCreateSymbolicLink_entry_IrqlIoPassive3 on the first device
+	 * arrival. A KMUTEX gives the same mutual exclusion and waits at
+	 * PASSIVE_LEVEL, so the calls inside it are legal.
+	 *
+	 * The 2001 driver predates Driver Verifier's IRQL rules, which is
+	 * presumably why it was never caught. See known-defects.txt.
+	 *
+	 * The harness cannot see any of this: its mutex is a counter.
 	 */
-	ExInitializeFastMutex(&g_ControlMutex);
+	KeInitializeMutex(&g_ControlMutex, 0);
 	mj[IRP_MJ_PNP]                     = AdaptoidPnp;
 	mj[IRP_MJ_POWER]                   = AdaptoidPower;
 	DriverObject->DriverUnload         = AdaptoidUnload;
@@ -738,13 +750,26 @@ void AdaptoidCancelIrp(PIRP Irp)
 }
 
 /*
- * Whether a parked request is still ours. The InterlockedExchange is the
- * whole of it: if the cancel routine was still set we won the race, and if
- * it was already null the canceller owns completing the request.
+ * Whether a parked request is still ours. The exchange is the whole of it:
+ * if the cancel routine was still set we won the race, and if it was
+ * already null the canceller owns completing the request.
+ *
+ * InterlockedExchangePOINTER, NOT InterlockedExchange. The latter is
+ * 32-bit, and CancelRoutine is a 64-bit pointer here, so it clears only
+ * the low half and leaves the top half in place - the field ends up
+ * holding a truncated, non-null pointer. The claim still reports success,
+ * so everything appears to work, and then IoCompleteRequest finds a cancel
+ * routine still set and Verifier bugchecks 0xC9 subcode 7 with a pointer
+ * like fffff80a`00000000 - recognisably the high half of a real address.
+ * Had cancellation ever fired, it would have called that address.
+ *
+ * The 32-bit original is correct as written; the idiom simply does not
+ * survive the port. See the pointer-width warning in CLAUDE.md.
  */
 int AdaptoidClaimIrp(PIRP Irp)
 {
-	return InterlockedExchange((LONG volatile *)&Irp->CancelRoutine, 0) != 0;
+	return InterlockedExchangePointer((PVOID volatile *)&Irp->CancelRoutine,
+	                                  NULL) != NULL;
 }
 
 NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
@@ -1498,8 +1523,23 @@ static NTSTATUS NTAPI VendorUrbComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)Context;
 	PURB             urb = (PURB)dx->Vendor.Urb;
 	ULONG            length = 0;
+	NTSTATUS         status;
 
 	UNREFERENCED_PARAMETER(DeviceObject);
+
+	/*
+	 * READ THE STATUS BEFORE ANYTHING IS FREED. This used to call
+	 * IoFreeIrp and then pass Irp->IoStatus.Status to the completion - a
+	 * use-after-free that normally goes unnoticed, because freed pool
+	 * usually still holds the old bytes. Under Driver Verifier's special
+	 * pool the page is unmapped the instant it is freed, so the read
+	 * faults immediately: bugcheck 0xA in VendorUrbComplete on the first
+	 * vendor transfer the driver ever completes.
+	 *
+	 * drv_VendorUrbComplete at 00019747 frees the IRP at the very END of
+	 * the routine, after every use of it. This ordering is that one.
+	 */
+	status = Irp->IoStatus.Status;
 
 	if (urb != NULL) {
 		length = urb->UrbControlVendorClassRequest.TransferBufferLength;
@@ -1509,7 +1549,7 @@ static NTSTATUS NTAPI VendorUrbComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 	dx->Vendor.UrbIrp = NULL;
 	IoFreeIrp(Irp);
 
-	AdaptoidVendorComplete(dx, Irp->IoStatus.Status, length);
+	AdaptoidVendorComplete(dx, status, length);
 	return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
@@ -3269,7 +3309,8 @@ NTSTATUS AdaptoidCreateControlDevice(PDRIVER_OBJECT DriverObject)
 	PDEVICE_OBJECT dev = NULL;
 	UNICODE_STRING name, link;
 
-	ExAcquireFastMutex(&g_ControlMutex);
+	KeWaitForSingleObject(&g_ControlMutex, Executive, KernelMode,
+	                      FALSE, NULL);
 	if (g_ControlDevice == NULL) {
 		RtlInitUnicodeString(&name, ADAPTOID_CDO_NAME);
 		st = IoCreateDevice(DriverObject, sizeof(ADAPTOID_CDO_EXT),
@@ -3305,7 +3346,7 @@ NTSTATUS AdaptoidCreateControlDevice(PDRIVER_OBJECT DriverObject)
 	if (NT_SUCCESS(st)) {
 		g_ControlRefCount++;
 	}
-	ExReleaseFastMutex(&g_ControlMutex);
+	KeReleaseMutex(&g_ControlMutex, FALSE);
 	return st;
 }
 
@@ -3319,7 +3360,8 @@ void AdaptoidControlMaybeDelete(void)
 {
 	PDEVICE_OBJECT dev = NULL;
 
-	ExAcquireFastMutex(&g_ControlMutex);
+	KeWaitForSingleObject(&g_ControlMutex, Executive, KernelMode,
+	                      FALSE, NULL);
 	if (g_ControlRefCount == 0 && g_ControlDevice != NULL &&
 	    ((PADAPTOID_CDO_EXT)g_ControlDevice->DeviceExtension)->OpenCount
 	     == 0) {
@@ -3334,7 +3376,7 @@ void AdaptoidControlMaybeDelete(void)
 		 */
 		g_ControlDevice = NULL;
 	}
-	ExReleaseFastMutex(&g_ControlMutex);
+	KeReleaseMutex(&g_ControlMutex, FALSE);
 
 	if (dev != NULL) {
 		PADAPTOID_CDO_EXT cx = (PADAPTOID_CDO_EXT)dev->DeviceExtension;
@@ -3350,11 +3392,12 @@ void AdaptoidControlMaybeDelete(void)
 
 void AdaptoidReleaseControlDevice(void)
 {
-	ExAcquireFastMutex(&g_ControlMutex);
+	KeWaitForSingleObject(&g_ControlMutex, Executive, KernelMode,
+	                      FALSE, NULL);
 	if (g_ControlRefCount > 0) {
 		g_ControlRefCount--;
 	}
-	ExReleaseFastMutex(&g_ControlMutex);
+	KeReleaseMutex(&g_ControlMutex, FALSE);
 	AdaptoidControlMaybeDelete();
 }
 
@@ -3546,9 +3589,10 @@ NTSTATUS NTAPI AdaptoidControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		return STATUS_DELETE_PENDING;
 	}
 
-	ExAcquireFastMutex(&g_ControlMutex);
+	KeWaitForSingleObject(&g_ControlMutex, Executive, KernelMode,
+	                      FALSE, NULL);
 	was = cx->OpenCount++;
-	ExReleaseFastMutex(&g_ControlMutex);
+	KeReleaseMutex(&g_ControlMutex, FALSE);
 
 	if (was == 0) {
 		for (d = cx->Registry.devices.flink;
@@ -3598,11 +3642,12 @@ NTSTATUS NTAPI AdaptoidControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
 	AdaptoidCancelNotifications(cx, Irp);
 
-	ExAcquireFastMutex(&g_ControlMutex);
+	KeWaitForSingleObject(&g_ControlMutex, Executive, KernelMode,
+	                      FALSE, NULL);
 	if (cx->OpenCount > 0) {
 		cx->OpenCount--;
 	}
-	ExReleaseFastMutex(&g_ControlMutex);
+	KeReleaseMutex(&g_ControlMutex, FALSE);
 
 	AdaptoidControlMaybeDelete();
 	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0);
