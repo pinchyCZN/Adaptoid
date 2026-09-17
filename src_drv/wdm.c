@@ -2343,23 +2343,36 @@ static void NTAPI AdaptoidCancelReadIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
 	PADAPTOID_DEVEXT DevExt = AdaptoidDevExtOf(DeviceObject);
 	KIRQL            irql;
-	int              ours;
 
 	IoReleaseCancelSpinLock(Irp->CancelIrql);
 
 	KeAcquireSpinLock(&DevExt->ReportLock, &irql);
-	ours = AdaptoidUnlinkRead(DevExt, Irp);
+	AdaptoidUnlinkRead(DevExt, Irp);
 	KeReleaseSpinLock(&DevExt->ReportLock, irql);
 
 	/*
-	 * If it was already off the list a dequeue took it, and that side
-	 * owns completing it - the same handshake AdaptoidClaimIrp is the
-	 * other half of.
+	 * COMPLETED UNCONDITIONALLY, and the unlink's answer is deliberately
+	 * not used to decide it.
+	 *
+	 * IoCancelIrp takes Irp->CancelRoutine with an interlocked exchange
+	 * and calls this only if it won, so this routine holds the request
+	 * exclusively and no later claim can succeed. There is nobody else to
+	 * complete it.
+	 *
+	 * TREATING "ALREADY OFF THE LIST" AS SOMEBODY ELSE'S OWNERSHIP IS THE
+	 * TRAP. AdaptoidDequeueRead unlinks BEFORE it claims, so between those
+	 * two steps the list has stopped being the arbiter and the exchange
+	 * has become it. A cancel landing in that window makes the dequeue's
+	 * claim fail - it moves on, believing the canceller owns the request -
+	 * while this routine finds the entry gone. Both would drop it and the
+	 * request would never complete, stranding a RemoveLockB reference and,
+	 * for a synchronous caller, the calling thread with it.
+	 *
+	 * The unlink still has to happen so the list keeps no stale entry; it
+	 * just does not decide this.
 	 */
-	if (ours) {
-		AdaptoidCompleteIrp(Irp, STATUS_CANCELLED, 0);
-		AdaptoidLockRelease(&DevExt->RemoveLockB);
-	}
+	AdaptoidCompleteIrp(Irp, STATUS_CANCELLED, 0);
+	AdaptoidLockRelease(&DevExt->RemoveLockB);
 }
 
 /*
@@ -3653,13 +3666,50 @@ void AdaptoidNotifyInit(PADAPTOID_CDO_EXT CdoExt)
 	                 NotifyAbort, CdoExt);
 }
 
+/*
+ * A CANCEL ROUTINE ALWAYS OWNS ITS IRP, and must complete it unconditionally.
+ *
+ * IoCancelIrp takes Irp->CancelRoutine with an interlocked exchange and calls
+ * the routine ONLY if it won that exchange, so by the time this runs the
+ * pointer is already null and no other claim can ever succeed. There is
+ * nobody else left to complete the request.
+ *
+ * THIS MUST NOT GO THROUGH AdaptoidCancelNotifications, which is written for
+ * CLEANUP and CLOSE. Those arrive with the cancel routine still installed, so
+ * the claim inside is a real arbiter against a delivery in flight. Here the
+ * same claim reads the null the I/O manager just wrote, fails every time, and
+ * the request is dropped as "somebody else owns this" when nobody does.
+ *
+ * WHAT THAT COSTS IS NOT A LEAKED IRP. Function 0x818 is issued as a
+ * synchronous DeviceIoControl, so the caller's thread sits in
+ * nt!IopCancelAlertedRequest, which sleeps until the driver completes the
+ * request. It never does: the thread cannot leave the kernel, cannot take the
+ * termination APC, and the process becomes unkillable. Its handle never
+ * closes, so OpenCount never falls to zero, so AdaptoidControlMaybeDelete
+ * never deletes the control device, so the driver stays mapped and no
+ * reinstall can replace it short of a reboot. Measured as three unkillable
+ * wishd201.exe with OpenCount at 3 and waiter_count at 0 - unlinked, never
+ * completed.
+ *
+ * Unlinking is still done, because the list must not keep a stale waiter, but
+ * its answer is deliberately NOT used as the ownership test: delivery unlinks
+ * before it claims, so a waiter this routine finds already gone may be one
+ * whose delivery then LOST the claim to us and dropped it.
+ */
 static void NTAPI NotifyCancelRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-	PADAPTOID_CDO_EXT cx =
+	PADAPTOID_CDO_EXT   cx =
 	        (PADAPTOID_CDO_EXT)DeviceObject->DeviceExtension;
+	core_notify_waiter *w = ADAPTOID_IRP_WAITER(Irp);
+	KIRQL               irql;
 
 	IoReleaseCancelSpinLock(Irp->CancelIrql);
-	AdaptoidCancelNotifications(cx, Irp);
+
+	KeAcquireSpinLock(&cx->Lock, &irql);
+	core_notify_cancel(&cx->Registry.notify, w);
+	KeReleaseSpinLock(&cx->Lock, irql);
+
+	AdaptoidCompleteIrp(Irp, STATUS_CANCELLED, 0);
 }
 
 NTSTATUS AdaptoidWaitNotification(PADAPTOID_CDO_EXT CdoExt, PIRP Irp)

@@ -34,6 +34,62 @@ if errorlevel 1 (
     echo   NOT ELEVATED. Run this from an Administrator command prompt.
     exit /b 1
 )
+
+rem THE CONFIGURATOR PINS THE OLD DRIVER IN MEMORY, and this is the one
+rem failure mode of this script that reports complete success and changes
+rem nothing. It is worth refusing rather than warning.
+rem
+rem wishk300 only leaves memory when its last device object goes, and the
+rem control device is deleted only when the adapter count AND the open
+rem handle count are both zero. The configurator holds two handles on
+rem \\.\Wish_NA1 for as long as it runs, so unplugging the adapter is not
+rem enough: the control device survives, the driver object survives, and
+rem Windows will not map a second copy of an image that is still resident.
+rem
+rem Everything below then succeeds - the file is staged, the package
+rem installs, the rescan binds - while the kernel goes on running the
+rem previous build. Measured as an unchanged load address and an unchanged
+rem PDB GUID across a deploy, with the bug the deploy was meant to fix
+rem still visibly accumulating in the device extension.
+tasklist /fi "imagename eq wishd201.exe" 2>nul | find /i "wishd201.exe" >nul
+if not errorlevel 1 (
+    echo.
+    echo   THE CONFIGURATOR IS RUNNING. Deploying now would report success
+    echo   and leave the OLD driver running.
+    echo.
+    echo   wishd201.exe keeps \\.\Wish_NA1 open, which keeps the control
+    echo   device alive, which keeps wishk300.sys resident. A resident
+    echo   image is never replaced.
+    echo.
+    echo   Exit it from its tray icon, then run this again. If it is
+    echo   already closed and this still fires, reboot instead - something
+    echo   else holds a handle.
+    echo.
+    echo   To deploy anyway, knowing it may not take effect:
+    echo       deploy.cmd "%PKG%" force
+    echo.
+    if /i not "%~2"=="force" exit /b 1
+    echo   FORCED. Verify the load address actually changed afterwards.
+    echo.
+)
+
+rem WAS THE OLD IMAGE ALREADY RESIDENT WHEN WE STARTED? That, not the
+rem state afterwards, is what decides whether this deploy can take. A
+rem running service after the install is normal and expected - the device
+rem was rebound and the driver loaded. A running service BEFORE it means
+rem the previous image is still mapped, and Windows does not replace a
+rem mapped image, so the install below will stage the new file and leave
+rem the kernel executing the old one.
+rem
+rem wishk300 stays mapped until its last device object goes, and the
+rem control device is deleted only when the adapter count and the open
+rem handle count are BOTH zero AT THE SAME MOMENT. Closing the
+rem configurator while the adapter is plugged does not do it, and
+rem unplugging the adapter while the configurator runs does not either.
+rem Section 7.2 of ..\src_drv\README.txt has the detail.
+set "WASRESIDENT="
+sc query wishk300 2>nul | find /i "RUNNING" >nul
+if not errorlevel 1 set "WASRESIDENT=1"
 if not exist "%PKG%\%INFNAME%" (
     echo   No %INFNAME% in %PKG%
     echo   Run tools\package.cmd on the host first.
@@ -143,6 +199,24 @@ echo ============================================================
 sc query wishk300 2>nul | findstr /i "SERVICE_NAME STATE"
 reg query "HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_06F7&PID_0001" /s /v Service 2>nul | findstr /i "Service"
 echo.
+if defined WASRESIDENT (
+    echo   ------------------------------------------------------------
+    echo   THE OLD DRIVER WAS ALREADY LOADED WHEN THIS STARTED, so the
+    echo   new file is staged but the kernel is almost certainly still
+    echo   running the previous build. Everything above still reports
+    echo   success; that is what makes this worth saying out loud.
+    echo.
+    echo   REBOOT THE GUEST. That is the only step that reliably maps
+    echo   the new image, and it costs less than diagnosing a fix that
+    echo   appears not to work.
+    echo.
+    echo   To confirm afterwards, from the host debugger:
+    echo       lm vm wishk300
+    echo   The load address and the PDB GUID both change on every build.
+    echo   If neither moved, the old image is still running.
+    echo   ------------------------------------------------------------
+    echo.
+)
 echo   For the full picture run state.cmd.
 echo   If the adapter was plugged in through this, unplug and replug it -
 echo   the accessory probe only runs on device arrival.

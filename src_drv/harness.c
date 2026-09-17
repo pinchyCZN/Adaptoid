@@ -3926,6 +3926,90 @@ static int test_hid_reports(void)
 		groups++;
 	}
 
+	/* ---- unloading a script releases what it was holding -----------
+	 *
+	 * THE BUG THIS EXISTS FOR, reproduced on hardware before it was
+	 * fixed: a script bound the A button to _key('f13'), the button was
+	 * held, and a DIFFERENT script was selected before it was released.
+	 * The driver was left with key_down_count 1 and keys_down[0] 0x68
+	 * while an unrelated script was loaded and thread_count was 0.
+	 *
+	 * A keyboard report is absolute state, so the host held F13 down
+	 * until a report omitted it, and the only code that would have sent
+	 * that report had just been freed. Nothing was running; the key was
+	 * latched.
+	 *
+	 * Both orderings are checked here, because the fix must clear the
+	 * first WITHOUT disturbing the second.
+	 */
+	{
+		/* ---- released while its script is still loaded: unchanged -- */
+		core_sched s;
+
+		core_init(&cs, hid_sink, 0);
+		core_sched_init(&s, sched_test_alloc, sched_test_free, 0);
+		core_sched_set_core(&s, &cs);
+
+		core_hid_key_event(&cs, 0x68, 1);          /* press, from _key */
+		core_hid_key_event(&cs, 0x68, 0);          /* release, same script */
+		sched_expect(cs.key_down_count == 0, "an ordinary release clears",
+		             cs.key_down_count, 0, &bad);
+
+		g_hidcount = 0;
+		core_sched_unload(&s);
+		sched_expect(cs.key_down_count == 0, "and unload leaves it clear",
+		             cs.key_down_count, 0, &bad);
+		sched_expect(g_hidcount == 0,
+		             "emitting nothing when nothing was held",
+		             g_hidcount, 0, &bad);
+
+		/* ---- held ACROSS the unload: must be released -------------- */
+		core_init(&cs, hid_sink, 0);
+		core_sched_init(&s, sched_test_alloc, sched_test_free, 0);
+		core_sched_set_core(&s, &cs);
+
+		core_hid_key_event(&cs, 0x68, 1);
+		core_hid_mouse_button(&cs, 1, 1);
+		sched_expect(cs.key_down_count == 1, "the key is held",
+		             cs.key_down_count, 1, &bad);
+		sched_expect(cs.keys_down[0] == 0x68, "and it is F13",
+		             cs.keys_down[0], 0x68, &bad);
+		sched_expect(cs.mouse_buttons == 1, "the mouse button too",
+		             cs.mouse_buttons, 1, &bad);
+
+		g_hidcount = 0;
+		core_sched_unload(&s);
+
+		sched_expect(cs.key_down_count == 0,
+		             "unload releases a key the script still held",
+		             cs.key_down_count, 0, &bad);
+		sched_expect(cs.key_modifiers == 0, "and every modifier",
+		             cs.key_modifiers, 0, &bad);
+		sched_expect(cs.mouse_buttons == 0, "and every mouse button",
+		             cs.mouse_buttons, 0, &bad);
+
+		/*
+		 * CLEARING THE STATE IS NOT ENOUGH ON ITS OWN. The host holds
+		 * the key until a report arrives WITHOUT it, so the reports
+		 * matter as much as the fields: one keyboard, one mouse.
+		 */
+		sched_expect(g_hidcount == 2, "and says so in two reports",
+		             g_hidcount, 2, &bad);
+		sched_expect(g_hidlog[0].id == CORE_REPORT_KEYBOARD,
+		             "the keyboard one first", g_hidlog[0].id,
+		             CORE_REPORT_KEYBOARD, &bad);
+		sched_expect(g_hidlog[0].data[0] == 0, "with no modifiers",
+		             g_hidlog[0].data[0], 0, &bad);
+		sched_expect(g_hidlog[0].data[2] == 0, "and an empty key slot",
+		             g_hidlog[0].data[2], 0, &bad);
+		sched_expect(g_hidlog[1].id == CORE_REPORT_MOUSE,
+		             "then the mouse one", g_hidlog[1].id,
+		             CORE_REPORT_MOUSE, &bad);
+		sched_expect(g_hidlog[1].data[0] == 0, "with no buttons",
+		             g_hidlog[1].data[0], 0, &bad);
+		groups++;
+	}
+
 	hlog("HID report builders    : %s (%d groups)\n", bad ? "FAIL" : "ok",
 	     groups);
 	return bad;
@@ -7043,6 +7127,15 @@ static int test_input_path(void)
 		 */
 		cancel = (CANCEL_FN)reads[0].CancelRoutine;
 		reads[0].Cancel = TRUE;
+		/*
+		 * AND IT TAKES THE ROUTINE FIRST. IoCancelIrp claims
+		 * Irp->CancelRoutine with an interlocked exchange and calls it
+		 * only if it won, so a cancel routine always runs with the
+		 * pointer already null. Leaving it installed here would let a
+		 * routine that re-claims the IRP pass - which is exactly how
+		 * the notification path's leak survived this suite.
+		 */
+		reads[0].CancelRoutine = NULL;
 		g_irp_count = 0;
 		if (cancel != NULL) {
 			cancel(&devobj, &reads[0]);
@@ -7203,6 +7296,73 @@ static int test_input_path(void)
 		}
 		sched_expect(dx.RemoveLockB.IoCount == 1,
 		             "and 64 more deliveries do not move it",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 18. a dequeue that LOSES the claim still gets completed ----
+	 *
+	 * THE NARROW HALF OF THE SAME DEFECT the notification path had in its
+	 * wide form. Both queues unlink a request BEFORE claiming it, so
+	 * between those two steps the list has stopped being the arbiter and
+	 * the interlocked exchange on Irp->CancelRoutine has become it.
+	 *
+	 * If IoCancelIrp wins that exchange in exactly that window: the
+	 * dequeue's claim fails and it moves on, believing the canceller owns
+	 * the request - while the cancel routine, if it tests LIST MEMBERSHIP,
+	 * finds the entry already unlinked and believes the dequeue owns it.
+	 * Both drop it and nobody completes it.
+	 *
+	 * A cancel routine is never called unless IoCancelIrp won, so it holds
+	 * the request exclusively and the only correct thing it can do is
+	 * complete it unconditionally. Membership decides whether to UNLINK,
+	 * never whether to complete.
+	 *
+	 * g_claim_refuse forces the losing side, which is the only way to
+	 * reach this window deterministically.
+	 */
+	{
+		typedef void (NTAPI *CANCEL_FN)(PDEVICE_OBJECT, PIRP);
+		DEVICE_OBJECT devobj;
+		CANCEL_FN     cancel;
+		PIRP          got;
+
+		input_reset(&dx);
+		g_pnp_devext = &dx;
+		memset(&devobj, 0, sizeof(devobj));
+
+		AdaptoidReadReport(&dx, &reads[0]);
+		sched_expect(dx.PendingReadCount == 1, "a read is parked",
+		             dx.PendingReadCount, 1, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 2,
+		             "holding a remove lock reference",
+		             dx.RemoveLockB.IoCount, 2, &bad);
+
+		cancel = (CANCEL_FN)reads[0].CancelRoutine;
+
+		/* The dequeue unlinks it, then loses the claim to a cancel. */
+		g_claim_refuse = 1;
+		got = AdaptoidDequeueRead(&dx);
+		g_claim_refuse = 0;
+		sched_expect(got == NULL, "the dequeue gives it up",
+		             got == NULL, 1, &bad);
+		sched_expect(dx.PendingReadCount == 0,
+		             "but it is already off the list",
+		             dx.PendingReadCount, 0, &bad);
+
+		/* Now the cancel the dequeue deferred to actually arrives. */
+		g_irp_count            = 0;
+		reads[0].Cancel        = TRUE;
+		reads[0].CancelRoutine = NULL;
+		if (cancel != NULL) {
+			cancel(&devobj, &reads[0]);
+		}
+
+		sched_expect(g_irp_count == 1,
+		             "the cancel routine completes it anyway",
+		             g_irp_count, 1, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "and gives the remove lock back",
 		             dx.RemoveLockB.IoCount, 1, &bad);
 		groups++;
 	}
@@ -8997,6 +9157,95 @@ static int test_power_and_control(void)
 		sched_expect(g_irp_count == 0,
 		             "a waiter already claimed is not completed twice",
 		             g_irp_count, 0, &bad);
+
+		cx->Registry.live_count = 0;
+		AdaptoidReleaseControlDevice();
+		groups++;
+	}
+
+	/* ---- 13. the I/O manager cancels a parked notification --------- */
+	{
+		typedef void (NTAPI *CANCEL_FN)(PDEVICE_OBJECT, PIRP);
+		PADAPTOID_CDO_EXT cx;
+		DRIVER_OBJECT     drv;
+		IRP               irp;
+		IO_STACK_LOCATION sp;
+		FILE_OBJECT       fo;
+		UCHAR             buf[CORE_NOTIFY_BYTES];
+		CANCEL_FN         cancel;
+
+		/*
+		 * THE CASE THE GROUP ABOVE DOES NOT COVER, and the difference is
+		 * the whole bug. Group 12 calls AdaptoidCancelNotifications
+		 * directly, which is the CLEANUP and CLOSE path: the cancel
+		 * routine is still installed there, so the interlocked claim
+		 * inside it finds a non-null pointer and succeeds.
+		 *
+		 * THE I/O MANAGER ARRIVES DIFFERENTLY. IoCancelIrp takes the
+		 * cancel routine with an interlocked exchange and only calls it
+		 * if IT won, so by the time a cancel routine runs,
+		 * Irp->CancelRoutine IS ALREADY NULL and no later claim can
+		 * ever succeed. A cancel routine therefore holds the IRP
+		 * exclusively and must complete it unconditionally.
+		 *
+		 * Claiming again inside it always fails, the request is dropped
+		 * as "somebody else owns this" when nobody does, and it stays
+		 * pending forever.
+		 *
+		 * WHAT THAT COSTS IS NOT A LEAKED IRP. A synchronous
+		 * DeviceIoControl leaves the caller's thread inside
+		 * nt!IopCancelAlertedRequest, which sleeps until the driver
+		 * completes the request - so the thread cannot leave the
+		 * kernel, cannot take the termination APC, and the process
+		 * becomes unkillable. Its handle never closes either, so the
+		 * control device is never deleted, the driver stays mapped, and
+		 * no reinstall can replace it until a reboot. Measured with
+		 * three unkillable wishd201.exe and OpenCount stuck at 3.
+		 *
+		 * SO THE MODELLING HAS TO BE EXACT: clear CancelRoutine BEFORE
+		 * calling, exactly as IoCancelIrp does. Leaving it installed is
+		 * what let this pass here for as long as it did.
+		 */
+		memset(&drv, 0, sizeof(drv));
+		AdaptoidCreateControlDevice(&drv);
+		cx = AdaptoidControlDeviceExt();
+		cx->Registry.live_count = 1;
+
+		memset(&irp, 0, sizeof(irp));
+		memset(&sp, 0, sizeof(sp));
+		memset(&fo, 0, sizeof(fo));
+		irp.CurrentStackLocation = &sp;
+		irp.NextStackLocation    = &sp;
+		irp.SystemBuffer         = buf;
+		sp.FileObject            = &fo;
+
+		g_irp_count = 0;
+		sched_expect(AdaptoidWaitNotification(cx, &irp) == STATUS_PENDING,
+		             "the waiter parks", 1, 1, &bad);
+		sched_expect(cx->Registry.notify.waiter_count == 1,
+		             "and is on the list",
+		             cx->Registry.notify.waiter_count, 1, &bad);
+
+		cancel = (CANCEL_FN)irp.CancelRoutine;
+		sched_expect(cancel != NULL, "a cancel routine is installed",
+		             cancel != NULL, 1, &bad);
+
+		/* IoCancelIrp: set Cancel, TAKE the routine, then call it. */
+		irp.Cancel        = TRUE;
+		irp.CancelRoutine = NULL;
+		if (cancel != NULL) {
+			cancel(cx->Self, &irp);
+		}
+
+		sched_expect(g_irp_count == 1,
+		             "the cancel routine completes the request",
+		             g_irp_count, 1, &bad);
+		sched_expect(irp.IoStatus.Status == STATUS_CANCELLED,
+		             "as cancelled", 1,
+		             irp.IoStatus.Status == STATUS_CANCELLED, &bad);
+		sched_expect(cx->Registry.notify.waiter_count == 0,
+		             "and takes it off the list",
+		             cx->Registry.notify.waiter_count, 0, &bad);
 
 		cx->Registry.live_count = 0;
 		AdaptoidReleaseControlDevice();

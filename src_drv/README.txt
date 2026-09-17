@@ -32,6 +32,7 @@ Table of Contents
    6.2.  Specifications For What Remains
    7.  Installing It
    7.1.  Signing
+   7.2.  Redeploying Over A Running Driver
    8.  Out Of Scope
 
 1.  Layout
@@ -449,16 +450,48 @@ Table of Contents
    fall back to loading the .sys as a service by hand, which skips PnP
    entirely and therefore skips the catalog.
 
-   WHAT ALL OF THIS ESTABLISHES is that the package is signed and
-   installable in principle. It has not been installed. The four clean
-   builds say the code compiles and links as a kernel driver; nothing here
-   says it runs.
+   THE PACKAGE INSTALLS AND THE DRIVER RUNS. It is deployed and loaded on
+   64-bit Windows 10 with test signing on, hidclass accepts the composite
+   descriptor, and the original 2001 configurator - a 32-bit binary - drives
+   it: it opens the control device, enumerates the adapter, downloads
+   compiled scripts, and keyboard and mouse remapping work. So the catalog
+   attribute above is not a blocker in practice on that build.
+
+7.2.  Redeploying Over A Running Driver
+
+   THE CONFIGURATOR PINS THE OLD DRIVER IN MEMORY, and this is the one way
+   a deploy reports complete success and changes nothing at all.
+
+   wishk300.sys leaves memory only when its last device object goes.
+   AdaptoidControlMaybeDelete deletes the control device only when the
+   adapter count and the open handle count are BOTH zero, and wishd201.exe
+   holds two handles on \\.\Wish_NA1 for as long as it runs. Unplugging the
+   adapter is therefore not enough: the control device survives, the driver
+   object survives, and Windows will not map a second copy of an image that
+   is still resident.
+
+   Everything downstream then succeeds. The file stages, pnputil installs
+   the package, the rescan binds the device - and the kernel goes on
+   executing the previous build.
+
+   THE FILE ON DISK PROVES NOTHING. The only reliable check is the loaded
+   image:
+
+       lm vm wishk300
+
+   The load address and the PDB GUID in the symbol path both change on
+   every link. If neither moved across a deploy, the old image is still
+   running no matter what the install reported.
+
+   deploy.cmd refuses to run while wishd201.exe is present for this reason.
+   Exit it from its tray icon first, or reboot after deploying.
 
 8.  Out Of Scope
 
-   Loading the driver is out of scope here. It is unsigned, and x64 Windows
-   will not load an unsigned driver without test-signing mode; see
-   ../docs/replacement-architecture.txt section 8.4.
+   The driver is test-signed rather than WHQL-signed, so x64 Windows loads
+   it only with test-signing mode on; see
+   ../docs/replacement-architecture.txt section 8.4. Production signing is
+   out of scope here.
 
    Note also that none of the 2001 offsets carry over to 64-bit. The portable
    content is field order and meaning, which is why the extension is written

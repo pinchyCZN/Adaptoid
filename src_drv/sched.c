@@ -293,6 +293,53 @@ void core_sched_unload(core_sched *s)
 	if (s == 0) {
 		return;
 	}
+
+	/*
+	 * RELEASE WHAT THE SCRIPT WAS HOLDING, FIRST, and this is a deliberate
+	 * improvement on the original rather than a port of it.
+	 *
+	 * THE PROBLEM IS A LIFETIME MISMATCH, not a missing shutdown step. A
+	 * HID keyboard report is ABSOLUTE STATE: every report carries the
+	 * complete set of keys currently down, and the host holds a key until
+	 * a later report omits it. So a script does not hold a key. It causes
+	 * two one-shot transitions - core_hid_key_event(usage, 1) on press and
+	 * (usage, 0) on release - and between them the driver sends nothing at
+	 * all.
+	 *
+	 * That state lives in core_state, which belongs to the DEVICE, but only
+	 * a script ever writes it. Free the script between the two transitions
+	 * and the second one can never happen: nothing is left running, nothing
+	 * is looping, and no thread is waiting - the key is simply latched down
+	 * in core_state and in the host's keyboard stack, and the only code
+	 * that knew how to lift it has been freed. The host's typematic repeat
+	 * then makes it look like something is still driving input.
+	 *
+	 * drv_ScriptLoad at 00017310 has the same gap. Its teardown zeroes
+	 * CurStickX, CurStickY and CurButtons - the JOYSTICK state a script
+	 * owned - and stops there, so the keyboard and mouse collections are
+	 * left holding whatever the script last set. This does for those two
+	 * what the original does for the stick.
+	 *
+	 * Measured: with a script binding the A button to _key('f13'), holding
+	 * A and switching scripts left key_down_count at 1 and keys_down[0] at
+	 * 0x68 with a different script loaded and thread_count at 0.
+	 *
+	 * COSTS NOTHING WHEN NOTHING IS HELD. Both calls test for an actual
+	 * change before emitting, so the ordinary case - a release that arrives
+	 * while its own script is still loaded - reaches here with the state
+	 * already clear and sends no report.
+	 */
+	if (s->cs != 0) {
+		u32 button;
+
+		/* Usage zero is the release-everything case: all keys and all
+		 * modifiers, one report. */
+		core_hid_key_event(s->cs, 0, 0);
+		for (button = 1; button <= CORE_HID_MOUSE_BUTTONS; button++) {
+			core_hid_mouse_button(s->cs, button, 0);
+		}
+	}
+
 	if (s->arm != 0) {
 		/* Cancelling is arming for "never"; the OS layer reads a wake time
 		 * of 0 as a cancel. drv_ScriptLoad calls KeCancelTimer here. */
