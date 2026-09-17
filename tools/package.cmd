@@ -101,9 +101,15 @@ rem The guest cannot see the source tree, only the share, so the scripts
 rem it has to run have to travel with the package. They go BESIDE the
 rem package folder rather than inside it, to keep that folder to exactly
 rem the files the catalogue covers.
-for %%S in (deploy.cmd state.cmd undeploy.cmd pakread.exe) do (
+for %%S in (deploy.cmd state.cmd undeploy.cmd trustcert.cmd) do (
     if exist "%~dp0%%S" copy /y "%~dp0%%S" "%DEST%\..\" >nul
 )
+rem THE CERTIFICATE HAS TO TRAVEL TOO. Without it in the guest's Root and
+rem TrustedPublisher stores the package stages but reports
+rem "Signer Name: Unknown", the driver is refused as unsigned, and the
+rem device falls through to HidUsb looking like a plain game controller.
+copy /y "%ROOT%\src_drv\build\sign\adaptoid-test.cer" "%DEST%\..\" >nul 2>&1
+if errorlevel 1 echo   WARNING: no adaptoid-test.cer to stage.
 if exist "%ROOT%\src_drv\build\x64\Release\pakread.exe" (
     copy /y "%ROOT%\src_drv\build\x64\Release\pakread.exe" "%DEST%\..\" >nul
 )

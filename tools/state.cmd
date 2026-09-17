@@ -16,8 +16,33 @@ rem to open the device, so run pakread.exe - it prints whether the open
 rem succeeded before it does anything else.
 rem ----------------------------------------------------------------------
 
+rem     state.cmd [output-file]
+rem
+rem Give it any path you like; that path is used verbatim and nothing is
+rem copied anywhere. With no argument it writes locally and then tries to
+rem copy onto the share.
+rem
+rem THE SHARE IS NOT THE SAME LETTER ON BOTH SIDES. The host's B: appears
+rem inside this guest as Z:, so a default of B: writes nowhere. Z: is
+rem tried first and B: second, and neither existing is not an error - the
+rem local copy is still written.
+rem
+rem WRITE LOCALLY FIRST, COPY AFTER. A VirtualBox shared folder is
+rem read-only unless it was explicitly made writable, and redirecting
+rem straight onto a read-only share fails EVERY line in this script with
+rem "The system cannot find the path specified" - dozens of identical
+rem errors that look like the registry queries failing rather than the
+rem output file.
 set "OUT=%~1"
-if "%OUT%"=="" set "OUT=B:\adaptoid-state.txt"
+set "SHARE="
+if "%OUT%"=="" (
+    set "OUT=%TEMP%\adaptoid-state.txt"
+    if exist "Z:\" (
+        set "SHARE=Z:\adaptoid-state.txt"
+    ) else (
+        if exist "B:\" set "SHARE=B:\adaptoid-state.txt"
+    )
+)
 
 echo Adaptoid install state > "%OUT%"
 echo Collected %DATE% %TIME% >> "%OUT%"
@@ -89,6 +114,28 @@ echo ============================================================ >> "%OUT%"
 reg query "HKLM\SYSTEM\CurrentControlSet\Enum\USB" /s /f "06F7" /k >> "%OUT%" 2>&1
 echo. >> "%OUT%"
 
-echo Done. Read %OUT% from the host.
-type "%OUT%" | findstr /i "SERVICE_NAME STATE Service REG_SZ" 2>nul
+echo.
+echo ============================================================
+echo == THE TWO ANSWERS THAT MATTER
+echo ==   Service should read wishk300. HidUsb means our package
+echo ==   lost the ranking, or our driver refused to start.
+echo ==   Expect THREE HID children: Col01 Col02 Col03.
+echo ============================================================
+findstr /i /c:"SERVICE_NAME" /c:"STATE" "%OUT%"
+findstr /i /c:"    Service    REG_SZ" "%OUT%"
+findstr /i /c:"HID\VID_06F7" "%OUT%"
+echo.
+
+if defined SHARE (
+    copy /y "%OUT%" "%SHARE%" >nul 2>&1
+    if errorlevel 1 (
+        echo   Could not write %SHARE% - the share is read-only.
+        echo   Full report is at %OUT% on this machine.
+        echo   To fix: VM Settings, Shared Folders, clear Read-only.
+    ) else (
+        echo   Full report copied to %SHARE%
+    )
+) else (
+    echo   Full report at %OUT%
+)
 endlocal

@@ -2049,10 +2049,82 @@ PIRP AdaptoidDequeueRead(PADAPTOID_DEVEXT DevExt)
 	}
 }
 
-/* Park a read, with the cancel handshake. */
+/*
+ * Unlink a parked read if it is still on the list. Returns whether it was.
+ * The caller holds ReportLock.
+ */
+static int AdaptoidUnlinkRead(PADAPTOID_DEVEXT DevExt, PIRP Irp)
+{
+	PLIST_ENTRY entry = ADAPTOID_IRP_LIST_ENTRY(Irp);
+	PLIST_ENTRY scan;
+
+	for (scan = DevExt->PendingReads.Flink;
+	     scan != &DevExt->PendingReads;
+	     scan = scan->Flink) {
+		if (scan == entry) {
+			entry->Blink->Flink = entry->Flink;
+			entry->Flink->Blink = entry->Blink;
+			DevExt->PendingReadCount--;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The cancel routine for a parked read.
+ *
+ * WITHOUT THIS THE DRIVER CANNOT BE REMOVED. hidclass keeps a handful of
+ * IOCTL_HID_READ_REPORT requests parked here permanently - its "ping pong"
+ * IRPs - and on removal it cancels them and WAITS for them all to come
+ * back, inside HIDCLASS!CancelAllPingPongIrps. With no cancel routine the
+ * I/O manager has nothing to call, the requests are never completed, and
+ * that wait never ends: PnP stalls holding the device node, the control
+ * device's reference never drops, the driver stays resident and pnputil
+ * blocks behind it. Every one of those is a symptom of this one omission.
+ */
+static void NTAPI AdaptoidCancelReadIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PADAPTOID_DEVEXT DevExt = AdaptoidDevExtOf(DeviceObject);
+	KIRQL            irql;
+	int              ours;
+
+	IoReleaseCancelSpinLock(Irp->CancelIrql);
+
+	KeAcquireSpinLock(&DevExt->ReportLock, &irql);
+	ours = AdaptoidUnlinkRead(DevExt, Irp);
+	KeReleaseSpinLock(&DevExt->ReportLock, irql);
+
+	/*
+	 * If it was already off the list a dequeue took it, and that side
+	 * owns completing it - the same handshake AdaptoidClaimIrp is the
+	 * other half of.
+	 */
+	if (ours) {
+		AdaptoidCompleteIrp(Irp, STATUS_CANCELLED, 0);
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
+	}
+}
+
+/*
+ * Park a read, with the cancel handshake.
+ *
+ * MARKED PENDING BEFORE THE CANCEL ROUTINE GOES ON, because from the moment
+ * it does another thread may complete this request.
+ *
+ * THE CANCEL ROUTINE IS ALSO WHAT MAKES DELIVERY WORK, which is not
+ * obvious. AdaptoidClaimIrp decides ownership by exchanging the cancel
+ * routine for null and testing what was there; with no routine ever
+ * installed it reads null, every claim fails, and AdaptoidDequeueRead
+ * concludes that cancellation owns each request and drops it. The queue
+ * then never yields a request, no report is ever delivered, and every
+ * parked read leaks. Installing the routine is what gives the claim
+ * something to win.
+ */
 void AdaptoidQueueRead(PADAPTOID_DEVEXT DevExt, PIRP Irp)
 {
 	KIRQL irql;
+	int   cancelled = 0;
 	PLIST_ENTRY entry = ADAPTOID_IRP_LIST_ENTRY(Irp);
 
 	KeAcquireSpinLock(&DevExt->ReportLock, &irql);
@@ -2061,16 +2133,44 @@ void AdaptoidQueueRead(PADAPTOID_DEVEXT DevExt, PIRP Irp)
 	DevExt->PendingReads.Blink->Flink = entry;
 	DevExt->PendingReads.Blink = entry;
 	DevExt->PendingReadCount++;
+
+	IoMarkIrpPending(Irp);
+	IoSetCancelRoutine(Irp, (PVOID)AdaptoidCancelReadIrp);
+
+	/*
+	 * ALREADY CANCELLED IS A REAL CASE, not a theoretical one: IoCancelIrp
+	 * can have run before the routine was installed, and the I/O manager
+	 * does not call it retrospectively. Take the routine back off; if it
+	 * was still there this side owns the completion.
+	 */
+	if (Irp->Cancel && AdaptoidClaimIrp(Irp)) {
+		cancelled = AdaptoidUnlinkRead(DevExt, Irp);
+	}
 	KeReleaseSpinLock(&DevExt->ReportLock, irql);
+
+	if (cancelled) {
+		AdaptoidCompleteIrp(Irp, STATUS_CANCELLED, 0);
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
+	}
 }
 
-/* Fail every parked read. The device going away does this. */
+/*
+ * Fail every parked read. The device going away does this.
+ *
+ * THE REMOVE LOCK IS RELEASED PER REQUEST, because AdaptoidReadReport takes
+ * one before parking and every other path that completes a parked read -
+ * AdaptoidReportSink, the cancel routine - drops it on the way out.
+ * Completing these without dropping it leaves RemoveLockB permanently above
+ * zero, and AdaptoidLockReleaseAndWait then waits for an event that can
+ * never be signalled, hanging the very removal that called this.
+ */
 void AdaptoidCancelPendingReads(PADAPTOID_DEVEXT DevExt)
 {
 	PIRP irp;
 
 	while ((irp = AdaptoidDequeueRead(DevExt)) != NULL) {
 		AdaptoidCompleteIrp(irp, STATUS_DELETE_PENDING, 0);
+		AdaptoidLockRelease(&DevExt->RemoveLockB);
 	}
 }
 

@@ -6358,6 +6358,17 @@ NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
 /* the input path: polling, the report queue, pending reads            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The requests the input tests park and complete.
+ *
+ * FILE SCOPE SO THE FIXTURE CAN ZERO THEM. As a local array they were
+ * uninitialised stack, so Cancel and CancelRoutine carried whatever the
+ * previous group left behind. A real IRP arrives zeroed from
+ * IoAllocateIrp, and code that reads Irp->Cancel - which any cancel-safe
+ * queue must - is entitled to assume that.
+ */
+static IRP g_reads[4];
+
 static void input_reset(PADAPTOID_DEVEXT dx)
 {
 	int i;
@@ -6365,6 +6376,9 @@ static void input_reset(PADAPTOID_DEVEXT dx)
 
 	for (i = 0; i < (int)sizeof(*dx); i++) {
 		p[i] = 0;
+	}
+	for (i = 0; i < (int)sizeof(g_reads); i++) {
+		((u8 *)g_reads)[i] = 0;
 	}
 	core_init(&dx->Core, AdaptoidReportSink, dx);
 	AdaptoidDevExtInit(dx);
@@ -6389,7 +6403,7 @@ static int test_input_path(void)
 	int bad    = 0;
 	int groups = 0;
 	static ADAPTOID_DEVEXT dx;
-	IRP reads[4];
+	PIRP reads = g_reads;
 	int i;
 
 	/* ---- 1. starting polling submits both slots -------------------- */
@@ -6742,6 +6756,129 @@ static int test_input_path(void)
 		             0, &bad);
 		sched_expect(dx.PendingReadCount == 1, "the reader is still parked",
 		             dx.PendingReadCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 14. a parked read is cancellable -------------------------
+	 *
+	 * THE BUG THIS EXISTS FOR. AdaptoidQueueRead once parked the request
+	 * without installing a cancel routine. Three things broke at once and
+	 * none of them looked like a missing cancel routine:
+	 *
+	 *   - IoCancelIrp had nothing to call, so hidclass's ping-pong reads
+	 *     were never returned. HIDCLASS!CancelAllPingPongIrps waits for
+	 *     them on removal, so PnP stalled and the driver could not be
+	 *     unloaded at all.
+	 *   - AdaptoidClaimIrp decides ownership by exchanging the cancel
+	 *     routine for null and testing what was there. With none ever
+	 *     installed every claim failed, AdaptoidDequeueRead treated each
+	 *     request as already cancelled and dropped it, and NO REPORT WAS
+	 *     EVER DELIVERED.
+	 *   - Every parked request leaked.
+	 *
+	 * Checking that the routine is installed is the cheap half; the rest
+	 * drives it the way the I/O manager would.
+	 */
+	{
+		typedef void (NTAPI *CANCEL_FN)(PDEVICE_OBJECT, PIRP);
+		CANCEL_FN cancel;
+		DEVICE_OBJECT devobj;
+
+		input_reset(&dx);
+		g_pnp_devext = &dx;
+		memset(&devobj, 0, sizeof(devobj));
+
+		sched_expect(AdaptoidReadReport(&dx, &reads[0]) == STATUS_PENDING,
+		             "a read with nothing queued parks", 1, 1, &bad);
+		sched_expect(reads[0].PendingReturned != 0,
+		             "marked pending", 1, 1, &bad);
+		sched_expect(reads[0].CancelRoutine != NULL,
+		             "with a cancel routine",
+		             reads[0].CancelRoutine != NULL, 1, &bad);
+
+		/*
+		 * The I/O manager sets Cancel, then calls the routine. GUARDED,
+		 * because without one this would be a call through null and the
+		 * whole harness would die on the very failure it is reporting.
+		 */
+		cancel = (CANCEL_FN)reads[0].CancelRoutine;
+		reads[0].Cancel = TRUE;
+		g_irp_count = 0;
+		if (cancel != NULL) {
+			cancel(&devobj, &reads[0]);
+		}
+
+		sched_expect(g_irp_count == 1, "cancelling completes it",
+		             g_irp_count, 1, &bad);
+		sched_expect(reads[0].IoStatus.Status == STATUS_CANCELLED,
+		             "as cancelled", 1,
+		             reads[0].IoStatus.Status == STATUS_CANCELLED, &bad);
+		sched_expect(dx.PendingReadCount == 0, "and off the list",
+		             dx.PendingReadCount, 0, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "having dropped the remove lock",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 15. cancelled before the routine was installed ------------
+	 *
+	 * IoCancelIrp can win the race, and the I/O manager does NOT call a
+	 * routine installed afterwards. The queue has to notice Cancel is
+	 * already set and complete the request itself, or it parks something
+	 * nothing will ever come back for.
+	 */
+	{
+		input_reset(&dx);
+		g_pnp_devext = &dx;
+		g_irp_count  = 0;
+		reads[0].Cancel = TRUE;
+
+		AdaptoidReadReport(&dx, &reads[0]);
+
+		sched_expect(g_irp_count == 1,
+		             "an already-cancelled read is completed at once",
+		             g_irp_count, 1, &bad);
+		sched_expect(dx.PendingReadCount == 0, "and never stays parked",
+		             dx.PendingReadCount, 0, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "with the remove lock dropped",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		groups++;
+	}
+
+	/* ---- 16. removal fails every parked read and drops its lock ---- */
+	{
+		int i;
+
+		input_reset(&dx);
+		g_pnp_devext = &dx;
+		g_irp_count  = 0;
+
+		for (i = 0; i < 3; i++) {
+			AdaptoidReadReport(&dx, &reads[i]);
+		}
+		sched_expect(dx.PendingReadCount == 3, "three parked",
+		             dx.PendingReadCount, 3, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 4,
+		             "each holding the remove lock",
+		             dx.RemoveLockB.IoCount, 4, &bad);
+
+		AdaptoidCancelPendingReads(&dx);
+
+		sched_expect(g_irp_count == 3, "removal completes all three",
+		             g_irp_count, 3, &bad);
+		sched_expect(dx.PendingReadCount == 0, "the list is empty",
+		             dx.PendingReadCount, 0, &bad);
+		/*
+		 * BACK TO THE INITIAL REFERENCE. Completing without dropping
+		 * these left the count above zero for good, and
+		 * AdaptoidLockReleaseAndWait then waits on an event nothing can
+		 * signal - hanging the removal that asked for the cancel.
+		 */
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "and every remove lock is dropped",
+		             dx.RemoveLockB.IoCount, 1, &bad);
 		groups++;
 	}
 
