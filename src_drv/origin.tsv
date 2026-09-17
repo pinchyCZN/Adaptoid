@@ -90,6 +90,7 @@ ExReleaseFastMutex	harness.c	new	-	-	-
 HidRegisterMinidriver	harness.c	new	-	-	-
 InterlockedDecrement	harness.c	new	-	-	-
 InterlockedExchange	harness.c	new	-	-	-
+InterlockedExchangePointer	harness.c	new	-	-	-
 InterlockedIncrement	harness.c	new	-	-	-
 IoAcquireCancelSpinLock	harness.c	new	-	-	-
 IoCompleteRequest	harness.c	new	-	-	-
@@ -106,9 +107,11 @@ IofCallDriver	harness.c	new	-	-	-
 KeCancelTimer	harness.c	new	-	-	-
 KeInitializeDpc	harness.c	new	-	-	-
 KeInitializeEvent	harness.c	new	-	-	-
+KeInitializeMutex	harness.c	new	-	-	-
 KeInitializeSpinLock	harness.c	new	-	-	-
 KeInitializeTimer	harness.c	new	-	-	-
 KeQueryInterruptTime	harness.c	new	-	-	-
+KeReleaseMutex	harness.c	new	-	-	-
 KeSetEvent	harness.c	new	-	-	-
 KeSetTimer	harness.c	new	-	-	-
 KeWaitForSingleObject	harness.c	new	-	-	-
@@ -143,6 +146,8 @@ harness_claim	harness.c	new	-	-	-
 harness_pump	harness.c	new	-	-	-
 harness_sink	harness.c	new	-	-	-
 harness_vendor	harness.c	new	-	-	-
+harness_vendor_claim	harness.c	new	-	-	-
+harness_vendor_strict	harness.c	new	-	-	-
 hid_keys_match	harness.c	new	-	-	-
 hid_parse	harness.c	new	-	-	-
 hid_sink	harness.c	new	-	-	-
@@ -317,6 +322,7 @@ AdaptoidBuildLocationName	wdm.c	port	wishk201.sys	00011f5e	drv_BuildDeviceLocati
 AdaptoidCancelIrp	wdm.c	new	-	-	-
 AdaptoidCancelNotifications	wdm.c	port	wishk201.sys	00015ce0	drv_CancelNotificationIrps
 AdaptoidCancelPendingReads	wdm.c	port	wishk201.sys	00014d90	drv_CancelPendingReads
+AdaptoidCancelReadIrp	wdm.c	port	wishk201.sys	00014f28	drv_CancelReadReportIrp
 AdaptoidCancelVendorRequest	wdm.c	port	wishk201.sys	000199c0	drv_CancelVendorRequest
 AdaptoidChannelClose	wdm.c	port	wishk201.sys	000126f0	drv_HidChannelClose
 AdaptoidChannelCreate	wdm.c	port	wishk201.sys	00012690	drv_HidChannelCreate
@@ -356,6 +362,7 @@ AdaptoidFreeDeviceResources	wdm.c	port	wishk201.sys	00016820	drv_FreeDeviceResou
 AdaptoidFreePollIrp	wdm.c	part	wishk201.sys	00016b00	drv_PollStop
 AdaptoidFreeWorkItem	wdm.c	new	-	-	-
 AdaptoidIdlePowerComplete	wdm.c	port	wishk201.sys	000172e0	drv_RequestPowerComplete
+AdaptoidInitPoolType	wdm.c	new	-	-	-
 AdaptoidInputHook	wdm.c	part	wishk201.sys	00017550	drv_ScriptDispatchInput
 AdaptoidIntDeviceControl	wdm.c	port	wishk201.sys	000128d2	drv_DispatchInternalDeviceControl
 AdaptoidIoctlEnable	wdm.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand
@@ -413,6 +420,7 @@ AdaptoidStartDevice	wdm.c	port	wishk201.sys	00016550	drv_StartDevice
 AdaptoidSystemPowerComplete	wdm.c	port	wishk201.sys	00017157	drv_SystemPowerRequestComplete
 AdaptoidTickHook	wdm.c	part	wishk201.sys	00017980	drv_ScriptScheduler
 AdaptoidUnconfigureDevice	wdm.c	port	wishk201.sys	000167c0	drv_UnconfigureDevice
+AdaptoidUnlinkRead	wdm.c	part	wishk201.sys	00014f28	drv_CancelReadReportIrp
 AdaptoidUnload	wdm.c	port	wishk201.sys	000117e0	drv_Unload
 AdaptoidUnwireDevice	wdm.c	part	wishk201.sys	0001236e	drv_AddDevice
 AdaptoidUpdateIdlePower	wdm.c	port	wishk201.sys	000171c0	drv_UpdateIdlePowerState

@@ -847,8 +847,25 @@ NTSTATUS AdaptoidCompleteRead(PADAPTOID_DEVEXT DevExt, PIRP Irp,
 	} else {
 		n = 0;
 	}
+	/*
+	 * THE REMOVE LOCK IS THE CALLER'S TO DROP, NOT THIS ROUTINE'S, because
+	 * only the caller knows whether there is one to drop. A read that was
+	 * parked carries a RemoveLockB reference taken by AdaptoidReadReport;
+	 * a read answered immediately from the report queue never took one.
+	 * Both come through here.
+	 *
+	 * Releasing here served the first and corrupted the second, and the
+	 * error is silent and cumulative rather than a crash: measured on the
+	 * live driver as RemoveLockB.IoCount at -1103 with the device running
+	 * normally. AdaptoidLockReleaseAndWait then reads a count that passed
+	 * zero long ago, so removal stops waiting for reads that are still in
+	 * flight.
+	 *
+	 * Every caller that completes a parked read drops the reference
+	 * itself - AdaptoidReportSink, AdaptoidCancelPendingReads and the
+	 * cancel routine all do.
+	 */
 	AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, n);
-	AdaptoidLockRelease(&DevExt->RemoveLockB);
 	return STATUS_SUCCESS;
 }
 
@@ -1954,10 +1971,73 @@ NTSTATUS NTAPI AdaptoidChannelClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 { UNREFERENCED_PARAMETER(DeviceObject);
   return AdaptoidCompleteIrp(Irp, STATUS_SUCCESS, 0), STATUS_SUCCESS; }
 
+/*
+ * IRP_MJ_DEVICE_CONTROL on the private per-device channel - the 'q' route,
+ * drv_IoctlViaHidHandle in the original.
+ *
+ * THE SECOND WAY INTO THE PER-DEVICE SURFACE, and the one the configurator
+ * uses to download a compiled script. Both private paths converge on
+ * core_ioctl_dispatch and differ only in how the adapter is named: a
+ * control-device request carries a four-byte handle at the front of the
+ * input buffer and strips it, while here the adapter is implied by the file
+ * object the request arrived on. SO THE BUFFER IS FORWARDED UNCHANGED -
+ * stripping four bytes on this path would corrupt every request on it.
+ *
+ * The device is taken from the device object rather than from a registry
+ * lookup, but the gate is the one the forwarded path applies: a row that is
+ * not live is refused.
+ *
+ * BRACKETED BY RemoveLockA because several of these codes reach the
+ * hardware synchronously - the Pak block transfers and the raw vendor
+ * passthrough - and the device must not finish removing underneath one.
+ */
 NTSTATUS NTAPI AdaptoidChannelIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{ UNREFERENCED_PARAMETER(DeviceObject);
-  return AdaptoidCompleteIrp(Irp, STATUS_NOT_SUPPORTED, 0),
-	     STATUS_NOT_SUPPORTED; }
+{
+	PADAPTOID_DEVEXT   dx = AdaptoidDevExtOf(DeviceObject);
+	PIO_STACK_LOCATION sl = IoGetCurrentIrpStackLocation(Irp);
+	core_device_entry *d;
+	core_ioctl         req;
+	core_ioctl_env     env;
+	NTSTATUS           status;
+	u32                info = 0;
+	u32                st;
+
+	if (dx == NULL) {
+		AdaptoidCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+		return STATUS_DELETE_PENDING;
+	}
+
+	d = &dx->Registration;
+	if (d->live == 0 || d->cs == NULL) {
+		AdaptoidCompleteIrp(Irp, STATUS_NO_SUCH_DEVICE, 0);
+		return STATUS_NO_SUCH_DEVICE;
+	}
+
+	status = AdaptoidLockAcquire(&dx->RemoveLockA);
+	if (!NT_SUCCESS(status)) {
+		AdaptoidCompleteIrp(Irp, status, 0);
+		return status;
+	}
+
+	req.code    = sl->Parameters.DeviceIoControl.IoControlCode;
+	req.in      = (const u8 *)ADAPTOID_IRP_BUFFER(Irp);
+	req.in_len  = sl->Parameters.DeviceIoControl.InputBufferLength;
+	req.out     = (u8 *)ADAPTOID_IRP_BUFFER(Irp);
+	req.out_len = sl->Parameters.DeviceIoControl.OutputBufferLength;
+
+	env.cs         = d->cs;
+	env.sched      = d->sched;
+	env.vendor     = d->vendor;
+	env.vendor_ctx = d->os_ctx;
+	env.enable     = d->enable;
+	env.enable_ctx = d->os_ctx;
+	env.now_100ns  = KeQueryInterruptTime();
+
+	st = core_ioctl_dispatch(&env, &req, &info);
+	AdaptoidLockRelease(&dx->RemoveLockA);
+	AdaptoidCompleteIrp(Irp, (NTSTATUS)st, info);
+	return (NTSTATUS)st;
+}
 
 #endif /* !ADAPTOID_USERMODE */
 

@@ -7122,6 +7122,91 @@ static int test_input_path(void)
 		groups++;
 	}
 
+	/* ---- 17. the remove lock balances on BOTH delivery paths -------
+	 *
+	 * THE TWO WAYS A READ IS ANSWERED TAKE DIFFERENT NUMBERS OF
+	 * REFERENCES, and that asymmetry is the reason this is worth its own
+	 * group. A read that parks takes one, and whichever side later
+	 * completes it drops that one. A read answered straight from the
+	 * report queue never takes one at all. What is checked here is that
+	 * AdaptoidReadReport and AdaptoidReportSink each account for their
+	 * own half of that correctly.
+	 *
+	 * THIS GROUP CANNOT SEE A MISCOUNT INSIDE AdaptoidCompleteRead, and
+	 * that limit is the point of this note rather than an aside. The
+	 * harness supplies its own AdaptoidCompleteRead a few hundred lines
+	 * up; wdm.c's is compiled only into the driver. The two disagreed -
+	 * the real one released RemoveLockB and the stub did not - and the
+	 * driver ran at RemoveLockB.IoCount = -1103 with every group here
+	 * passing, including this one. Restoring the bug in wdm.c does not
+	 * turn this group red, because none of wdm.c's version runs here.
+	 *
+	 * So do not read a pass here as cover for that routine. Closing the
+	 * gap means compiling the real AdaptoidCompleteRead into the harness
+	 * and deleting the stub, which needs the read fixtures to carry a
+	 * UserBuffer and an OutputBufferLength the way a real read does.
+	 */
+	{
+		u8 payload[3];
+
+		input_reset(&dx);
+		g_pnp_devext = &dx;
+		g_irp_count  = 0;
+
+		payload[0] = 0x11;
+		payload[1] = 0x22;
+		payload[2] = 0x33;
+
+		/* Nothing is parked, so this queues rather than completing. */
+		AdaptoidReportSink(&dx, 1, payload, 3);
+		sched_expect(dx.ReportCount == 1,
+		             "a report with no reader queues",
+		             dx.ReportCount, 1, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "and queueing takes no reference",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+
+		/* THE PATH THAT WAS WRONG: answered from the queue, never
+		 * parked, so it must neither take nor drop a reference. */
+		AdaptoidReadReport(&dx, &reads[0]);
+		sched_expect(g_irp_count == 1,
+		             "the next read is answered at once",
+		             g_irp_count, 1, &bad);
+		sched_expect(dx.PendingReadCount == 0, "without parking",
+		             dx.PendingReadCount, 0, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "leaving the remove lock where it found it",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+
+		/* And the parked path still balances: one taken, one dropped. */
+		AdaptoidReadReport(&dx, &reads[1]);
+		sched_expect(dx.PendingReadCount == 1,
+		             "a read with no report parks",
+		             dx.PendingReadCount, 1, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 2,
+		             "holding one reference",
+		             dx.RemoveLockB.IoCount, 2, &bad);
+
+		AdaptoidReportSink(&dx, 1, payload, 3);
+		sched_expect(g_irp_count == 2, "the sink completes it",
+		             g_irp_count, 2, &bad);
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "dropping exactly one reference",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+
+		/* Repetition is what made this visible on hardware: the error
+		 * is one reference per report, so it only looks like a leak
+		 * after thousands. */
+		for (i = 0; i < 64; i++) {
+			AdaptoidReportSink(&dx, 1, payload, 3);
+			AdaptoidReadReport(&dx, &reads[0]);
+		}
+		sched_expect(dx.RemoveLockB.IoCount == 1,
+		             "and 64 more deliveries do not move it",
+		             dx.RemoveLockB.IoCount, 1, &bad);
+		groups++;
+	}
+
 	hlog("Input path             : %s (%d groups)\n", bad ? "FAIL" : "ok",
 	     groups);
 	return bad;
