@@ -89,7 +89,8 @@ Table of Contents
    23. Defect 21: Hexadecimal Literals Compile To A Pointer
    24. Defect 22: An LF-Only Script Hangs The Configurator
    25. Defect 23: INT_MIN Divided By Minus One Bugchecks
-   26. What Is Not Affected
+   26. Defect 24: Unloading A Script Arms The Timer Instead Of Stopping It
+   27. What Is Not Affected
 
 1.  Severity Summary
 
@@ -1303,7 +1304,72 @@ Table of Contents
    the interpreter status table; without the guard they do not fail the
    harness, they KILL it, which is the behaviour being prevented.
 
-26. What Is Not Affected
+26. Defect 24: Unloading A Script Arms The Timer Instead Of Stopping It
+
+   Location:  drv_ScriptLoad's teardown and drv_ScriptThreadQueue
+              (00017860), the arm helper behind KeSetTimer.
+
+   Dropping a script is supposed to STOP the script timer. The scheduler
+   asks for that by arming for a wake time of zero - "never" - and the OS
+   layer is required to read zero as a cancel. Computing a due time from
+   it instead produces zero, and KeSetTimer reads a due time of zero as
+   FIRE IMMEDIATELY. So the path that tears a script down re-arms the
+   timer, on its way to freeing the very structures the timer's DPC runs
+   against.
+
+   IT IS NOT A RACE. It happens on every teardown that had a script
+   loaded. What varies is only whether the timer gets to fire before the
+   device and its driver image are gone.
+
+   A SECOND, NARROWER WINDOW SITS BEHIND IT. KeCancelTimer neither waits
+   for a DPC already queued nor for one already running, and the
+   scheduler DPC re-arms at the end of its own pass. So even a correct
+   cancel can be undone by a pass that was in flight when teardown began.
+
+   Trigger:  a script actively scheduling - a thread sleeping or runnable,
+   which any button handler produces - at the moment the device is
+   removed. Reached by holding a fault-generating script and unplugging
+   the adapter repeatedly; a single press and a single unplug does not do
+   it, because the scheduler has to be armed at that instant.
+
+   Effect:  BUGCHECK. The timer outlives the driver and the kernel calls
+   its DPC at an address in an image that is no longer mapped.
+
+   MEASURED ON THE REPLACEMENT, WHICH HAD THE IDENTICAL HOLE:
+
+       BugCheck D1, {fffff8003ce49df0, 2, 8, fffff8003ce49df0}
+       Arg2 = 2    IRQL, DISPATCH_LEVEL
+       Arg3 = 8    an EXECUTE fault, not a read or a write
+       FAILURE_BUCKET_ID: AV_VRF_CODE_AV_UNLOADED_IP_wishk300.sys
+
+       nt!KiRetireDpcList
+         nt!KiProcessExpiredTimerList
+           <Unloaded_wishk300.sys>+0x9df0
+
+   Unloaded modules listed wishk300.sys at fffff800`3ce40000, so the
+   faulting address is that image plus 0x9df0. An expired timer dispatched
+   a DPC into unmapped code.
+
+   THE ORIGINAL IS EXPOSED BY INSPECTION, NOT BY MEASUREMENT. It imports
+   KeSetTimer and KeCancelTimer and neither KeFlushQueuedDpcs nor
+   KeRemoveQueueDpc, so it has no way to wait for an in-flight DPC. The
+   crash above was produced on the replacement.
+
+   In the replacement:  FIXED, in two parts. The arm seam now honours the
+   contract - a wake time of zero cancels - and a ScriptDying flag shuts
+   the seam for good once teardown starts. Teardown then runs cancel,
+   KeFlushQueuedDpcs, cancel, and only afterwards core_sched_unload: the
+   flush returns once every queued and running DPC has finished, and the
+   second cancel catches a pass that read the flag just before it was set.
+
+   A TRAP FOR THE TEST, worth knowing before writing one. Asserting that
+   the timer's due time is zero after teardown PASSES WITH THE BUG
+   PRESENT, because the bug arms with a due time of zero and a due time
+   of zero is also what a stopped timer holds. The two are
+   indistinguishable by that field. What separates them is whether
+   KeSetTimer was called at all, so the harness counts arms instead.
+
+27. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original

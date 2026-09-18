@@ -762,6 +762,12 @@ typedef struct _ADAPTOID_DEVEXT {
 	 */
 	KIRQL                ScriptLockIrql;
 	/*
+	 * Set once teardown has begun, and only ever set. AdaptoidScriptArm
+	 * refuses to arm while it is true, so a scheduler pass that is already
+	 * running cannot put the timer back after the cancel.
+	 */
+	BOOLEAN              ScriptDying;
+	/*
 	 * NOT A BOOLEAN, AND IT STARTS AT -1. The scheduler DPC increments it
 	 * only while it is non-negative and decrements only while it is
 	 * positive, so it stays latched at -1 until something else lifts it,

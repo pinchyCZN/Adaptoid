@@ -503,6 +503,7 @@ void    KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context);
 void    KeInitializeTimer(PKTIMER Timer);
 BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc);
 BOOLEAN KeCancelTimer(PKTIMER Timer);
+void    KeFlushQueuedDpcs(void);
 
 /* The control device object. */
 void     ExInitializeFastMutex(PFAST_MUTEX Mutex);

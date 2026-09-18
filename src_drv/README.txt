@@ -432,6 +432,17 @@ Table of Contents
    ioc_script_fault writes, so it is a deliberate change to the contract
    rather than a repair, and it has not been made.
 
+   IT ALSO CARRIES STALE STACK FROM OTHER THREADS. The dump is the node's
+   whole capacity, stack_size words, not the live saved_depth, and nodes
+   are recycled through the free list. Observed: a fault raised by a
+   handler that never recursed returned a dump containing forty frames of
+   a DIFFERENT handler's recursion - return address 0x146 with a counter
+   walking 0x27 down to 0 - left in the recycled node below the live
+   depth. Harmless within one script, since core_sched_unload drains the
+   free pool, but it is script data the faulting thread never wrote. The
+   explicit record above would end this too, by copying saved_depth words
+   rather than the capacity.
+
 6.3.  Seams That Are Wired Only In The Harness
 
    THESE COMPILE, PASS THEIR TESTS, AND DO NOTHING ON HARDWARE. Each is a

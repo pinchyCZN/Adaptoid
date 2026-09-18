@@ -6270,6 +6270,18 @@ BOOLEAN KeCancelTimer(PKTIMER Timer)
 	return was;
 }
 
+/*
+ * Nothing to flush: the harness has one thread and never queues a DPC to
+ * run later, so every "DPC" has already returned by the time anything
+ * could wait for it. Counted so a test can assert teardown called it.
+ */
+static int g_dpc_flushes;
+
+void KeFlushQueuedDpcs(void)
+{
+	g_dpc_flushes++;
+}
+
 /* The fast mutex guarding the control-device singleton. */
 static LONG g_mutex_depth;
 static LONG g_mutex_max;
@@ -10417,6 +10429,53 @@ static int test_wiring(void)
 	 * counts through the single device it drives. Put the tally back.
 	 */
 	g_reports_seen = seen_before;
+
+	/* ---- 9. teardown stops the timer instead of arming it ----------
+	 *
+	 * core_sched_unload arms for "never" by passing a wake time of ZERO,
+	 * and the OS layer has to read that as a cancel. Reading it as a due
+	 * time instead yields zero, which KeSetTimer takes as "fire at once" -
+	 * so tearing a script down ARMED the timer on the very path that then
+	 * frees what its DPC runs against. That reached a bugcheck D1 on the
+	 * live driver, executing in an image already unloaded.
+	 *
+	 * The harness has one thread, so it cannot show a DPC racing teardown.
+	 * What it can show is the half that was never a race at all: after
+	 * AdaptoidUnwireDevice the timer must be STOPPED, and the queued DPCs
+	 * must have been waited for before anything was freed.
+	 */
+	{
+		LARGE_INTEGER due;
+
+		int arms;
+
+		g_dpc_flushes = 0;
+		due.QuadPart  = -10000;
+		KeSetTimer(&dx->ScriptTimer, due, &dx->ScriptDpc);
+		sched_expect(dx->ScriptTimer.Due != 0, "the timer starts armed",
+		             dx->ScriptTimer.Due != 0, 1, &bad);
+
+		arms = g_timer_arms;
+		AdaptoidUnwireDevice(dx);
+
+		/*
+		 * COUNT THE ARMS, DO NOT LOOK AT Due. The bug armed the timer with
+		 * a due time of ZERO, and this stub stores whatever it is given -
+		 * so a Due of 0 reads identically whether the timer was stopped or
+		 * set to fire at once. Testing Due passes with the bug present.
+		 * Whether KeSetTimer was called at all is the difference.
+		 */
+		sched_expect(g_timer_arms == arms,
+		             "teardown stops the timer, never arms it",
+		             g_timer_arms - arms, 0, &bad);
+		sched_expect(g_dpc_flushes > 0,
+		             "and waited for queued DPCs first",
+		             g_dpc_flushes, 1, &bad);
+		sched_expect(dx->ScriptDying != 0,
+		             "with the arm seam shut behind it",
+		             dx->ScriptDying != 0, 1, &bad);
+		groups++;
+	}
 
 	hlog("Subsystem wiring       : %s (%d groups)\n", bad ? "FAIL" : "ok",
 	     groups);

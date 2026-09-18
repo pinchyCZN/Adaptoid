@@ -105,6 +105,7 @@ IoSetCompletionRoutine	harness.c	new	-	-	-
 IoSkipCurrentIrpStackLocation	harness.c	new	-	-	-
 IofCallDriver	harness.c	new	-	-	-
 KeCancelTimer	harness.c	new	-	-	-
+KeFlushQueuedDpcs	harness.c	new	-	-	-
 KeInitializeDpc	harness.c	new	-	-	-
 KeInitializeEvent	harness.c	new	-	-	-
 KeInitializeMutex	harness.c	new	-	-	-

@@ -352,6 +352,24 @@ void AdaptoidUnwireDevice(PADAPTOID_DEVEXT DevExt)
 		core_registry_remove(&cdo->Registry, &DevExt->Registration);
 	}
 
+	/*
+	 * STOP THE TIMER BEFORE FREEING WHAT ITS DPC READS, and in this order.
+	 * Cancelling alone is not enough: a DPC already running re-arms at the
+	 * end of its pass, and KeCancelTimer neither waits for a queued DPC nor
+	 * for one in progress.
+	 *
+	 *   ScriptDying   the arm seam refuses from here on
+	 *   cancel        drops anything already pending
+	 *   flush         returns only once every queued AND running DPC has
+	 *                 finished - PASSIVE_LEVEL only, which this path is
+	 *   cancel        catches the one pass that read the flag just before
+	 *                 it was set and armed just after the first cancel
+	 *
+	 * Only then is the scheduler torn down, because nothing can reach it.
+	 */
+	DevExt->ScriptDying = TRUE;
+	KeCancelTimer(&DevExt->ScriptTimer);
+	KeFlushQueuedDpcs();
 	KeCancelTimer(&DevExt->ScriptTimer);
 	core_sched_unload(&DevExt->Sched);
 
@@ -3380,10 +3398,32 @@ static void AdaptoidSchedLeave(void *ctx)
 
 static void AdaptoidScriptArm(void *ctx, u64 wake_time)
 {
-	PADAPTOID_DEVEXT dx  = (PADAPTOID_DEVEXT)ctx;
-	ULONGLONG        now = KeQueryInterruptTime();
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+	ULONGLONG        now;
 	LARGE_INTEGER    due;
 
+	/*
+	 * A WAKE TIME OF ZERO IS A CANCEL, NOT A WAKE AT ONCE. That is the
+	 * scheduler's contract: core_sched_unload arms for "never" when it
+	 * drops a script. Computing a due time from it instead yields zero,
+	 * which KeSetTimer reads as "fire immediately" - so unloading a script
+	 * ARMED the timer rather than stopping it, on the very path that then
+	 * frees what the timer's DPC runs against.
+	 *
+	 * Measured before this check existed: bugcheck D1 at IRQL 2, an
+	 * EXECUTE fault at wishk300+0x9df0 with the image already in the
+	 * unloaded list, reached through KiProcessExpiredTimerList - the timer
+	 * outliving the driver and calling into freed code.
+	 *
+	 * ScriptDying is the other half. A scheduler pass already running when
+	 * teardown starts would otherwise re-arm behind the cancel.
+	 */
+	if (wake_time == 0 || dx->ScriptDying) {
+		KeCancelTimer(&dx->ScriptTimer);
+		return;
+	}
+
+	now = KeQueryInterruptTime();
 	due.QuadPart = (wake_time > now) ? -(LONGLONG)(wake_time - now) : 0;
 	KeSetTimer(&dx->ScriptTimer, due, &dx->ScriptDpc);
 }
