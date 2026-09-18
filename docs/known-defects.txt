@@ -85,7 +85,8 @@ Table of Contents
    20. Defect 18: A Busy Vendor Slot Drops An SDK Command Silently
    21. Defect 19: A Notification Wait Returns A Status It Has Forfeited
    22. Defect 20: The Control Device's Power IRP Stalls The Power Queue
-   23. What Is Not Affected
+   23. Defect 21: Hexadecimal Literals Compile To A Pointer
+   24. What Is Not Affected
 
 1.  Severity Summary
 
@@ -139,6 +140,10 @@ Table of Contents
                                                    dispatch window
        control device power IRP   control device   no, nothing sends
        omits PoStartNextPowerIrp                   one
+       hexadecimal literals       wishd201.exe     yes, every hex
+       compile to a pointer       compiler         literal, but no
+                                                   shipped script uses
+                                                   one
 
 2.  Defect 1: Button Map Filler Entries
 
@@ -1049,13 +1054,69 @@ Table of Contents
    divergence noted inline.
 
 
-23. What Is Not Affected
+23. Defect 21: Hexadecimal Literals Compile To A Pointer
+
+   Location:  wishd201.exe, the constant action behind scanner rule 20.
+              The scanner recognises 0x and 0X; nothing converts the
+              text to a value.
+
+   A hexadecimal constant in script source does not reach the bytecode as
+   its value. What is emitted is a POINTER - an address inside the
+   configurator's own heap, in the 0x01700000 to 0x02200000 band - and
+   the interpreter then computes with that address.
+
+   MEASURED ON BOTH DRIVERS, from the same source through the same
+   compiler. A script asking for the population count of four different
+   constants, all four of which became one word:
+
+       source literal   emitted
+       0x7EADBEEF       0x02143490
+       0xDEADBEEF       0x02143490
+       0x7FFFFFFF       0x02143490
+       0x80000000       0x02143490
+
+   So all four answers were identical and all four were wrong. None of
+   the source literals appears anywhere in the compiled program: a search
+   of the whole code array finds zero occurrences of any of them.
+
+   THE VALUE DEPENDS ON THE CALL SITE, NOT THE LITERAL, which is what
+   identifies it as a pointer rather than arithmetic gone wrong. Four
+   different literals in one expression context share one address, while
+   the same literal used elsewhere gets a different one. Running the
+   identical source on a second machine produces a different address
+   again - 0x01745BD0 where the first gave 0x02143C00 - because a heap
+   address is all it ever was.
+
+   Trigger:  any hexadecimal literal. SIZE IS IRRELEVANT: 0x0000BEEF,
+   which is 48879 and fits anywhere, fails exactly as 0xDEADBEEF does.
+   Decimal literals are unaffected and compile correctly.
+
+   Effect:  silent wrong answers. Nothing faults, nothing is logged, and
+   the interpreter behaves correctly on the word it was handed, so every
+   diagnostic points away from the cause.
+
+   Would it be noticed:  NO, AND IT NEVER WAS. Not one script shipped
+   with the product contains a hexadecimal literal, so the path was never
+   taken. It was found by writing a test script that used one.
+
+   In the replacement:  NOT APPLICABLE, because the compiler is not being
+   replaced here. It matters to anything that replaces the configurator:
+   such a program must actually convert hex constants, and any script
+   carried across that uses one was never doing what it said. The driver
+   side needs no change, and that is established rather than assumed -
+   the bytecode in the device holds the wrong word before the driver ever
+   sees it, and the harness computes the correct answer for every value
+   it is given, including the ones the compiler substituted.
+
+24. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
    software depends on them:
 
-   -  The script compiler in wishd201.exe and the bytecode it emits.
+   -  The bytecode the compiler emits FOR DECIMAL CONSTANTS. Hexadecimal
+      constants are defect 21, section 23, and are wrong everywhere they
+      appear.
    -  The bytecode interpreter drv_ScriptExecute and its
       100000-instruction budget. Its per-instruction PC check is sound;
       the one slip in its bounds checking is defect 6, section 8, and

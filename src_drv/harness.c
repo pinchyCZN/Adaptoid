@@ -1973,6 +1973,73 @@ static int test_script(void)
 		}
 	}
 
+	/* ---- a real loop over every bit, not a single operation --------
+	 *
+	 * WHY THIS IS NOT COVERED BY THE TABLE ABOVE. Those programs test
+	 * one operator each with the stack empty either side. This one runs
+	 * a thirty-two iteration loop that keeps a running total in a
+	 * global, indexes a second global as the loop counter, and nests a
+	 * shift and a mask INSIDE an addition - so the operand stack is two
+	 * deep across a binary operation, which no single-operator program
+	 * reaches.
+	 *
+	 * It exists because a script computing popcount(0x02164350) on the
+	 * live driver printed 8 where the answer is 9. The constant it was
+	 * given had already been mangled by the configurator's compiler -
+	 * that part is established, the bytecode in the device holds
+	 * 0x02164350 and not the 0xDEADBEEF the source asked for - but the
+	 * count being wrong FOR THAT VALUE is a separate question, and this
+	 * is the only way to ask it without a VM.
+	 *
+	 * The program is the same shape the compiler emits: c = 0; i = 0;
+	 * while (i < 32) { c = c + ((V >> i) & 1); i = i + 1; }
+	 */
+	{
+		core_script vm;
+		u32 vars[SCRIPT_VARS + CORE_SCRIPT_LOCALS];
+		int j;
+
+		static const u32 POP[] = {
+			0x110u, 0x000u, 0x093u, 0x110u, 0x20000000u, 0x230u,
+			0x110u, 0x000u, 0x093u, 0x110u, 0x20000001u, 0x230u,
+			0x110u, 0x20000001u, 0x020u, 0x093u, 0x110u, 0x020u,
+			0x263u, 0x172u, 0x022u, 0x110u, 0x20000000u, 0x020u,
+			0x093u, 0x110u, 0x20000002u, 0x020u, 0x093u, 0x110u,
+			0x20000001u, 0x020u, 0x251u, 0x093u, 0x110u, 0x001u,
+			0x257u, 0x252u, 0x093u, 0x110u, 0x20000000u, 0x230u,
+			0x110u, 0x20000001u, 0x020u, 0x093u, 0x110u, 0x001u,
+			0x252u, 0x093u, 0x110u, 0x20000001u, 0x230u, 0x170u,
+			0xFFFFFFD5u, 0x082u
+		};
+		static const struct { u32 v; int want; } BITS[] = {
+			{0x00000000u,  0}, {0x00000001u,  1}, {0x80000000u,  1},
+			{0xFFFFFFFFu, 32}, {0x02164350u,  9}, {0xDEADBEEFu, 24},
+			{0x0000FFFFu, 16}, {0x55555555u, 16}
+		};
+
+		for (j = 0; j < (int)(sizeof(BITS) / sizeof(BITS[0])); j++) {
+			int st;
+
+			core_script_init(&vm, POP, (s32)(sizeof(POP) / 4), vars,
+			                 SCRIPT_VARS);
+			vm.vars[2] = BITS[j].v;      /* the value under test */
+			st = core_script_run(&vm);
+
+			if (st != CORE_SCRIPT_TERMINATED) {
+				hlog("  FAIL script popcount 0x%08lX: status %d\n",
+				     (unsigned long)BITS[j].v, st);
+				bad++;
+			} else if ((int)vm.vars[0] != BITS[j].want) {
+				hlog("  FAIL script popcount 0x%08lX: got %d, want %d\n",
+				     (unsigned long)BITS[j].v, (int)vm.vars[0],
+				     BITS[j].want);
+				bad++;
+			}
+			htrace("script popcount 0x%08lX -> %d\n",
+			       (unsigned long)BITS[j].v, (int)vm.vars[0]);
+		}
+	}
+
 	hlog("Script interpreter     : %s (%d programs)\n", bad ? "FAIL" : "ok",
 	     (int)(sizeof(PROGS) / sizeof(PROGS[0])) + 12);
 	return bad;
