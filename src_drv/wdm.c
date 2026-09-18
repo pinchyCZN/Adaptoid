@@ -265,6 +265,7 @@ NTSTATUS NTAPI AdaptoidAddDevice(PDRIVER_OBJECT DriverObject,
 	/* Nothing may poll until PnP says start. */
 	devext->PollStopMask = ADAPTOID_STOP_REASON_PNP;
 
+	KeInitializeSpinLock(&devext->ScriptLock);
 	KeInitializeDpc(&devext->ScriptDpc, AdaptoidScriptDpc, devext);
 	KeInitializeTimer(&devext->ScriptTimer);
 	/* Latched negative: a script cannot own the stick until something
@@ -3353,6 +3354,30 @@ static void AdaptoidScriptEvent(void *ctx, u32 type, u32 arg1, u32 arg2)
  * now" as against "at this absolute time". A wake already past arms for the
  * next instant rather than for a time in the past.
  */
+/*
+ * Serialise the scheduler's post-mortem slot against the client draining it.
+ *
+ * ScriptLock already exists for the depth counter and is reused rather than
+ * multiplied: the two uses never nest, because the DPC releases it before
+ * calling core_sched_run. A SPIN LOCK IS THE RIGHT KIND - the scheduler
+ * fills the slot from a DPC at DISPATCH_LEVEL, so nothing that waits can be
+ * used, and KeAcquireSpinLock is legal from both there and the PASSIVE_LEVEL
+ * IOCTL that empties it.
+ */
+static void AdaptoidSchedEnter(void *ctx)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+
+	KeAcquireSpinLock(&dx->ScriptLock, &dx->ScriptLockIrql);
+}
+
+static void AdaptoidSchedLeave(void *ctx)
+{
+	PADAPTOID_DEVEXT dx = (PADAPTOID_DEVEXT)ctx;
+
+	KeReleaseSpinLock(&dx->ScriptLock, dx->ScriptLockIrql);
+}
+
 static void AdaptoidScriptArm(void *ctx, u64 wake_time)
 {
 	PADAPTOID_DEVEXT dx  = (PADAPTOID_DEVEXT)ctx;
@@ -3477,6 +3502,8 @@ void AdaptoidWireDevice(PADAPTOID_DEVEXT DevExt)
 	                DevExt);
 	core_sched_set_core(&DevExt->Sched, &DevExt->Core);
 	core_sched_set_arm(&DevExt->Sched, AdaptoidScriptArm, DevExt);
+	core_sched_set_lock(&DevExt->Sched, AdaptoidSchedEnter,
+	                    AdaptoidSchedLeave, DevExt);
 	core_sched_set_event_sink(&DevExt->Sched, AdaptoidScriptEvent, DevExt);
 
 	/* This adapter's row in the driver-wide registry. */

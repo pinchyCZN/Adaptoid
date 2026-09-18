@@ -50,6 +50,25 @@ static void *sched_alloc(core_sched *s, u32 bytes)
 	return s->alloc(s->mem_ctx, bytes);
 }
 
+/*
+ * Take and release the post-mortem slot's lock. Null when the owner is
+ * single-threaded, which is why every caller goes through these rather than
+ * testing the pointers itself.
+ */
+static void sched_enter(core_sched *s)
+{
+	if (s->enter != 0) {
+		s->enter(s->lock_ctx);
+	}
+}
+
+static void sched_leave(core_sched *s)
+{
+	if (s->leave != 0) {
+		s->leave(s->lock_ctx);
+	}
+}
+
 static void sched_free(core_sched *s, void *block)
 {
 	if (block != 0 && s->release != 0) {
@@ -157,6 +176,9 @@ void core_sched_init(core_sched *s, core_sched_alloc_fn alloc,
 	s->arm_ctx   = 0;
 	s->emit      = 0;
 	s->emit_ctx  = 0;
+	s->enter     = 0;
+	s->leave     = 0;
+	s->lock_ctx  = 0;
 
 	/* The builtin library is on by default; a caller that wants something
 	 * else installs it with core_sched_set_native. */
@@ -175,6 +197,16 @@ void core_sched_set_arm(core_sched *s, core_sched_arm_fn fn, void *ctx)
 	if (s != 0) {
 		s->arm     = fn;
 		s->arm_ctx = ctx;
+	}
+}
+
+void core_sched_set_lock(core_sched *s, core_sched_lock_fn enter,
+                         core_sched_lock_fn leave, void *ctx)
+{
+	if (s != 0) {
+		s->enter    = enter;
+		s->leave    = leave;
+		s->lock_ctx = ctx;
 	}
 }
 
@@ -288,8 +320,45 @@ static void free_list(core_sched *s, core_sched_thread *head)
 	}
 }
 
+/*
+ * Empty the post-mortem slot and hand both blocks to the caller.
+ *
+ * THE ONLY SANCTIONED WAY FOR A CLIENT TO TAKE THE SLOT. Reading the two
+ * pointers and clearing them by hand is four ordinary statements, and a
+ * fault landing in the middle of them frees what the reader has already
+ * latched - so the exchange is atomic against the scheduler here, once,
+ * rather than correct at each call site by inspection.
+ *
+ * Both blocks belong to the caller on return and are released by it,
+ * outside the lock: nothing else can reach them once the slot is empty.
+ */
+void core_sched_fault_take(core_sched *s, core_sched_thread **thread,
+                           u32 **vars)
+{
+	core_sched_thread *t = 0;
+	u32               *v = 0;
+
+	if (s != 0) {
+		sched_enter(s);
+		t = s->fault_thread;
+		v = s->fault_vars;
+		s->fault_thread = 0;
+		s->fault_vars   = 0;
+		sched_leave(s);
+	}
+	if (thread != 0) {
+		*thread = t;
+	}
+	if (vars != 0) {
+		*vars = v;
+	}
+}
+
 void core_sched_unload(core_sched *s)
 {
+	core_sched_thread *dead_thread;
+	u32               *dead_vars;
+
 	if (s == 0) {
 		return;
 	}
@@ -358,11 +427,19 @@ void core_sched_unload(core_sched *s)
 	free_list(s, &s->ready);
 	free_list(s, &s->freepool);
 
-	sched_free(s, s->fault_thread);
-	sched_free(s, s->fault_vars);
+	/* The third claim on the slot, and the same rule as the other two:
+	 * take it under the lock, release it once nothing else can reach
+	 * it. A script load can arrive while a thread is faulting. */
+	sched_enter(s);
+	dead_thread     = s->fault_thread;
+	dead_vars       = s->fault_vars;
 	s->fault_thread = 0;
 	s->fault_vars   = 0;
 	s->fault_status = 0;
+	s->fault_total  = 0;
+	sched_leave(s);
+	sched_free(s, dead_thread);
+	sched_free(s, dead_vars);
 
 	s->thread_count   = 0;
 	s->next_thread_id = 0;
@@ -589,9 +666,10 @@ static int sched_execute(core_sched *s, core_sched_thread **pt)
  */
 static void sched_fault(core_sched *s, core_sched_thread *t, int status)
 {
-	core_sched_thread *old_thread = s->fault_thread;
-	u32               *old_vars   = s->fault_vars;
+	core_sched_thread *old_thread;
+	u32               *old_vars;
 	u32               *snapshot;
+	int                was_empty;
 	s32 i;
 
 	snapshot = (u32 *)sched_alloc(s, (u32)s->vm.var_count * 4u);
@@ -600,16 +678,40 @@ static void sched_fault(core_sched *s, core_sched_thread *t, int status)
 			snapshot[i] = s->vm.vars[i];
 		}
 	}
+
+	sched_enter(s);
+	was_empty  = (s->fault_thread == 0);
+	old_thread = s->fault_thread;
+	old_vars   = s->fault_vars;
 	/* A failed snapshot is not a failed fault - the original reports the
 	 * fault either way and simply parks a null. */
 	s->fault_thread = t;
 	s->fault_vars   = snapshot;
 	s->fault_status = status;
+	s->fault_total++;
+	sched_leave(s);
 
+	/* Outside the lock: nothing else can reach either block now. */
 	sched_free(s, old_thread);
 	sched_free(s, old_vars);
 
-	core_sched_post_event(s, CORE_EVENT_FAULT, (u32)status, s->device_tag);
+	/*
+	 * ONE EVENT PER COLLECTION, NOT ONE PER FAULT. There is a single
+	 * post-mortem slot and every fault overwrites it, so a client told
+	 * twice before it drains once could not have retrieved the first
+	 * anyway. Signalling only the empty-to-occupied edge makes the event
+	 * rate equal to the client's own drain rate, which is what keeps a
+	 * faulting script from flooding the notification queue.
+	 *
+	 * was_empty IS READ INSIDE THE LOCK, with the exchange. Deciding it
+	 * outside would let the drain empty the slot in between; both sides
+	 * would then have seen an occupant, neither would signal, and the
+	 * fault would sit uncollected until something unrelated faulted.
+	 */
+	if (was_empty) {
+		core_sched_post_event(s, CORE_EVENT_FAULT, (u32)status,
+		                      s->device_tag);
+	}
 }
 
 /*

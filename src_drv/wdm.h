@@ -755,6 +755,13 @@ typedef struct _ADAPTOID_DEVEXT {
 	KDPC                 ScriptDpc;
 	KSPIN_LOCK           ScriptLock;
 	/*
+	 * The IRQL ScriptLock was taken at. It lives here rather than on a
+	 * stack because the scheduler's lock seam is two separate calls with
+	 * nothing of its own between them. Only the holder ever writes it,
+	 * and the lock is what orders one holder against the next.
+	 */
+	KIRQL                ScriptLockIrql;
+	/*
 	 * NOT A BOOLEAN, AND IT STARTS AT -1. The scheduler DPC increments it
 	 * only while it is non-negative and decrements only while it is
 	 * positive, so it stays latched at -1 until something else lifts it,

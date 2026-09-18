@@ -2184,6 +2184,26 @@ static int sched_test_native(void *ctx, core_script *vm, u32 id)
 	}
 }
 
+static int g_lock_depth;
+static int g_lock_max;
+static int g_lock_calls;
+
+static void sched_test_enter(void *ctx)
+{
+	(void)ctx;
+	g_lock_depth++;
+	if (g_lock_depth > g_lock_max) {
+		g_lock_max = g_lock_depth;
+	}
+	g_lock_calls++;
+}
+
+static void sched_test_leave(void *ctx)
+{
+	(void)ctx;
+	g_lock_depth--;
+}
+
 static void sched_test_open(core_sched *s)
 {
 	core_sched_init(s, sched_test_alloc, sched_test_free, 0);
@@ -2593,6 +2613,94 @@ static int test_sched(void)
 		sched_expect(s.vm.code_count == 0, "and clears the script",
 		             s.vm.code_count, 0, &bad);
 		sched_expect(g_sched_live == 0, "leaking nothing",
+		             g_sched_live, 0, &bad);
+		groups++;
+	}
+
+	/* ---- 12. the post-mortem slot has one owner and one doorbell ----
+	 *
+	 * Two rules, one piece of code: the slot is exchanged under the lock
+	 * seam, and a fault signals ONLY when it finds the slot empty. A
+	 * client told twice before it drains once could not have retrieved
+	 * the first post-mortem anyway - the second fault overwrote it.
+	 *
+	 * WHAT THIS CANNOT SHOW is the race it exists to prevent. The harness
+	 * is single-threaded, so the seam is counted rather than contended.
+	 * g_lock_max proves only that the region is entered and never nests,
+	 * which is what would deadlock a real spin lock; that the exchange is
+	 * atomic against a DPC is a property of the driver's lock and is not
+	 * reachable from here.
+	 */
+	{
+		core_sched s;
+		core_sched_thread *got_t;
+		u32               *got_v;
+		core_sched_thread *t;
+
+		g_sched_live = 0;
+		g_lock_depth = 0;
+		g_lock_max   = 0;
+		g_lock_calls = 0;
+		sched_test_open(&s);
+		core_sched_set_lock(&s, sched_test_enter, sched_test_leave, 0);
+
+		/* A fault into an EMPTY slot signals. */
+		core_sched_load(&s, PROG_LOOP, 2, 4, 0);
+		sched_expect(g_evcount == 1, "empty slot posts one event",
+		             g_evcount, 1, &bad);
+		sched_expect(s.fault_thread != 0, "the thread is parked",
+		             s.fault_thread != 0, 1, &bad);
+		sched_expect(s.fault_total == 1, "and counted",
+		             (long)s.fault_total, 1, &bad);
+
+		/* A second fault, slot still full: counted, but SILENT. */
+		sched_reset_log();
+		t = core_sched_thread_alloc(&s, 0);
+		t->wake_time = 0;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 0);
+		sched_expect(g_evcount == 0, "an occupied slot posts nothing",
+		             g_evcount, 0, &bad);
+		sched_expect(s.fault_total == 2, "the fault is still counted",
+		             (long)s.fault_total, 2, &bad);
+		sched_expect(s.fault_thread != 0, "and it holds the newer one",
+		             s.fault_thread != 0, 1, &bad);
+
+		/* Draining hands both blocks over and leaves the slot empty. */
+		core_sched_fault_take(&s, &got_t, &got_v);
+		sched_expect(got_t != 0, "take returns the thread",
+		             got_t != 0, 1, &bad);
+		sched_expect(got_v != 0, "and the globals snapshot",
+		             got_v != 0, 1, &bad);
+		sched_expect(s.fault_thread == 0, "the slot is empty after it",
+		             s.fault_thread == 0, 1, &bad);
+		sched_expect(s.fault_vars == 0, "both halves of it",
+		             s.fault_vars == 0, 1, &bad);
+		s.release(s.mem_ctx, got_t);
+		s.release(s.mem_ctx, got_v);
+
+		/* Empty again, so the next fault signals again. */
+		sched_reset_log();
+		t = core_sched_thread_alloc(&s, 0);
+		t->wake_time = 0;
+		core_sched_queue(&s, t);
+		core_sched_run(&s, 0);
+		sched_expect(g_evcount == 1, "a drained slot signals again",
+		             g_evcount, 1, &bad);
+		sched_expect(s.fault_total == 3, "three faults, two events",
+		             (long)s.fault_total, 3, &bad);
+
+		sched_expect(g_lock_calls > 0, "the lock seam was used",
+		             g_lock_calls > 0, 1, &bad);
+		sched_expect(g_lock_max == 1, "and never nested",
+		             g_lock_max, 1, &bad);
+		sched_expect(g_lock_depth == 0, "enter and leave are balanced",
+		             g_lock_depth, 0, &bad);
+
+		core_sched_unload(&s);
+		sched_expect(s.fault_total == 0, "unload resets the count",
+		             (long)s.fault_total, 0, &bad);
+		sched_expect(g_sched_live == 0, "and nothing leaked",
 		             g_sched_live, 0, &bad);
 		groups++;
 	}

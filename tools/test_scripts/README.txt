@@ -7,7 +7,8 @@ tools/test_scripts                          Adaptoid script source
 
 Abstract
 
-   Six .ac scripts for the Adaptoid configurator, each covering one area. They
+   Seven .ac scripts for the Adaptoid configurator, each covering one area.
+   They
    are the consolidation of eleven throwaway scripts; the originals are on the
    VM share under scripts/ and are not worth keeping.
 
@@ -49,6 +50,26 @@ Table of Contents
    30, and _kill leaks that count (Defect 8). RE-SELECT THE SCRIPT between
    attempts or a later press silently forks nothing and looks like a pass.
 
+   A FOURTH: the thirty-thread cap bounds how many threads exist AT ONCE, not
+   how many a script may create. Both drivers refuse _fork past thirty on the
+   ready list. On the original the count leaked, so the refusal was permanent
+   and the script was crippled for its lifetime; on the replacement the count
+   is accurate, slots free as threads end, and a script can keep creating them
+   indefinitely. Concurrency is bounded. THROUGHPUT IS NOT.
+
+   That matters because the cost is per FAULT, not per live thread: each one
+   allocates a globals snapshot, frees the previous snapshot and thread node,
+   and may post an event. Under Driver Verifier special pool every one of
+   those is a dedicated page. Handlers are driven from the input stream rather
+   than from button edges, so a held button re-enters a handler that is still
+   running and the invocations stack, which is how a hundred forks per press
+   becomes thousands of threads.
+
+   SO A SCRIPT MEASURING SOMETHING ELSE KEEPS ITS FORK COUNT SMALL AND GUARDS
+   RE-ENTRY WITH A static FLAG, or the storm becomes the only thing it tests.
+   @--racewindow.ac does neither, deliberately: overloading that path IS what
+   it measures.
+
 
 2. The Scripts
 
@@ -80,6 +101,12 @@ Table of Contents
    | @--faultcrash.ac | THE IMPORTANT ONE. Enumerates the interpreter     |
    |                  | fault codes, and crashes the original driver on   |
    |                  | ONE PRESS. See section 3.                         |
+   | @--racewindow.ac | DELIBERATE OVERLOAD. Unguarded handlers that      |
+   |                  | fork a hundred faulting threads a press and       |
+   |                  | stack when the button is held, driving the        |
+   |                  | fault path past what a client can drain.          |
+   |                  | Passes when events_dropped stays ZERO and the     |
+   |                  | driver stays up, however hard it is driven.       |
    | @--stuckkey.ac   | Holds a key for as long as a button is held.      |
    |                  | Switch script while the button is down and the    |
    |                  | key is stranded - the driver keeps it pressed     |

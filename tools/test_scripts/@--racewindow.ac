@@ -1,0 +1,122 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// DELIBERATE OVERLOAD - the fault path driven past what the client can
+// keep up with.
+//
+// Handlers are driven from the input stream, not from button edges, so a
+// held button re-enters a handler that is still running. These handlers
+// take about a second to finish and have NO re-entry guard, so the
+// invocations stack on purpose. That is the stress: threads created
+// without bound, a fault from each one, and a notification path asked to
+// carry far more than a user-mode client can drain.
+//
+//   A   100 faults per invocation, 10 ms apart
+//   B   200 faults per invocation,  5 ms apart
+//   Z   one fault                            control
+//
+// HOLD THE BUTTON to stack invocations. A single tap is a much lighter
+// test than leaning on it for several seconds.
+//
+// WHAT A PASS LOOKS LIKE, read from the driver with KD:
+//
+//   events_dropped  STAYS AT ZERO, however hard this is driven. The
+//                   post-mortem slot holds one fault and every new fault
+//                   overwrites it, so the driver signals only when the
+//                   slot goes from empty to occupied. That makes the
+//                   notification rate the client's own drain rate. A
+//                   non-zero count means the coalescing is not holding.
+//
+//   fault_total     rises freely - it counts every fault, including the
+//                   ones no event was posted for. Thousands is normal
+//                   and is what tells you the storm really ran.
+//
+//   thread_count    never exceeds 30. That cap bounds threads AT ONCE,
+//                   not threads created, which is why next_thread_id
+//                   reaches the thousands while this stays small.
+//
+//   no bugcheck     the slot is exchanged under a lock, so a fault
+//                   landing while the client drains cannot free what the
+//                   drain has already taken.
+//
+// WHAT THIS DOES NOT FIX, and do not read as a failure: the configurator
+// still writes a line to the Debugging Log for every fault it drains, and
+// enough of them will make its window slow regardless of what the driver
+// does. Log rendering is a client problem. Judge the driver on
+// events_dropped and on staying up.
+//
+// COST. Every fault allocates a globals snapshot, frees the previous
+// snapshot and thread node, and may post an event. Under Driver Verifier
+// special pool each of those is a dedicated page with a guard page, so
+// this is far more expensive with verifier armed than without. That is
+// the point when testing the fix, and worth remembering when reading the
+// machine's responsiveness.
+//
+// Decimal only: hex literals compile to a pointer here, Defect 21.
+
+stream_10ms(n)
+{
+    int i = 0;
+    int id;
+    int z = 0;
+    int q;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            q = 100 / z;               // fault at once, no sleep first
+            _exit();
+        }
+        if (id < 0) return i;          // _fork refused: 30 already live
+        _sleep(10);                    // parent paces the stream
+        i = i + 1;
+    }
+    return n;
+}
+
+stream_5ms(n)
+{
+    int i = 0;
+    int id;
+    int z = 0;
+    int q;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            q = 100 / z;
+            _exit();
+        }
+        if (id < 0) return i;
+        _sleep(5);
+        i = i + 1;
+    }
+    return n;
+}
+
+act_stream(p)
+{
+    if (p) stream_10ms(100);
+    return 0;
+}
+
+act_dense(p)
+{
+    if (p) stream_5ms(200);
+    return 0;
+}
+
+act_one(p)
+{
+    int z = 0;
+    int q;
+
+    if (p) q = 100 / z;
+    return 0;
+}
+
+main() {}
+int on_a(p) = act_stream;
+int on_b(p) = act_dense;
+int on_z(p) = act_one;

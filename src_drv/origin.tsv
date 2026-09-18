@@ -184,8 +184,10 @@ sched_expect	harness.c	new	-	-	-
 sched_reset_log	harness.c	new	-	-	-
 sched_test_alloc	harness.c	new	-	-	-
 sched_test_arm	harness.c	new	-	-	-
+sched_test_enter	harness.c	new	-	-	-
 sched_test_event	harness.c	new	-	-	-
 sched_test_free	harness.c	new	-	-	-
+sched_test_leave	harness.c	new	-	-	-
 sched_test_native	harness.c	new	-	-	-
 sched_test_open	harness.c	new	-	-	-
 script_run_prog	harness.c	new	-	-	-
@@ -280,6 +282,7 @@ rd32	ioctl.c	new	-	-	-
 registry_find	ioctl.c	part	wishk201.sys	0001061f	drv_IoctlControlDevice
 wr32	ioctl.c	new	-	-	-
 clamp_s32	sched.c	new	-	-	-
+core_sched_fault_take	sched.c	part	wishk201.sys	00012bc0	drv_IoctlDeviceCommand
 core_sched_init	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
 core_sched_load	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
 core_sched_load_le	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
@@ -291,6 +294,7 @@ core_sched_run	sched.c	port	wishk201.sys	00017980	drv_ScriptScheduler
 core_sched_set_arm	sched.c	new	-	-	-
 core_sched_set_core	sched.c	new	-	-	-
 core_sched_set_event_sink	sched.c	new	-	-	-
+core_sched_set_lock	sched.c	new	-	-	-
 core_sched_set_native	sched.c	new	-	-	-
 core_sched_thread_alloc	sched.c	port	wishk201.sys	000177c0	drv_ScriptThreadAlloc
 core_sched_unload	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
@@ -307,9 +311,11 @@ native_arg	sched.c	part	wishk201.sys	000186a0	drv_ScriptNativeCall
 native_fork	sched.c	port	wishk201.sys	000186a0	drv_ScriptNativeCall
 sched_alloc	sched.c	new	-	-	-
 sched_drain_events	sched.c	part	wishk201.sys	00015e70	drv_DispatchEvents
+sched_enter	sched.c	new	-	-	-
 sched_execute	sched.c	part	wishk201.sys	00017b90	drv_ScriptExecute
 sched_fault	sched.c	part	wishk201.sys	00017b90	drv_ScriptExecute
 sched_free	sched.c	new	-	-	-
+sched_leave	sched.c	new	-	-	-
 sched_load_body	sched.c	part	wishk201.sys	00017310	drv_ScriptLoad
 sched_rd32	sched.c	new	-	-	-
 sched_spawn_handler	sched.c	part	wishk201.sys	00017550	drv_ScriptDispatchInput
@@ -408,7 +414,9 @@ AdaptoidRequestDevicePower	wdm.c	part	wishk201.sys	00017250	drv_RequestDevicePow
 AdaptoidRequestPowerIrp	wdm.c	part	wishk201.sys	00017250	drv_RequestDevicePower
 AdaptoidRouteOf	wdm.c	part	wishk201.sys	000117f0	drv_CreateTriage
 AdaptoidSchedAlloc	wdm.c	new	-	-	-
+AdaptoidSchedEnter	wdm.c	new	-	-	-
 AdaptoidSchedFree	wdm.c	new	-	-	-
+AdaptoidSchedLeave	wdm.c	new	-	-	-
 AdaptoidScriptArm	wdm.c	part	wishk201.sys	00017860	drv_ScriptThreadQueue
 AdaptoidScriptDpc	wdm.c	port	wishk201.sys	00017910	drv_ScriptSchedulerDpc
 AdaptoidScriptEvent	wdm.c	port	wishk201.sys	00015e70	drv_DispatchEvents

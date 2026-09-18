@@ -453,10 +453,7 @@ static u32 ioc_script_fault(core_ioctl_env *env, const core_ioctl *r, u32 *info)
 		*info = 0;
 		return CORE_ST_SUCCESS;
 	}
-	t    = s->fault_thread;
-	vars = s->fault_vars;
-	s->fault_thread = 0;
-	s->fault_vars   = 0;
+	core_sched_fault_take(s, &t, &vars);
 	if (t == 0) {
 		/*
 		 * DIVERGENCE: the snapshot is released even when there is no

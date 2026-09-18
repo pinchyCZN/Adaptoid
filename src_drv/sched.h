@@ -156,6 +156,19 @@ typedef void (*core_sched_arm_fn)(void *ctx, u64 wake_time);
  * user-mode notification queue. */
 typedef void (*core_sched_event_fn)(void *ctx, u32 type, u32 arg1, u32 arg2);
 
+/*
+ * Serialise the post-mortem slot. The scheduler fills it from a DPC and the
+ * client empties it from an IOCTL, so both can be in the slot at once.
+ *
+ * ONLY THE EXCHANGE IS GUARDED, never the copy, the allocation or the free:
+ * whoever takes a pointer out of the slot owns that block exclusively from
+ * that moment, because nothing else can still reach it. A lock held across
+ * the interpreter would run a whole quantum at DISPATCH_LEVEL.
+ *
+ * Both halves are optional. A single-threaded owner leaves them null.
+ */
+typedef void (*core_sched_lock_fn)(void *ctx);
+
 typedef struct core_sched {
 	/*
 	 * The interpreter. code, vars and the native seam live here for the
@@ -209,6 +222,10 @@ typedef struct core_sched {
 	u32               *fault_vars;
 	int                fault_status;
 
+	/* Every fault, including those coalesced away by the notify rule
+	 * below. Diagnostic only - it is not reported to the client. */
+	u32                fault_total;
+
 	core_sched_event events[CORE_SCHED_EVENTS];
 	s32 event_head;
 	s32 event_count;
@@ -235,12 +252,18 @@ typedef struct core_sched {
 
 	core_sched_event_fn emit;
 	void               *emit_ctx;
+
+	core_sched_lock_fn  enter;
+	core_sched_lock_fn  leave;
+	void               *lock_ctx;
 } core_sched;
 
 void core_sched_init(core_sched *s, core_sched_alloc_fn alloc,
                      core_sched_free_fn release, void *mem_ctx);
 
 void core_sched_set_arm(core_sched *s, core_sched_arm_fn fn, void *ctx);
+void core_sched_set_lock(core_sched *s, core_sched_lock_fn enter,
+                         core_sched_lock_fn leave, void *ctx);
 void core_sched_set_event_sink(core_sched *s, core_sched_event_fn fn,
                                void *ctx);
 void core_sched_set_native(core_sched *s, core_script_native_fn fn,
@@ -270,6 +293,8 @@ int  core_sched_load(core_sched *s, const u32 *code, s32 code_count,
 int  core_sched_load_le(core_sched *s, const u8 *code_le, s32 code_count,
                         s32 var_count, u64 now);
 
+void core_sched_fault_take(core_sched *s, core_sched_thread **thread,
+                           u32 **vars);
 void core_sched_unload(core_sched *s);
 
 /*

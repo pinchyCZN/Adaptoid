@@ -793,14 +793,28 @@ Table of Contents
    Would a user notice:  yes, as a bugcheck. A script faulting in more
    than one thread with the Debugging Log open is enough.
 
-   In the replacement:  NOT FIXED, and currently WORSE than the original.
-   core_sched's sched_fault frees the superseded snapshot the same way,
-   and ioc_script_fault takes NO LOCK AT ALL when it reads and clears the
-   two pointers, where the original at least makes that handoff atomic.
-   The fix is mutual exclusion between the DPC driving core_sched_run and
-   the IOCTL that drains, using the ScriptLock already in the device
-   extension. It cannot live in core, which has no lock primitive, and
-   the harness cannot test it, having one thread.
+   In the replacement:  FIXED. Every claim on the slot goes through
+   core_sched_fault_take, which exchanges it under a lock seam - core's
+   enter/leave pair, supplied by wdm.c from the ScriptLock already in the
+   device extension. A spin lock is the right kind because the scheduler
+   fills the slot from a DPC at DISPATCH_LEVEL, so nothing that waits can
+   be used, and KeAcquireSpinLock is legal from there and from the
+   PASSIVE_LEVEL IOCTL that empties it.
+
+   ONLY THE EXCHANGE IS GUARDED. Whoever takes a pointer out of the slot
+   owns that block exclusively from that moment, because nothing else can
+   still reach it, so the copy, the allocation and the free all happen
+   outside the lock. Holding one across core_sched_run would run a whole
+   interpreter quantum at DISPATCH_LEVEL.
+
+   There are three claims, not two: sched_fault, the drain, and
+   core_sched_unload, which drops both buffers when a new script arrives.
+   All three take the lock.
+
+   The harness cannot show the race, having one thread. It verifies what
+   it can - that the region is entered, never nests and balances, which is
+   what would deadlock a real spin lock, and that the take empties the
+   slot - in scheduler group 12.
 
 15.1.  And The Same Path Leaks
 
