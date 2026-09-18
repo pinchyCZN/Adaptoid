@@ -7,7 +7,7 @@ tools/test_scripts                          Adaptoid script source
 
 Abstract
 
-   Seven .ac scripts for the Adaptoid configurator, each covering one area.
+   Eight .ac scripts for the Adaptoid configurator, each covering one area.
    They
    are the consolidation of eleven throwaway scripts; the originals are on the
    VM share under scripts/ and are not worth keeping.
@@ -131,6 +131,13 @@ Table of Contents
    |                  | Defect 7: a forked child that reads a PARAMETER   |
    |                  | is refused its own locals and faults with status  |
    |                  | 2.                                                |
+   | @--edgemath.ac   | Operand values a divide cannot compute. The       |
+   |                  | interpreter checks the divisor against zero       |
+   |                  | and nothing else, so INT_MIN / -1 reaches a       |
+   |                  | bare idiv and overflows - the same exception      |
+   |                  | as divide by zero, raised in a DPC. Also          |
+   |                  | recursion past the stack clamp and whether a      |
+   |                  | script recovers after the budget runs dry.        |
    | @--faultcrash.ac | THE IMPORTANT ONE. Enumerates the interpreter     |
    |                  | fault codes, and crashes the original driver on   |
    |                  | ONE PRESS. See section 3.                         |

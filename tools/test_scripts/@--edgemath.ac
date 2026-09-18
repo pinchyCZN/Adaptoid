@@ -1,0 +1,211 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// ARITHMETIC EDGE CASES THE INTERPRETER DOES NOT GUARD.
+//
+// Everything else in this folder stresses threads, faults and the
+// notification path. This one stresses the INTERPRETER ITSELF, with the
+// operand values a divide instruction cannot compute.
+//
+// THE DIVISOR-ZERO CHECK IS NOT THE ONLY WAY A DIVIDE CAN TRAP. On x86,
+// INT_MIN / -1 overflows: the true answer is +2147483648, which does not
+// fit in a signed 32-bit result, and the CPU raises the SAME exception
+// it raises for division by zero. The interpreter checks the divisor
+// against zero and nothing else, so these two buttons reach a bare idiv
+// with the one operand pair that traps. In the driver that happens
+// inside the scheduler DPC, where an unhandled exception is a bugcheck.
+//
+// INT_MIN is written as 1 << 31 because the language cannot spell
+// -2147483648 as a literal: 2147483648 does not fit in an int, and there
+// is no unary form that reaches it. Decimal only, hex is Defect 21.
+//
+//   Z   control            arithmetic works, types  ct=1
+//   L   SAFE INT_MIN       divides INT_MIN by 1, 2 and -2, which are all
+//                          representable. Types three lines. If this
+//                          faults, the problem is INT_MIN itself and not
+//                          the overflow case.
+//   A   INT_MIN / -1       EXPECTED TO BUGCHECK
+//   B   INT_MIN % -1       EXPECTED TO BUGCHECK - the same instruction
+//                          computes both quotient and remainder
+//   R   deep recursion     600 frames against a 200-word stack clamp
+//   S   budget then run    exhausts the instruction budget, then checks
+//                          the script still works afterwards
+//
+// RUN Z AND L FIRST. They prove the script loaded and that INT_MIN by
+// itself is harmless, which is what makes A and B mean something. Open
+// Notepad for the typed output and the Debugging Log for faults.
+//
+// A CLEAN RESULT FOR A AND B IS A FAULT, NOT SILENCE: the log should say
+// the script faulted and the driver should still be alive. A bugcheck
+// means the guard is missing. A hang means something else entirely.
+
+tap_digit(v)
+{
+    if (v == 0) { _key('0',1); _key('0',0); }
+    if (v == 1) { _key('1',1); _key('1',0); }
+    if (v == 2) { _key('2',1); _key('2',0); }
+    if (v == 3) { _key('3',1); _key('3',0); }
+    if (v == 4) { _key('4',1); _key('4',0); }
+    if (v == 5) { _key('5',1); _key('5',0); }
+    if (v == 6) { _key('6',1); _key('6',0); }
+    if (v == 7) { _key('7',1); _key('7',0); }
+    if (v == 8) { _key('8',1); _key('8',0); }
+    if (v == 9) { _key('9',1); _key('9',0); }
+    return 0;
+}
+
+tap_num(n)
+{
+    int d = 1;
+
+    // NOT for INT_MIN: negating it overflows back to itself and this
+    // would print nonsense. Nothing here passes it one.
+    if (n < 0) {
+        _key('minus',1); _key('minus',0);
+        n = -n;
+    }
+    while (d <= n / 10) d = d * 10;
+    while (d > 0) {
+        tap_digit((n / d) % 10);
+        d = d / 10;
+    }
+    return 0;
+}
+
+say(a, b, v)
+{
+    _key(a,1); _key(a,0);
+    _key(b,1); _key(b,0);
+    _key('equals',1); _key('equals',0);
+    tap_num(v);
+    _key('enter',1); _key('enter',0);
+    return 0;
+}
+
+// ---- Z: the control -------------------------------------------------
+
+act_control(p)
+{
+    if (p) say('c','t', 1);
+    return 0;
+}
+
+// ---- L: INT_MIN with divisors that cannot overflow ------------------
+//
+// INT_MIN / 1  is INT_MIN, representable.
+// INT_MIN / 2  is -1073741824, representable.
+// INT_MIN / -2 is  1073741824, representable.
+//
+// Only -1 overflows. If any of these three faults or crashes, the fault
+// is not the overflow case and A and B prove nothing.
+
+act_safe(p)
+{
+    int lo;
+    int a;
+
+    if (p) {
+        lo = 1 << 31;
+        a = lo / 2;
+        say('s','1', a);
+        a = lo / (0 - 2);
+        say('s','2', a);
+        a = (lo / 1) == lo;
+        say('s','3', a);
+    }
+    return 0;
+}
+
+// ---- A: the overflow divide -----------------------------------------
+
+act_divtrap(p)
+{
+    int lo;
+    int neg;
+    int q;
+
+    if (p) {
+        lo  = 1 << 31;
+        neg = 0 - 1;
+        q   = lo / neg;
+        say('d','x', q == 0);
+    }
+    return 0;
+}
+
+// ---- B: the overflow modulo -----------------------------------------
+
+act_modtrap(p)
+{
+    int lo;
+    int neg;
+    int q;
+
+    if (p) {
+        lo  = 1 << 31;
+        neg = 0 - 1;
+        q   = lo % neg;
+        say('m','x', q == 0);
+    }
+    return 0;
+}
+
+// ---- R: recursion against the stack clamp ---------------------------
+//
+// A thread's saved stack is clamped to 200 words, so a call chain deeper
+// than that cannot be restored across a yield. 600 frames is three times
+// the clamp. A fault is the correct outcome; a wrong answer means frames
+// were silently lost.
+
+descend(n)
+{
+    if (n <= 0) return 0;
+    return 1 + descend(n - 1);
+}
+
+act_deep(p)
+{
+    if (p) say('r','c', descend(600));
+    return 0;
+}
+
+// ---- S: budget exhaustion, then does it recover ---------------------
+//
+// The instruction budget is a token bucket, 100000 per second shared by
+// every thread, and running it dry is a fault. What is NOT tested
+// anywhere else is whether the script works again afterwards: press S
+// twice, a second apart. The first press should fault, the second should
+// type bg=1.
+
+spin(n)
+{
+    int i = 0;
+    int t = 0;
+
+    while (i < n) {
+        t = t + i;
+        i = i + 1;
+    }
+    return t;
+}
+
+act_budget(p)
+{
+    static int runs = 0;
+
+    if (p) {
+        runs = runs + 1;
+        if (runs == 1) spin(200000);
+        if (runs > 1) say('b','g', 1);
+    }
+    return 0;
+}
+
+main() {}
+int on_z(p) = act_control;
+int on_l(p) = act_safe;
+int on_a(p) = act_divtrap;
+int on_b(p) = act_modtrap;
+int on_r(p) = act_deep;
+int on_s(p) = act_budget;

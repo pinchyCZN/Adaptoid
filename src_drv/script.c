@@ -354,6 +354,38 @@ int core_script_run(core_script *vm)
 			vm->sp--;
 			lhs = STK(vm, vm->sp);
 
+			/*
+			 * A ZERO DIVISOR IS NOT THE ONLY OPERAND PAIR A DIVIDE
+			 * CANNOT COMPUTE. INT_MIN / -1 has no representable
+			 * result - the true quotient is +2147483648, one past
+			 * what a signed 32-bit value holds - and x86 reports
+			 * that overflow through the SAME #DE trap it uses for
+			 * division by zero. MOD TRAPS IDENTICALLY, because one
+			 * idiv produces both the quotient and the remainder.
+			 *
+			 * WITHOUT THIS CHECK IT IS A BUGCHECK, NOT A SCRIPT
+			 * FAULT. The interpreter runs from the scheduler DPC at
+			 * DISPATCH_LEVEL, where an unhandled #DE is fatal to the
+			 * machine. Measured on the live driver from an ordinary
+			 * text script: bugcheck 1E, KMODE_EXCEPTION_NOT_HANDLED,
+			 * exception c0000095 STATUS_INTEGER_OVERFLOW, at the
+			 * idiv this guard protects.
+			 *
+			 * The operands are compared as bit patterns rather than
+			 * as signed values, because forming the constant INT_MIN
+			 * by casting is exactly the conversion being guarded.
+			 *
+			 * It reports DIV_ZERO rather than a status of its own.
+			 * The two are one condition from a script's point of
+			 * view - a divide whose result does not exist - and the
+			 * client already has a string for this one.
+			 */
+			if ((op == CORE_OP_DIV || op == CORE_OP_MOD) &&
+				lhs == 0x80000000u && vm->acc == 0xFFFFFFFFu) {
+				status = CORE_SCRIPT_DIV_ZERO;
+				break;
+			}
+
 			switch (op) {
 			case CORE_OP_LSHFT: vm->acc = lhs << (vm->acc & 0x1f);        break;
 			case CORE_OP_RSHFT:

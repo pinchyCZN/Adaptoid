@@ -88,7 +88,8 @@ Table of Contents
    22. Defect 20: The Control Device's Power IRP Stalls The Power Queue
    23. Defect 21: Hexadecimal Literals Compile To A Pointer
    24. Defect 22: An LF-Only Script Hangs The Configurator
-   25. What Is Not Affected
+   25. Defect 23: INT_MIN Divided By Minus One Bugchecks
+   26. What Is Not Affected
 
 1.  Severity Summary
 
@@ -1243,7 +1244,66 @@ Table of Contents
    A reimplementation should scan and seek in one unit, and refuse to
    advance a scan loop by a computed offset without checking it moved.
 
-25. What Is Not Affected
+25. Defect 23: INT_MIN Divided By Minus One Bugchecks
+
+   Location:  drv_ScriptExecute, the IDIV ECX at 000181db (divide) and
+              000181fb (modulo).
+
+   The interpreter checks a divide's DIVISOR against zero and nothing
+   else. There is a second operand pair a signed divide cannot compute:
+   INT_MIN / -1, whose true quotient is +2147483648, one past the largest
+   value a signed 32-bit result holds. On x86 that overflow raises the
+   SAME #DE trap as division by zero, and nothing distinguishes them at
+   the instruction.
+
+   MODULO TRAPS IDENTICALLY. One IDIV produces the quotient and the
+   remainder together, so INT_MIN % -1 reaches the same instruction with
+   the same operands. That is why there are two addresses above and one
+   defect.
+
+   Trigger:  a script evaluating INT_MIN / -1 or INT_MIN % -1. The
+   language cannot write INT_MIN as a literal - 2147483648 does not fit
+   in an int - but 1 << 31 reaches it in one expression, and both
+   operands can arrive from ordinary variables.
+
+   Effect:  BUGCHECK. The interpreter runs from the script scheduler DPC
+   at DISPATCH_LEVEL, where an unhandled #DE is fatal to the machine
+   rather than to the script.
+
+   Would a user notice:  yes, as a machine that restarts. It needs no
+   crafted bytecode and no debugger - a text script compiled by the
+   shipped configurator is enough.
+
+   MEASURED ON THE REPLACEMENT, WHICH HAD THE IDENTICAL HOLE, from a
+   script pressing one button:
+
+       BugCheck 1E, {ffffffffc0000095, fffff80d54057eb3, 0, 326}
+       EXCEPTION_CODE: 0xc0000095 - {EXCEPTION} Integer overflow.
+       CURRENT_IRQL:   2
+       SYMBOL_NAME:    wishk300!core_script_run+493
+       nt!KiDivideErrorFault+0x30a
+
+   Note the status: c0000095 STATUS_INTEGER_OVERFLOW, not the c0000094
+   STATUS_INTEGER_DIVIDE_BY_ZERO a zero divisor produces. Windows
+   separates the two causes of #DE even though the instruction does not,
+   so the status alone identifies which of the two operand pairs trapped.
+
+   THE ORIGINAL IS UNGUARDED BY INSPECTION, NOT BY MEASUREMENT. Its two
+   IDIVs have no overflow test, and the constant 0x80000000 appears
+   nowhere in drv_ScriptExecute's 737 instructions - there is nothing
+   that could be a guard. The crash above was produced on the
+   replacement; the same script has not been run against wishk201.sys.
+
+   In the replacement:  FIXED. core_script_run rejects the pair before
+   reaching the divide, reporting the existing DIV_ZERO status rather
+   than inventing one - from a script's point of view both are a divide
+   whose result does not exist, and the client already has a string for
+   it. The operands are compared as bit patterns, because forming INT_MIN
+   by casting is the conversion being guarded. Covered by two cases in
+   the interpreter status table; without the guard they do not fail the
+   harness, they KILL it, which is the behaviour being prevented.
+
+26. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
@@ -1252,10 +1312,11 @@ Table of Contents
    -  The bytecode the compiler emits FOR DECIMAL CONSTANTS. Hexadecimal
       constants are defect 21, section 23, and are wrong everywhere they
       appear.
-   -  The bytecode interpreter drv_ScriptExecute and its
-      100000-instruction budget. Its per-instruction PC check is sound;
-      the one slip in its bounds checking is defect 6, section 8, and
-      that slip is masked by the per-instruction check.
+   -  The bytecode interpreter's per-instruction PC check and its
+      100000-instruction budget. The interpreter is NOT otherwise clean:
+      its arithmetic reaches a divide it cannot compute, which is defect
+      23, section 25, and the one slip in its bounds checking is defect
+      6, section 8 - that slip is masked by the per-instruction check.
    -  The input, button and stick primitives of the native builtin
       library. Its THREAD primitives are not clean: see defects 7, 8 and
       9, which are all in _fork, _kill and _wake.

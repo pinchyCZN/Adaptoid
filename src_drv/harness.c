@@ -1915,6 +1915,18 @@ static int test_script(void)
 		static const u32 S_TERM[]    = {0x082};
 		static const u32 S_DIV[]     = {0x110,1,0x093,0x110,0,0x255};
 		static const u32 S_MOD[]     = {0x110,1,0x093,0x110,0,0x256};
+		/*
+		 * INT_MIN / -1 and INT_MIN %% -1. A divide whose result does not
+		 * exist, which x86 reports through the same trap as a zero
+		 * divisor. THESE TWO WOULD TAKE THE HARNESS DOWN WITH AN
+		 * INTEGER-OVERFLOW EXCEPTION IF THE GUARD WERE REMOVED, rather
+		 * than report a failure - which is the point of having them: in
+		 * the driver the same operands are a bugcheck.
+		 */
+		static const u32 S_DIVOVF[]  =
+		    {0x110,0x80000000u,0x093,0x110,0xFFFFFFFFu,0x255};
+		static const u32 S_MODOVF[]  =
+		    {0x110,0x80000000u,0x093,0x110,0xFFFFFFFFu,0x256};
 		static const u32 S_UNDER[]   = {0x294};
 		static const u32 S_ILLEGAL[] = {0x999};
 		static const u32 S_LOOP[]    = {0x170,0xFFFFFFFEu};
@@ -1936,6 +1948,8 @@ static int test_script(void)
 		  {S_TERM,    1, CORE_SCRIPT_TERMINATED, "ret on empty stack"},
 		  {S_DIV,     6, CORE_SCRIPT_DIV_ZERO,   "divide by zero"    },
 		  {S_MOD,     6, CORE_SCRIPT_DIV_ZERO,   "modulo by zero"    },
+		  {S_DIVOVF,  6, CORE_SCRIPT_DIV_ZERO,   "INT_MIN / -1"      },
+		  {S_MODOVF,  6, CORE_SCRIPT_DIV_ZERO,   "INT_MIN % -1"      },
 		  {S_UNDER,   1, CORE_SCRIPT_UNDERFLOW,  "stack underflow"   },
 		  {S_ILLEGAL, 1, CORE_SCRIPT_ILLEGAL,    "illegal opcode"    },
 		  {S_LOOP,    2, CORE_SCRIPT_BUDGET_OUT, "infinite loop"     },
