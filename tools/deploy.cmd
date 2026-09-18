@@ -24,7 +24,7 @@ rem parses "Published Name" and "Original Name" literally.
 rem ----------------------------------------------------------------------
 
 set "PKG=%~1"
-if "%PKG%"=="" set "PKG=B:\pkg"
+if "%PKG%"=="" set "PKG=%~dp0pkg"
 set "INFNAME=adaptoid.inf"
 set "HWID=USB\VID_06F7&PID_0001"
 for %%H in ("USB\VID_06F7&PID_0001") do set "HWLEAF=%%~nxH"
