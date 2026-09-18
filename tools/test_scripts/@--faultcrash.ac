@@ -1,0 +1,118 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// THE ONE THAT CRASHES THE ORIGINAL. Read this before pressing A.
+//
+// BUTTON A BUGCHECKS THE 2001 DRIVER ON ONE PRESS, from an ordinary
+// script through the shipped configurator - no debugger, no crafted
+// request. It is Defect 13 in ../../docs/known-defects.txt: the fault
+// snapshot has two owners. drv_ScriptExecute frees whatever it
+// supersedes, the fn 0x83d drain frees what it took, and both free
+// outside the lock that guards the pointers. Eight children faulting in
+// one scheduler pass means each one frees the snapshot the drain is
+// still copying.
+//
+// ARM SPECIAL POOL FIRST, or it will not stop for the debugger:
+//
+//     verifier /flags 0x1 /driver wishk201.sys
+//
+// and reboot. NOTE THE NAME - wishk201.sys is the FILE, wishna1k is
+// only the service, and verifying the service name silently does
+// nothing at all. Without special pool the read at 0x133f0 succeeds on
+// a still-mapped page, the damage lands inside the pool allocator one
+// instruction later, and the machine reboots outright rather than
+// breaking in.
+//
+// OPEN THE DEBUGGING LOG BEFORE PRESSING ANYTHING. The drain only runs
+// when the configurator is listening, and no drain means no race.
+//
+//   A   storm of 8    ONE PRESS. Expect a bugcheck on the original.
+//   B   storm of 20   wider, if 8 ever fails to do it
+//   Z   ONE fault     the control: no concurrency, must NOT crash
+//
+// THE FAULT CODES. The remaining buttons each fault a different way, so
+// the log names each status. cfg_FormatDriverEvent renders all eleven
+// and is the authoritative naming.
+//
+//   L   divide by zero        status 5
+//   R   modulo by zero        status 5, by the other operator
+//   S   runaway loop          budget exhausted after 100000 steps
+//
+// RE-SELECT THIS SCRIPT BETWEEN ATTEMPTS. _fork refuses past thirty
+// threads and the count leaks (Defect 8), so a later press can quietly
+// fork nothing and look like a pass.
+//
+// Decimal only: hex literals compile to a pointer, Defect 21.
+
+// A child faults the instant the scheduler runs it. The parent never
+// reaches the divide - only the children do.
+burst(n)
+{
+    int i = 0;
+    int id;
+    int z = 0;
+    int q;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            q = 100 / z;
+            _exit();
+        }
+        if (id < 0) return i;          // _fork refused, the count leaked
+        i = i + 1;
+    }
+    return n;
+}
+
+act_storm8(p)  { if (p) burst(8);  return 0; }
+act_storm20(p) { if (p) burst(20); return 0; }
+
+act_one(p)
+{
+    int z = 0;
+    int q;
+
+    if (p) q = 100 / z;
+    return 0;
+}
+
+act_div0(p)
+{
+    int z = 0;
+    int q;
+
+    if (p) q = 100 / z;
+    return 0;
+}
+
+act_mod0(p)
+{
+    int z = 0;
+    int q;
+
+    if (p) q = 100 % z;
+    return 0;
+}
+
+act_spin(p)
+{
+    int i = 0;
+
+    if (p) {
+        while (i >= 0) {
+            i = i + 1;
+            if (i > 2000000000) i = 0;
+        }
+    }
+    return 0;
+}
+
+main() {}
+int on_a(p) = act_storm8;
+int on_b(p) = act_storm20;
+int on_z(p) = act_one;
+int on_l(p) = act_div0;
+int on_r(p) = act_mod0;
+int on_s(p) = act_spin;

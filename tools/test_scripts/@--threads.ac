@@ -1,0 +1,155 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// THE THREAD PRIMITIVES - _fork, _kill, and what a child may touch.
+//
+// Covers two defects. See ../../docs/known-defects.txt.
+//
+// DEFECT 8, the counter leak. _kill unlinks its victim but never
+// decrements ThreadCount, so the count drifts up one per kill and _fork
+// refuses once it passes 29 - for the life of the script, whatever the
+// real thread count is. Only loading a script clears it.
+//
+//   A   f5=   five fork+kill pairs, count refusals
+//          original 0,  replacement 0
+//   B   f4=   forty fork+kill pairs, count refusals
+//          original 15, replacement 0
+//          press B a SECOND time without reloading:
+//          original 40, replacement 0
+//   Z   pd=   this handler thread's id
+//
+// DEFECT 7, the child's stack. _fork gives the child the parent's
+// StackSize while the node it actually got was sized for the parent's
+// current depth, so a child can address outside what it owns.
+//
+//   L   a child that reads a PARAMETER faults with status 2, bad
+//       read/write address, before running a single useful instruction.
+//       Watch the DEBUGGING LOG - nothing reaches Notepad.
+//   R   the same shape with NO parameter read. It reaches the divide
+//       and faults with status 5 instead, which is the control showing
+//       the difference is the parameter and not the fork.
+//
+// RE-SELECT THIS SCRIPT BETWEEN PRESSES. A and B leak the count, so a
+// later press forks nothing and silently reports 0 refusals.
+//
+// Decimal only: hex literals compile to a pointer, Defect 21.
+
+tap_digit(v)
+{
+    if (v == 0) { _key('0',1); _key('0',0); }
+    if (v == 1) { _key('1',1); _key('1',0); }
+    if (v == 2) { _key('2',1); _key('2',0); }
+    if (v == 3) { _key('3',1); _key('3',0); }
+    if (v == 4) { _key('4',1); _key('4',0); }
+    if (v == 5) { _key('5',1); _key('5',0); }
+    if (v == 6) { _key('6',1); _key('6',0); }
+    if (v == 7) { _key('7',1); _key('7',0); }
+    if (v == 8) { _key('8',1); _key('8',0); }
+    if (v == 9) { _key('9',1); _key('9',0); }
+    return 0;
+}
+
+tap_num(n)
+{
+    int d = 1;
+
+    if (n < 0) {
+        _key('minus',1); _key('minus',0);
+        n = -n;
+    }
+    while (d <= n / 10) d = d * 10;
+    while (d > 0) {
+        tap_digit((n / d) % 10);
+        d = d / 10;
+    }
+    return 0;
+}
+
+say(a, b, v)
+{
+    _key(a,1); _key(a,0);
+    _key(b,1); _key(b,0);
+    _key('equals',1); _key('equals',0);
+    tap_num(v);
+    _key('enter',1); _key('enter',0);
+    return 0;
+}
+
+// ---- Defect 8 -------------------------------------------------------
+//
+// Each child parks in a long sleep so the parent kills a LIVE thread. A
+// kill that finds nothing may not leak the count and would not test it.
+
+churn(n)
+{
+    int i = 0;
+    int id;
+    int refused = 0;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            _sleep(60000);
+            _exit();
+        }
+        if (id < 0) {
+            refused = refused + 1;
+        } else {
+            _kill(id);
+        }
+        i = i + 1;
+    }
+    return refused;
+}
+
+act_five(p)  { if (p) say('f','5', churn(5));  return 0; }
+act_forty(p) { if (p) say('f','4', churn(40)); return 0; }
+act_pid(p)   { if (p) say('p','d', _getpid()); return 0; }
+
+// ---- Defect 7 -------------------------------------------------------
+//
+// The child's first act is to read `unit`, a parameter. On the original
+// that faults with status 2 before anything else happens.
+
+child_reads_param(unit)
+{
+    int id;
+    int z = 0;
+    int q;
+
+    id = _fork();
+    if (id == 0) {
+        _sleep(unit);              // reads a PARAMETER - faults here
+        q = 100 / z;
+        _exit();
+    }
+    return 0;
+}
+
+// The control: one parameter to the helper, but the CHILD reads only
+// its own locals, which is the shape a child survives.
+child_reads_local(n)
+{
+    int id;
+    int z = 0;
+    int q;
+
+    id = _fork();
+    if (id == 0) {
+        _sleep(500);               // a literal, nothing read
+        q = 100 / z;               // z is a local - reaches the divide
+        _exit();
+    }
+    return 0;
+}
+
+act_param(p) { if (p) child_reads_param(500); return 0; }
+act_local(p) { if (p) child_reads_local(1);   return 0; }
+
+main() {}
+int on_a(p) = act_five;
+int on_b(p) = act_forty;
+int on_z(p) = act_pid;
+int on_l(p) = act_param;
+int on_r(p) = act_local;

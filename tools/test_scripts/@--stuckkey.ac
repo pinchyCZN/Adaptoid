@@ -1,0 +1,18 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// REPRO FIXTURE 1 of 2 - see docs, stuck-key reproduction.
+//
+// The A button holds HID usage 0x68 (F13) for as long as it is held.
+// F13 is deliberate: it is a real key that nothing on the desktop acts
+// on, so a stranded press is visible in the debugger without a stuck
+// arrow key fighting the mouse.
+
+action_HOLD_F13(p)
+{
+    _key('f13',p);
+}
+
+main() {}
+int on_a(p) = action_HOLD_F13;

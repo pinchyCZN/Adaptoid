@@ -1,0 +1,176 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// HEX LITERAL A/B - one answer per button, Notepad focused.
+//
+// TEST4 showed the compiler emits a DIFFERENT value at every use of the
+// same literal 0xDEADBEEF - 0x02164350, 0x02164320 and 0x02165210 - and
+// those look like heap addresses rather than mangled arithmetic. The
+// driver computed the right answer for each value it was handed, so the
+// fault is in the configurator's compiler, not the interpreter.
+//
+// THE PREDICTION THIS TESTS: the trigger is a literal that does not fit
+// in a SIGNED 32-bit int. 0xDEADBEEF is 3735928559, above INT_MAX.
+// 0x7EADBEEF is 2125315823, below it, and has the SAME number of set
+// bits - only the top bit differs. So:
+//
+//   A   popcount(0x7EADBEEF)   expect 24   below INT_MAX
+//   B   popcount(0xDEADBEEF)   expect 24   above INT_MAX, printed 8
+//   Z   popcount(0x7FFFFFFF)   expect 31   INT_MAX exactly
+//   L   popcount(0x80000000)   expect  1   INT_MAX + 1, the boundary
+//   R   0x7EADBEEF printed     expect 2125315823
+//   START 0x0000BEEF printed   expect 48879   a small literal, sanity
+//
+// Note rw= is the sharpest single line: it prints the literal itself
+// with no arithmetic in the way, so a wrong value there is the compiler
+// caught in the act.
+//
+// IF A IS RIGHT AND B IS WRONG the trigger is confirmed as the signed
+// overflow. If Z is right and L is wrong, the boundary is exactly
+// INT_MAX. If even A is wrong, the size is not what matters and the
+// trigger is something else about long hex literals.
+//
+// EACH ANSWER IS ITS OWN BUTTON because the script event queue holds
+// 100 entries and drops the OLDEST on overflow - which is what ate the
+// first two lines of the TEST3 report. One short line per press cannot
+// reach that.
+
+tap_digit(v)
+{
+    if (v == 0) { _key('0',1); _key('0',0); }
+    if (v == 1) { _key('1',1); _key('1',0); }
+    if (v == 2) { _key('2',1); _key('2',0); }
+    if (v == 3) { _key('3',1); _key('3',0); }
+    if (v == 4) { _key('4',1); _key('4',0); }
+    if (v == 5) { _key('5',1); _key('5',0); }
+    if (v == 6) { _key('6',1); _key('6',0); }
+    if (v == 7) { _key('7',1); _key('7',0); }
+    if (v == 8) { _key('8',1); _key('8',0); }
+    if (v == 9) { _key('9',1); _key('9',0); }
+    return 0;
+}
+
+tap_num(n)
+{
+    int d = 1;
+
+    if (n < 0) {
+        _key('minus',1); _key('minus',0);
+        n = -n;
+    }
+    while (d <= n / 10) d = d * 10;
+    while (d > 0) {
+        tap_digit((n / d) % 10);
+        d = d / 10;
+    }
+    return 0;
+}
+
+label2(a, b)
+{
+    _key(a,1); _key(a,0);
+    _key(b,1); _key(b,0);
+    _key('equals',1); _key('equals',0);
+    return 0;
+}
+
+endline()
+{
+    _key('enter',1); _key('enter',0);
+    return 0;
+}
+
+// Plain loop: no ternary, no do-while. TEST4 proved both forms agree,
+// so the simplest one is used and the result is about the VALUE only.
+pop(v)
+{
+    int c = 0;
+    int i = 0;
+
+    while (i < 32) {
+        if ((v >> i) & 1) c = c + 1;
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---- A: below INT_MAX, same bit count as B ---------------------------
+
+act_lo(p)
+{
+    if (p) {
+        label2('l','o');
+        tap_num(pop(0x7EADBEEF));      // expect 24
+        endline();
+    }
+    return 0;
+}
+
+// ---- B: above INT_MAX ------------------------------------------------
+
+act_hi(p)
+{
+    if (p) {
+        label2('h','i');
+        tap_num(pop(0xDEADBEEF));      // expect 24, TEST4 gave 8
+        endline();
+    }
+    return 0;
+}
+
+// ---- Z: INT_MAX exactly ----------------------------------------------
+
+act_max(p)
+{
+    if (p) {
+        label2('m','x');
+        tap_num(pop(0x7FFFFFFF));      // expect 31
+        endline();
+    }
+    return 0;
+}
+
+// ---- L: INT_MAX + 1, the boundary ------------------------------------
+
+act_over(p)
+{
+    if (p) {
+        label2('o','v');
+        tap_num(pop(0x80000000));      // expect 1
+        endline();
+    }
+    return 0;
+}
+
+// ---- R: print a below-INT_MAX literal straight out -------------------
+
+act_raw(p)
+{
+    if (p) {
+        label2('r','w');
+        tap_num(0x7EADBEEF);           // expect 2125315823
+        endline();
+    }
+    return 0;
+}
+
+// ---- START: a short literal, to prove small hex is fine --------------
+
+act_small(p)
+{
+    if (p) {
+        label2('s','m');
+        tap_num(0x0000BEEF);           // expect 48879
+        endline();
+    }
+    return 0;
+}
+
+main() {}
+int on_a(p) = act_lo;
+int on_b(p) = act_hi;
+int on_z(p) = act_max;
+int on_l(p) = act_over;
+int on_r(p) = act_raw;
+int on_s(p) = act_small;

@@ -1,0 +1,262 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// STRESS TEST - press A with Notepad focused.
+//
+// Every line it types is SELF-VERIFYING: the answers are things you
+// already know, so a wrong result is visible without a debugger.
+//
+//   FIB    the Fibonacci numbers
+//   PRIME  the primes below 50
+//   SUM    1+2+...+100, which is 5050
+//   NEST   sum of i*j over 1..10 squared, which is 3025
+//   GCD    gcd(1071,462), which is 21
+//   BITS   population count of 1431655765, which is 16. DECIMAL, not
+//          hex: a 0x constant would compile to a pointer here and the
+//          line would stop being verifiable. See Defect 21.
+//   RUN    how many times you have pressed A this load
+//
+// It exercises, deliberately: nested loops, for/while/do, break and
+// continue, the ternary, compound assignment, ++ and --, division and
+// modulo, negative numbers, static storage across invocations, and a
+// call depth of four with arguments at every level.
+
+// ---- one keystroke ---------------------------------------------------
+
+tap_digit(v)
+{
+    // A chain rather than a table: there are no arrays in this language,
+    // and the chain is also what makes the script big, which is the point.
+    if (v == 0) { _key('0',1); _key('0',0); }
+    if (v == 1) { _key('1',1); _key('1',0); }
+    if (v == 2) { _key('2',1); _key('2',0); }
+    if (v == 3) { _key('3',1); _key('3',0); }
+    if (v == 4) { _key('4',1); _key('4',0); }
+    if (v == 5) { _key('5',1); _key('5',0); }
+    if (v == 6) { _key('6',1); _key('6',0); }
+    if (v == 7) { _key('7',1); _key('7',0); }
+    if (v == 8) { _key('8',1); _key('8',0); }
+    if (v == 9) { _key('9',1); _key('9',0); }
+    return 0;
+}
+
+sp()    { _key('space',1); _key('space',0); return 0; }
+nl()    { _key('enter',1); _key('enter',0); return 0; }
+eq()    { _key('equals',1); _key('equals',0); return 0; }
+
+// ---- a whole number, most significant digit first --------------------
+
+tap_num(n)
+{
+    int d = 1;
+
+    if (n < 0) {
+        _key('minus',1); _key('minus',0);
+        n = -n;
+    }
+    // Find the highest power of ten at or below n without overflowing.
+    while (d <= n / 10) d = d * 10;
+
+    while (d > 0) {
+        tap_digit((n / d) % 10);
+        d = d / 10;
+    }
+    return 0;
+}
+
+// ---- the computations ------------------------------------------------
+
+is_prime(n)
+{
+    int f = 3;
+
+    if (n < 2)      return 0;
+    if (n == 2)     return 1;
+    if (n % 2 == 0) return 0;
+
+    while (f * f <= n) {
+        if (n % f == 0) return 0;
+        f += 2;
+    }
+    return 1;
+}
+
+gcd(a, b)
+{
+    int t;
+
+    while (b != 0) {
+        t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+popcount(v)
+{
+    int c = 0;
+    int i = 0;
+
+    do {
+        // Shift into a copy so the ternary and the mask both get used.
+        c += ((v >> i) & 1) ? 1 : 0;
+        i++;
+    } while (i < 32);
+    return c;
+}
+
+// ---- the report ------------------------------------------------------
+
+line_fib()
+{
+    int a = 1;
+    int b = 1;
+    int t;
+    int i = 0;
+
+    _key('f',1); _key('f',0);
+    _key('i',1); _key('i',0);
+    _key('b',1); _key('b',0);
+    eq();
+
+    while (i < 16) {
+        tap_num(a);
+        sp();
+        t = a + b;
+        a = b;
+        b = t;
+        i++;
+    }
+    nl();
+    return 0;
+}
+
+line_prime()
+{
+    int n = 0;
+
+    _key('p',1); _key('p',0);
+    _key('r',1); _key('r',0);
+    _key('i',1); _key('i',0);
+    eq();
+
+    for (n = 2; n < 50; n++) {
+        if (!is_prime(n)) continue;
+        tap_num(n);
+        sp();
+    }
+    nl();
+    return 0;
+}
+
+line_sum()
+{
+    int s = 0;
+    int i;
+
+    _key('s',1); _key('s',0);
+    _key('u',1); _key('u',0);
+    _key('m',1); _key('m',0);
+    eq();
+
+    for (i = 1; i <= 100; i++) s += i;
+    tap_num(s);            // 5050
+    nl();
+    return 0;
+}
+
+line_nest()
+{
+    int s = 0;
+    int i;
+    int j;
+
+    _key('n',1); _key('n',0);
+    _key('e',1); _key('e',0);
+    _key('s',1); _key('s',0);
+    eq();
+
+    for (i = 1; i <= 10; i++) {
+        for (j = 1; j <= 10; j++) {
+            s += i * j;
+            if (s < 0) break;          // never taken; exercises break
+        }
+    }
+    tap_num(s);            // 3025
+    nl();
+    return 0;
+}
+
+line_gcd()
+{
+    _key('g',1); _key('g',0);
+    _key('c',1); _key('c',0);
+    _key('d',1); _key('d',0);
+    eq();
+    tap_num(gcd(1071, 462));           // 21
+    nl();
+    return 0;
+}
+
+line_bits()
+{
+    _key('b',1); _key('b',0);
+    _key('i',1); _key('i',0);
+    _key('t',1); _key('t',0);
+    eq();
+    tap_num(popcount(1431655765));     // 16
+    nl();
+    return 0;
+}
+
+line_run()
+{
+    // STATIC, so it survives across presses. If this always prints 1 the
+    // static storage class is not persisting the way the language says.
+    static int runs = 0;
+
+    runs++;
+
+    _key('r',1); _key('r',0);
+    _key('u',1); _key('u',0);
+    _key('n',1); _key('n',0);
+    eq();
+    tap_num(runs);
+    nl();
+    return 0;
+}
+
+line_neg()
+{
+    // Negative numbers, modulo of a negative, and a deeper call chain.
+    _key('n',1); _key('n',0);
+    _key('e',1); _key('e',0);
+    _key('g',1); _key('g',0);
+    eq();
+    tap_num(0 - gcd(1071, 462));       // -21
+    nl();
+    return 0;
+}
+
+action_REPORT(p)
+{
+    // Only on the press edge. Without this the whole report is typed
+    // twice, once for the press and once for the release.
+    if (p) {
+        nl();
+        line_fib();
+        line_prime();
+        line_sum();
+        line_nest();
+        line_gcd();
+        line_bits();
+        line_neg();
+        line_run();
+    }
+    return 0;
+}
+
+main() {}
+int on_a(p) = action_REPORT;
