@@ -30,6 +30,7 @@ Table of Contents
    6.  The File Plan
    6.1.  State
    6.2.  Specifications For What Remains
+   6.3.  Seams That Are Wired Only In The Harness
    7.  Installing It
    7.1.  Signing
    7.2.  Redeploying Over A Running Driver
@@ -394,6 +395,56 @@ Table of Contents
    whole of PnP and power, the USB layer, and the entire script engine -
    interpreter, scheduler, input binding and builtin library, specified in
    ../docs/script-bytecode.txt sections 5, 6 and 9.
+
+6.3.  Seams That Are Wired Only In The Harness
+
+   THESE COMPILE, PASS THEIR TESTS, AND DO NOTHING ON HARDWARE. Each is a
+   consumer written against a seam whose real provider was never supplied,
+   so harness.c installs a double, every group passes, and the driver
+   silently has no such feature. They are listed together because they
+   share that shape and because a green suite is what hides them.
+
+   +--------------------+--------------------------------------------------+
+   | Seam               | State                                            |
+   +====================+==================================================+
+   | Topology providers | ADAPTOID_TOPOLOGY.RootHub, HubPorts and PortInfo |
+   |                    | are set only at harness.c:7631. Measured NULL on |
+   |                    | a live device, so AdaptoidBuildLocationName      |
+   |                    | fails its first check and every adapter is named |
+   |                    | "?". See below.                                  |
+   | Script stick owner | core_state.script_owns_stick is READ at          |
+   |                    | core.c:426 and written only by the harness. The  |
+   |                    | _stick builtin stores into stick_x and stick_y,  |
+   |                    | but with the flag clear the next packet decode   |
+   |                    | overwrites them, so the builtin has no lasting   |
+   |                    | effect.                                          |
+   +--------------------+--------------------------------------------------+
+
+   THE DEVICE NAME IS USER VISIBLE AND COSTS MORE THAN IT LOOKS. fn 0x835
+   returns that name, and the configurator finds adapters TWICE - once
+   through the driver interface and once by walking the USB bus itself -
+   then merges the two on the device path and the port path TOGETHER
+   (../docs/configurator-architecture.txt section 5). Its own walk yields a
+   real path such as A2 while the driver answers "?", so the match fails
+   and one physical adapter appears as two entries: the working one, and a
+   second the UI marks with a red X as "present but not claimed".
+
+   Implementing the providers means, from wdm.c and at PASSIVE_LEVEL,
+   opening \??\HCD0 through HCD9 and issuing the same hub IOCTLs the
+   configurator uses - GET_ROOT_HUB_NAME, GET_NODE_INFORMATION,
+   GET_NODE_CONNECTION_INFORMATION and GET_NODE_CONNECTION_NAME - each of
+   which is a two-call query-size-then-fetch against a variable-length
+   reply. The consumer, AdaptoidBuildLocationName and FindOnHub, is already
+   written, already bounds its recursion and already has tests; only the
+   three providers and a synchronous-IOCTL helper are missing.
+
+   WEIGH IT AGAINST IoGetDeviceProperty FIRST. A minidriver reaching
+   sideways to open host controller objects is unusual - user mode is the
+   normal place for that walk, which is where the configurator does it -
+   and DevicePropertyLocationInformation gives a port path with none of
+   that machinery. It yields a DIFFERENT string, though, and the merge
+   above needs the configurator's own format, so the cheaper route may not
+   actually buy the fix.
 
 7.  Installing It
 
