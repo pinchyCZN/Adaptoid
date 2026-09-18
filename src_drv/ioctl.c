@@ -334,15 +334,36 @@ static u32 ioc_script_load(core_ioctl_env *env, const core_ioctl *r, u32 *info)
 
 	/*
 	 * THE LENGTH IS AN EXACT EQUALITY, not a minimum, so the bytecode copy
-	 * cannot over-read the input buffer. Computed in u32 and compared
-	 * against the declared count so that a count large enough to overflow
-	 * the multiply cannot match a small buffer.
+	 * can neither over-read the input buffer nor under-fill the allocation.
 	 */
 	if (code_count < 0) {
 		return CORE_ST_INVALID_PARAM;
 	}
+
+	/*
+	 * THE MULTIPLY IS CHECKED BEFORE IT IS PERFORMED, and the equality
+	 * below is NOT a substitute for this.
+	 *
+	 * A count of 0x40000001 times four is 0x100000004, which truncates to
+	 * 4; need becomes 12 and matches a twelve-byte request exactly. The
+	 * length test passes, the allocation is four bytes, and the copy then
+	 * writes 0x40000001 words into it - a kernel pool overflow with
+	 * caller-controlled length, reachable by anyone who can open the
+	 * device.
+	 *
+	 * IT LOOKED GUARDED FOR A LONG TIME WITHOUT BEING GUARDED. A "need < 8"
+	 * test catches only a product that wraps to nearly zero, not this, and
+	 * what actually rejected it was an unrelated ceiling on script size
+	 * imposed by a staging array. Removing that array - a change about
+	 * where bytes are copied, which touched nothing here - took the guard
+	 * with it. Hence the explicit test: the bound belongs to the multiply,
+	 * not to a buffer that may not always exist.
+	 */
+	if ((u32)code_count > (0xFFFFFFFFu - 8u) / 4u) {
+		return CORE_ST_INVALID_PARAM;
+	}
 	need = (u32)code_count * 4u + 8u;
-	if (need < 8u || need != r->in_len) {
+	if (need != r->in_len) {
 		return CORE_ST_INVALID_PARAM;
 	}
 
@@ -384,19 +405,31 @@ static u32 ioc_script_load(core_ioctl_env *env, const core_ioctl *r, u32 *info)
 	 * mode actually transferred, the same way the original's is.
 	 */
 	/*
-	 * THE RETURN VALUE IS DISCARDED, which is the original's behaviour and
-	 * is preserved here rather than improved: drv_ScriptLoad returns void,
-	 * so fn 0x83C answers success whether or not the allocation succeeded.
-	 * A caller is told its script loaded when the device in fact has none.
+	 * A FAILED LOAD IS REPORTED, and this is a deliberate divergence.
+	 * drv_ScriptLoad returns void, so fn 0x83C answers success whether or
+	 * not the allocation succeeded and the caller is told its script
+	 * loaded when the device in fact has none. That is the same shape as
+	 * Defect 18 in ../docs/known-defects.txt - a path reporting success
+	 * for work it did not do - and it leaves a user watching a profile the
+	 * UI calls active while the controller keeps the previous mapping.
 	 *
-	 * That is worth revisiting - it is the same shape as Defect 18 in
-	 * ../docs/known-defects.txt, a path that reports success for work it
-	 * did not do - but it is a behaviour change on a published IOCTL and
-	 * belongs in its own decision, not in a refactor of where the bytes
-	 * are copied.
+	 * ONE STATUS IS EXACT HERE RATHER THAN A SIMPLIFICATION. Every failure
+	 * core_sched_load_le can return to this caller is an allocation
+	 * failure: its two argument checks are unreachable from here, because
+	 * a null sched, a negative count and the zero-count unload have all
+	 * been handled above. Naming which of the three allocations failed
+	 * would tell a caller nothing it could act on.
+	 *
+	 * THE STATUS DOES NOT LIE ABOUT THE DEVICE EITHER. Every failure path
+	 * in sched_load_body leaves the scheduler unloaded rather than half
+	 * built, so "the load failed" and "no script is loaded" agree -
+	 * measured on the live driver by failing the code allocation from the
+	 * debugger and reading back a null vm.code with a zero count.
 	 */
-	(void)core_sched_load_le(env->sched, r->in + 8, code_count, var_count,
-	                         env->now_100ns);
+	if (!core_sched_load_le(env->sched, r->in + 8, code_count, var_count,
+	                        env->now_100ns)) {
+		return CORE_ST_NO_MEMORY;
+	}
 	*info = 0;
 	return CORE_ST_SUCCESS;
 }

@@ -4622,6 +4622,65 @@ static int test_ioctl(void)
 		sched_expect(st == CORE_ST_SUCCESS && sch.vm.code == 0,
 		             "count 0 unloads", sch.vm.code != 0, 0, &bad);
 
+		/*
+		 * A FAILED LOAD IS REPORTED, not swallowed.
+		 *
+		 * The original cannot: drv_ScriptLoad returns void, so fn 0x83C
+		 * answers success whether or not the allocation succeeded and
+		 * the caller is told its script loaded when the device has none.
+		 * Measured on the live driver by failing the code allocation
+		 * from a debugger - the configurator reported nothing at all and
+		 * went on showing the profile as active while the controller
+		 * kept the previous mapping.
+		 *
+		 * EVERY ALLOCATION IN THE LOAD IS FAILED IN TURN, because the
+		 * three sites do not share an unwind: the first has nothing to
+		 * release, the second must free the code array, and the third
+		 * unloads what the first two built. All three must reach user
+		 * mode as the same status and leave the scheduler EMPTY rather
+		 * than half built - a status that said "failed" over a
+		 * half-loaded script would be worse than the silence it
+		 * replaces.
+		 */
+		{
+			int site;
+
+			for (site = 1; site <= 3; site++) {
+				wr32_test(g_ioc_in + 0, 1);
+				wr32_test(g_ioc_in + 4, 4);
+				wr32_test(g_ioc_in + 8, 0x082);
+
+				g_sched_fail_in = site;
+				st = ioc_call(&env, CORE_IOC_SCRIPT_LOAD, 12, 0, &info);
+				g_sched_fail_in = 0;
+
+				sched_expect(st == CORE_ST_NO_MEMORY,
+				             "a failed allocation is reported",
+				             (long)site, (long)site, &bad);
+				if (st != CORE_ST_NO_MEMORY) {
+					hlog("        (allocation %d gave 0x%08lX)\n",
+					     site, (unsigned long)st);
+				}
+				sched_expect(sch.vm.code == 0,
+				             "and leaves no script behind",
+				             sch.vm.code != 0, 0, &bad);
+				sched_expect(sch.vm.code_count == 0,
+				             "with a zero count",
+				             sch.vm.code_count, 0, &bad);
+			}
+
+			/* And the device still works afterwards. */
+			wr32_test(g_ioc_in + 0, 1);
+			wr32_test(g_ioc_in + 4, 4);
+			wr32_test(g_ioc_in + 8, 0x082);
+			st = ioc_call(&env, CORE_IOC_SCRIPT_LOAD, 12, 0, &info);
+			sched_expect(st == CORE_ST_SUCCESS,
+			             "and a later load still succeeds", (long)st, 0,
+			             &bad);
+			sched_expect(sch.vm.code_count == 1, "installing the script",
+			             sch.vm.code_count, 1, &bad);
+		}
+
 		/* the fault drain with nothing to drain */
 		st = ioc_call(&env, CORE_IOC_SCRIPT_FAULT, 0, 64, &info);
 		sched_expect(st == CORE_ST_SUCCESS && info == 0,

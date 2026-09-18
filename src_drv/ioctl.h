@@ -61,6 +61,13 @@
 #define CORE_ST_BUFFER_TOO_SMALL 0xC0000023u
 #define CORE_ST_DEVICE_NOT_READY_A3 0xC00000A3u
 
+/*
+ * STATUS_INSUFFICIENT_RESOURCES. NOT A CODE THE ORIGINAL CAN RETURN -
+ * drv_ScriptLoad is void, so fn 0x83C answers success whether or not the
+ * allocation succeeded. See ioc_script_load for why that is diverged from.
+ */
+#define CORE_ST_NO_MEMORY       0xC000009Au
+
 /* Counter selectors for CORE_IOC_READ_COUNTER and CORE_IOC_ZERO_COUNTER. */
 #define CORE_COUNTER_FIRMWARE   1   /* bcdDevice; read only            */
 #define CORE_COUNTER_TWO        2
