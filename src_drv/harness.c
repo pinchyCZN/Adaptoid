@@ -4787,6 +4787,34 @@ static int test_ioctl(void)
 		sched_expect(g_sched_live == live_before - 2,
 		             "BOTH blocks were released",
 		             live_before - g_sched_live, 2, &bad);
+
+		/*
+		 * A SNAPSHOT WITH NO THREAD IS STILL RELEASED. The original
+		 * returns early here without freeing it, which is the leak half
+		 * of Defect 13 - seen firing on hardware as faults that logged
+		 * "script faulted" with no crash data behind them.
+		 *
+		 * NOTHING HERE COVERS THE USE-AFTER-FREE half of that defect.
+		 * That one needs a fault to arrive while a drain is copying,
+		 * which is two threads, and this harness has one. See
+		 * ../src_drv/README.txt section 6.3.
+		 */
+		live_before      = g_sched_live;
+		sch.fault_vars   = (u32 *)sched_test_alloc(0, 16);
+		sch.fault_thread = 0;
+		sched_expect(g_sched_live == live_before + 1, "a stray snapshot",
+		             g_sched_live - live_before, 1, &bad);
+
+		st = ioc_call(&env, CORE_IOC_SCRIPT_FAULT, 0, 512, &info);
+		sched_expect(st == CORE_ST_SUCCESS,
+		             "draining a thread-less snapshot succeeds",
+		             (long)st, 0, &bad);
+		sched_expect(g_sched_live == live_before,
+		             "and releases it rather than orphaning it",
+		             g_sched_live - live_before, 0, &bad);
+		sched_expect(sch.fault_vars == 0, "leaving the slot empty",
+		             sch.fault_vars != 0, 0, &bad);
+
 		core_sched_unload(&sch);
 		sched_expect(g_sched_live == 0, "all memory returned",
 		             g_sched_live, 0, &bad);
