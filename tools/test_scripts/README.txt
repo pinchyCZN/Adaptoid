@@ -36,6 +36,39 @@ Table of Contents
 
 1. Two Constraints That Shaped Every Script
 
+   SCRIPTS MUST USE CRLF LINE ENDINGS. An LF-only script HANGS THE
+   CONFIGURATOR - the window greys out, the process spins at 100% CPU, and it
+   must be killed. It is not recoverable by restarting: the last-loaded script
+   is stored and re-opened on launch, so it hangs again immediately. Recover by
+   fixing the file's line endings before reopening.
+
+   THIS IS A TRAP BECAUSE NOTHING ABOUT THE SYMPTOM POINTS AT LINE ENDINGS, and
+   the obvious theories all have working counter-examples. The file is opened
+   in text mode, so the CRT translates CRLF to LF and the scanner sees the SAME
+   character stream either way - an LF file is not read as one long line, and
+   the comment text is not what matters. What differs is byte offsets:
+   cfg_ScriptHandlerScan drives its loop on crt_ftell positions, which report
+   where a match ended ON DISK, while the scan itself proceeds by character.
+   With CRLF a line boundary costs two bytes and one character; with LF it
+   costs one of each.
+
+   Every script the original author shipped is CRLF, so the arithmetic was
+   never exercised the other way. A script written with a Unix tool - a bash
+   heredoc, a redirect, anything that emits bare LF - produces a file that
+   looks correct in every editor and wedges the application on sight.
+
+   Hunting this by bisecting the comment block wastes a great deal of time and
+   CONVERGES ON A FALSE ANSWER, because a generator that rewrites the file
+   preserves its line endings: every variant stays LF and every variant hangs,
+   which reads as "the header is the problem". The two variants that appear to
+   pass only do so because their headers stop at the tag block. Check line
+   endings FIRST, against a script that works:
+
+       file @--faultcrash.ac @--yourscript.ac
+
+   which prints "with CRLF line terminators" for a good one and says
+   nothing about terminators for a bad one.
+
    NO HEXADECIMAL LITERALS. The configurator's compiler emits a POINTER instead
    of the value for any 0x constant - see ../../docs/ known-defects.txt Defect
    21. Decimal is unaffected. A test written with hex measures nothing.

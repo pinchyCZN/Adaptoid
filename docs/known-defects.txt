@@ -87,7 +87,8 @@ Table of Contents
    21. Defect 19: A Notification Wait Returns A Status It Has Forfeited
    22. Defect 20: The Control Device's Power IRP Stalls The Power Queue
    23. Defect 21: Hexadecimal Literals Compile To A Pointer
-   24. What Is Not Affected
+   24. Defect 22: An LF-Only Script Hangs The Configurator
+   25. What Is Not Affected
 
 1.  Severity Summary
 
@@ -1187,7 +1188,62 @@ Table of Contents
    sees it, and the harness computes the correct answer for every value
    it is given, including the ones the compiler substituted.
 
-24. What Is Not Affected
+24. Defect 22: An LF-Only Script Hangs The Configurator
+
+   Location:  wishd201.exe, cfg_ScriptHandlerScan at 00402bf0, whose
+              enumeration loop advances on offsets produced by
+              cfg_ScriptTemplateSearch at 004037d0.
+
+   A .ac script whose lines end in LF rather than CRLF hangs the
+   configurator the moment it is selected. The window greys out, the
+   process spins at 100% CPU on its UI thread, and it has to be killed.
+
+   IT DOES NOT RECOVER ON RESTART. The last-loaded script is stored and
+   reopened on launch, so a relaunched configurator hangs again before it
+   draws. The only way out is to fix the file's line endings, or remove
+   it, before reopening.
+
+   Trigger:  any script with bare LF endings AND a comment block beyond
+   the header tag block. An LF file whose comments stop at the tags loads
+   normally, which is what makes the trigger easy to misread.
+
+   Would a user notice:  yes, immediately and unrecoverably. Every script
+   shipped with the product is CRLF, so it does not arise in normal use -
+   it arises the moment a script is produced by a tool that writes bare
+   LF, which is most non-Windows tooling.
+
+   THE FILE IS NOT READ AS ONE LONG LINE, which is the obvious guess and
+   is wrong. cfg_ScriptOpen passes "r" to crt_fopen, so the stream is in
+   TEXT mode: the CRT translates CRLF to LF on the way in and the scanner
+   sees an identical character stream either way. Line structure is
+   preserved and the comment text is irrelevant.
+
+   What differs is byte offsets. cfg_ScriptTemplateSearch scans by
+   character through crt_filbuf but records match positions with
+   crt_ftell, which reports where the match ended ON DISK, and rewinds
+   with crt_fseek. With CRLF a line boundary costs two bytes on disk and
+   one character in the stream; with LF it costs one of each, so the same
+   logical position carries a different number.
+
+   cfg_ScriptHandlerScan then drives its loop entirely on those numbers,
+   using each match's end offset as the next search's start offset, with
+   NO GUARD THAT THE OFFSET STRICTLY INCREASES - no comparison against
+   the previous value, no forced minimum advance. A loop whose only
+   progress guarantee is arithmetic mixing two different units is what
+   makes the hang possible.
+
+   INFERENCE, NOT MEASUREMENT, for the last step: that the offsets
+   specifically fail to advance has not been observed under a debugger.
+   What is established is that line endings are decisive - the same
+   script with a 2722-byte comment header loads correctly as CRLF and
+   hangs as LF, with the code byte-identical - and that the loop above
+   has no monotonicity check.
+
+   In the replacement:  not applicable; this is configurator behaviour.
+   A reimplementation should scan and seek in one unit, and refuse to
+   advance a scan loop by a computed offset without checking it moved.
+
+25. What Is Not Affected
 
    It is worth stating plainly which paths were examined and found free
    of these defects, because the practical reliability of the original
