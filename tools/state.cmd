@@ -6,7 +6,7 @@ rem Read only. Answers "did my build even land" in one step.
 rem
 rem     state.cmd [output-file]
 rem
-rem Default writes to B:\adaptoid-state.txt so the host can read it.
+rem With no argument it writes adaptoid-state.txt BESIDE THIS SCRIPT.
 rem
 rem THERE IS NO TEST HERE FOR \\.\Wish_NA1, deliberately. cmd's "if exist"
 rem does not work on device paths: it reports ABSENT for a control device
@@ -16,32 +16,29 @@ rem to open the device, so run pakread.exe - it prints whether the open
 rem succeeded before it does anything else.
 rem ----------------------------------------------------------------------
 
-rem     state.cmd [output-file]
+rem ONE DESTINATION, WRITTEN DIRECTLY. %~dp0 is this script's own folder
+rem and ALREADY ENDS IN A BACKSLASH, so %~dp0adaptoid-state.txt needs no
+rem separator of its own. Run from a share and the report lands in the
+rem same folder the other side reads.
 rem
-rem Give it any path you like; that path is used verbatim and nothing is
-rem copied anywhere. With no argument it writes locally and then tries to
-rem copy onto the share.
-rem
-rem THE SHARE IS NOT THE SAME LETTER ON BOTH SIDES. The host's B: appears
-rem inside this guest as Z:, so a default of B: writes nowhere. Z: is
-rem tried first and B: second, and neither existing is not an error - the
-rem local copy is still written.
-rem
-rem WRITE LOCALLY FIRST, COPY AFTER. A VirtualBox shared folder is
-rem read-only unless it was explicitly made writable, and redirecting
-rem straight onto a read-only share fails EVERY line in this script with
-rem "The system cannot find the path specified" - dozens of identical
-rem errors that look like the registry queries failing rather than the
-rem output file.
+rem A READ-ONLY DESTINATION FAILS LOUDLY HERE RATHER THAN QUIETLY BELOW.
+rem A VirtualBox shared folder is read-only unless it was explicitly made
+rem writable, and redirecting onto one fails EVERY line in this script
+rem with "The system cannot find the path specified" - dozens of identical
+rem errors that read as the registry queries failing rather than as the
+rem output file never having been created. One probe up front turns that
+rem into a single sentence naming the real problem.
 set "OUT=%~1"
-set "SHARE="
-if "%OUT%"=="" (
-    set "OUT=%TEMP%\adaptoid-state.txt"
-    if exist "Z:\" (
-        set "SHARE=Z:\adaptoid-state.txt"
-    ) else (
-        if exist "B:\" set "SHARE=B:\adaptoid-state.txt"
-    )
+if "%OUT%"=="" set "OUT=%~dp0adaptoid-state.txt"
+
+break > "%OUT%" 2>nul
+if not exist "%OUT%" (
+    echo   Cannot write %OUT%
+    echo.
+    echo   That folder is read-only. Either make it writable, or give
+    echo   this script a path that is not:
+    echo       state.cmd %%TEMP%%\adaptoid-state.txt
+    exit /b 1
 )
 
 echo Adaptoid install state > "%OUT%"
@@ -126,16 +123,5 @@ findstr /i /c:"    Service    REG_SZ" "%OUT%"
 findstr /i /c:"HID\VID_06F7" "%OUT%"
 echo.
 
-if defined SHARE (
-    copy /y "%OUT%" "%SHARE%" >nul 2>&1
-    if errorlevel 1 (
-        echo   Could not write %SHARE% - the share is read-only.
-        echo   Full report is at %OUT% on this machine.
-        echo   To fix: VM Settings, Shared Folders, clear Read-only.
-    ) else (
-        echo   Full report copied to %SHARE%
-    )
-) else (
-    echo   Full report at %OUT%
-)
+echo   Full report at %OUT%
 endlocal

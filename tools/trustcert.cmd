@@ -32,12 +32,6 @@ rem ----------------------------------------------------------------------
 
 set "CER=%~1"
 if "%CER%"=="" (
-    if exist "Z:\adaptoid-test.cer" set "CER=Z:\adaptoid-test.cer"
-)
-if "%CER%"=="" (
-    if exist "B:\adaptoid-test.cer" set "CER=B:\adaptoid-test.cer"
-)
-if "%CER%"=="" (
     if exist "%~dp0adaptoid-test.cer" set "CER=%~dp0adaptoid-test.cer"
 )
 
