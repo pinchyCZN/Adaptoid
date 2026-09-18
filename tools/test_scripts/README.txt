@@ -7,7 +7,7 @@ tools/test_scripts                          Adaptoid script source
 
 Abstract
 
-   Eight .ac scripts for the Adaptoid configurator, each covering one area.
+   Nine .ac scripts for the Adaptoid configurator, each covering one area.
    They
    are the consolidation of eleven throwaway scripts; the originals are on the
    VM share under scripts/ and are not worth keeping.
@@ -147,6 +147,12 @@ Table of Contents
    |                  | fault path past what a client can drain.          |
    |                  | Passes when events_dropped stays ZERO and the     |
    |                  | driver stays up, however hard it is driven.       |
+   | @--reload.ac     | The THIRD claim on the fault slot: a script       |
+   |                  | load landing while a fault is in flight.          |
+   |                  | Faults are delayed 3 or 6 seconds so there is     |
+   |                  | a window to switch scripts in. Also forking       |
+   |                  | from inside a call chain, and eight threads       |
+   |                  | driving the HID report path at once.              |
    | @--stuckkey.ac   | Holds a key for as long as a button is held.      |
    |                  | Switch script while the button is down and the    |
    |                  | key is stranded - the driver keeps it pressed     |

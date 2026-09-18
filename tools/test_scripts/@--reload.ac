@@ -1,0 +1,182 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// THE THIRD OWNER OF THE FAULT SLOT, plus two thread stresses.
+//
+// The post-mortem slot has three claims on it, not two: the scheduler
+// fills it from a DPC, the client empties it from an IOCTL, and a
+// SCRIPT LOAD drops whatever is in it. The first two are reached by any
+// faulting script. The third needs a script load to land while a fault
+// is in flight, which nothing has ever managed - the storms that made
+// faults plentiful also crashed the machine in microseconds, leaving no
+// window to click in.
+//
+// These faults are DELAYED so there is a window. Press the button, then
+// switch to another script while the faults are arriving.
+//
+//   A   8 faults, all at 3 seconds     switch scripts as they land
+//   B   8 faults, all at 6 seconds     more time to click
+//   Z   ONE fault at 3 seconds         control, nothing to race
+//   L   fork from deep recursion       a child inheriting a deep stack
+//   R   8 threads typing at once       concurrent HID output
+//
+// THE SLEEP IS A LITERAL AND THE HELPER TAKES ONE PARAMETER. A forked
+// child that reads a PARAMETER is refused its own locals and faults
+// instantly with status 2 - that is Defect 7, and it destroys the delay
+// this test depends on. One parameter and literal sleeps is the shape a
+// child survives.
+//
+// HOW TO RUN A AND B
+//
+//   1. Debugging Log open - the drain only runs when the client is
+//      listening, and all three owners have to be active at once.
+//   2. Re-select this script first. A stale thread count silently forks
+//      nothing; if no fault lines appear at all, that is what happened.
+//   3. Press B, then open the script dropdown immediately.
+//   4. About six seconds later the faults arrive together. Switch to
+//      another script AS THEY APPEAR.
+//
+// WHAT EACH OUTCOME MEANS
+//
+//   no crash, faults logged   the lock serialises all three owners
+//   bugcheck in ioc_script_fault or core_sched_unload
+//                             the guard is incomplete
+//   nothing in the log        the forks did not happen - reload and
+//                             retry rather than reading it as a pass
+//
+// L AND R ARE SEPARATE QUESTIONS. L forks from inside a call chain, so
+// the child inherits a deep stack - the shape Defect 7 got wrong in the
+// original. R has eight threads emitting key events at once, which is
+// the only concurrent use of the HID report path a script can create.
+//
+// Decimal only: hex literals compile to a pointer here, Defect 21.
+
+storm3(n)
+{
+    int i = 0;
+    int id;
+    int z = 0;
+    int q;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            _sleep(3000);
+            q = 100 / z;
+            _exit();
+        }
+        if (id < 0) return i;
+        i = i + 1;
+    }
+    return n;
+}
+
+storm6(n)
+{
+    int i = 0;
+    int id;
+    int z = 0;
+    int q;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            _sleep(6000);
+            q = 100 / z;
+            _exit();
+        }
+        if (id < 0) return i;
+        i = i + 1;
+    }
+    return n;
+}
+
+act_fast(p)
+{
+    if (p) storm3(8);
+    return 0;
+}
+
+act_slow(p)
+{
+    if (p) storm6(8);
+    return 0;
+}
+
+act_one(p)
+{
+    int z = 0;
+    int q;
+
+    if (p) {
+        _sleep(3000);
+        q = 100 / z;
+    }
+    return 0;
+}
+
+// ---- L: fork from inside a call chain --------------------------------
+//
+// 40 frames is comfortably inside the 200-word clamp, so the recursion
+// itself must not fault. The child is forked at that depth and then
+// simply exits. A fault here is about the fork, not the depth.
+
+deepfork(n)
+{
+    int id;
+
+    if (n > 0) return deepfork(n - 1);
+
+    id = _fork();
+    if (id == 0) {
+        _sleep(1);
+        _exit();
+    }
+    return id;
+}
+
+act_deepfork(p)
+{
+    int i = 0;
+
+    if (p) {
+        while (i < 6) {
+            deepfork(40);
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// ---- R: concurrent HID output ----------------------------------------
+//
+// Eight threads typing at the same time. Well inside the 100-entry event
+// queue, so events_dropped must stay at zero; what is being stressed is
+// the report path being driven from several threads in one pass.
+
+act_typers(p)
+{
+    int i = 0;
+    int id;
+
+    if (p) {
+        while (i < 8) {
+            id = _fork();
+            if (id == 0) {
+                _key('x',1); _key('x',0);
+                _exit();
+            }
+            if (id < 0) return i;
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+main() {}
+int on_a(p) = act_fast;
+int on_b(p) = act_slow;
+int on_z(p) = act_one;
+int on_l(p) = act_deepfork;
+int on_r(p) = act_typers;

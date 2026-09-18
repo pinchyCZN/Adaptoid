@@ -30,6 +30,7 @@ Table of Contents
    6.  The File Plan
    6.1.  State
    6.2.  Specifications For What Remains
+   6.2.1.  The Post-Mortem Dump Is Still A 32-Bit Layout
    6.3.  Seams That Are Wired Only In The Harness
    7.  Installing It
    7.1.  Signing
@@ -395,6 +396,41 @@ Table of Contents
    whole of PnP and power, the USB layer, and the entire script engine -
    interpreter, scheduler, input binding and builtin library, specified in
    ../docs/script-bytecode.txt sections 5, 6 and 9.
+
+6.2.1.  The Post-Mortem Dump Is Still A 32-Bit Layout
+
+   KNOWN AND NOT FIXED. The fault dump that fn 0x83d returns is the thread
+   node copied out verbatim, and the client parses it at the offsets the
+   ORIGINAL's node had. That node was 32-bit: two 4-byte list pointers,
+   then thread_id at +0x08 and pc at +0x0C. This one carries 8-byte
+   pointers, so everything past them sits eight bytes later and every
+   labelled field in the client is reading its neighbour:
+
+   +--------------+--------+----------------------------------------+
+   | Client shows | Reads  | Actually gets                          |
+   +==============+========+========================================+
+   | pid          | +0x08  | the low half of blink                  |
+   | ip           | +0x0C  | the high half of blink                 |
+   | a            | +0x10  | thread_id                              |
+   | sp           | +0x14  | pc - the real faulting instruction     |
+   +--------------+--------+----------------------------------------+
+
+   Measured: a divide fault reported pid 0, ip 0, a 22, sp 806, against a
+   script of 1340 opcodes with thread ids running to 21. "a" and "sp" are
+   the thread id and the program counter; pid and ip are the zeroed list
+   links.
+
+   IT ALSO PUTS KERNEL POINTERS IN A USER BUFFER. flink, blink and the
+   stack pointer are all copied, and their high halves are visible in the
+   client's own display - every dump shows the ffff8a08 prefix of this
+   machine's kernel addresses.
+
+   The fix is not to pad the struct. It is to BUILD AN EXPLICIT 32-BIT
+   RECORD at the drain rather than copying the live node, which settles
+   the field offsets and the pointer disclosure together, because such a
+   record would hold no pointers at all. That changes the shape
+   ioc_script_fault writes, so it is a deliberate change to the contract
+   rather than a repair, and it has not been made.
 
 6.3.  Seams That Are Wired Only In The Harness
 
