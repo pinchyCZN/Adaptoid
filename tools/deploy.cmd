@@ -66,7 +66,7 @@ if not errorlevel 1 (
     echo   else holds a handle.
     echo.
     echo   To deploy anyway, knowing it may not take effect:
-    echo       deploy.cmd "%PKG%" force
+    echo       deploy.cmd "!PKG!" force
     echo.
     if /i not "%~2"=="force" exit /b 1
     echo   FORCED. Verify the load address actually changed afterwards.
@@ -90,8 +90,16 @@ rem Section 7.2 of ..\src_drv\README.txt has the detail.
 set "WASRESIDENT="
 sc query wishk300 2>nul | find /i "RUNNING" >nul
 if not errorlevel 1 set "WASRESIDENT=1"
+rem USE !VAR! INSIDE A BLOCK, NOT %VAR%. cmd expands %VAR% while it
+rem PARSES the whole parenthesised block, before running any of it, so a
+rem value containing a closing paren ends the block early and the rest of
+rem the path becomes a stray token. Installed under "C:\Program Files
+rem (x86)\Adaptoid\win64" that failed with "\Adaptoid\win64\pkg was
+rem unexpected at this time" - and it failed even though the condition was
+rem FALSE, because parsing happens first. Quoting works too, and is why
+rem the if below is fine; !PKG! keeps quotes out of the message.
 if not exist "%PKG%\%INFNAME%" (
-    echo   No %INFNAME% in %PKG%
+    echo   No !INFNAME! in !PKG!
     echo   Run tools\package.cmd on the host first.
     exit /b 1
 )
