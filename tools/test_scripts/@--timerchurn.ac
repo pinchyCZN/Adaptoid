@@ -1,0 +1,115 @@
+// Adaptoid Script
+
+// driver_version = 2.0.0
+
+// TIMER CHURN - keep the scheduler arming continuously so the rug can be
+// pulled out from under it.
+//
+// The timer is re-armed at the END of every scheduler pass that leaves a
+// thread on the ready list. To catch teardown racing that re-arm, the
+// ready list must never be empty for the whole window you need to reach
+// the unplug. These handlers fork threads that do nothing but sleep for
+// the shortest interval the language offers, over and over, so a pass
+// runs and re-arms on every clock tick for seconds on end.
+//
+//   A   25 threads, about 5 seconds of continuous arming
+//   B   25 threads, about 20 seconds - use this one, it is hard to
+//       unplug a VM inside five
+//   Z   one thread, about 5 seconds  - control, minimal churn
+//
+// HOW TO RUN IT
+//
+//   1. Your own debugger attached at a CONSOLE, not through the bridge -
+//      output is buffered otherwise and looks like nothing happened. See
+//      ../../docs/kernel-debugging.txt section 5.2.
+//   2. Press B. Every clock tick from then on is a pass and a re-arm.
+//   3. UNPLUG THE ADAPTER while it is still churning. Replug, repeat.
+//
+// WHAT YOU ARE WATCHING FOR
+//
+//   ADAPTOID-ARM stop    the ordinary teardown path, one per unplug that
+//                        had a script loaded. Expected, not the target.
+//   ADAPTOID-ARM RACE    a pass re-arming AFTER teardown began. THE
+//                        TARGET. The machine halts immediately after it,
+//                        on a breakpoint compiled into that branch.
+//
+// ON A UNIPROCESSOR THIS MAY BE UNREACHABLE. Teardown runs at
+// PASSIVE_LEVEL and the pass at DISPATCH_LEVEL, so with one CPU the two
+// cannot overlap - only a DPC already QUEUED when teardown starts can
+// reach it, and that gap is microseconds. Give the VM several CPUs and
+// the window becomes the whole of a pass instead.
+//
+// _sleep(1) does not mean one millisecond. It means "the next tick",
+// which is about 15 ms by default, so the counts below are ticks rather
+// than milliseconds and the durations are approximate.
+//
+// Decimal only: hex literals compile to a pointer here, Defect 21.
+
+churn(n, ticks)
+{
+    int i = 0;
+    int id;
+    int k;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            // CHILD. Locals only, never a parameter - a forked child
+            // reading a parameter faults at once (Defect 7).
+            k = 0;
+            while (k < 320) {
+                _sleep(1);
+                k = k + 1;
+            }
+            _exit();
+        }
+        if (id < 0) return i;        // _fork refused, thirty are live
+        i = i + 1;
+    }
+    return n;
+}
+
+churn_long(n)
+{
+    int i = 0;
+    int id;
+    int k;
+
+    while (i < n) {
+        id = _fork();
+        if (id == 0) {
+            k = 0;
+            while (k < 1300) {
+                _sleep(1);
+                k = k + 1;
+            }
+            _exit();
+        }
+        if (id < 0) return i;
+        i = i + 1;
+    }
+    return n;
+}
+
+act_short(p)
+{
+    if (p) churn(25, 0);
+    return 0;
+}
+
+act_long(p)
+{
+    if (p) churn_long(25);
+    return 0;
+}
+
+act_one(p)
+{
+    if (p) churn(1, 0);
+    return 0;
+}
+
+main() {}
+int on_a(p) = act_short;
+int on_b(p) = act_long;
+int on_z(p) = act_one;
