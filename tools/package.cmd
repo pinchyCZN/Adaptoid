@@ -92,7 +92,7 @@ if exist "%DEST%" rmdir /s /q "%DEST%"
 mkdir "%DEST%" 2>nul
 copy /y "%PKG%\*" "%DEST%\" >nul
 if errorlevel 1 (
-    echo   could not stage to %DEST%
+    echo   could not stage to !DEST!
     exit /b 1
 )
 

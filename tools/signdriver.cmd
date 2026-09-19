@@ -40,9 +40,9 @@ if not exist "%PFX%" (
     exit /b 1
 )
 if not exist "%OUTDIR%\wishk300.sys" (
-    echo   No driver at %OUTDIR%\wishk300.sys
+    echo   No driver at !OUTDIR!\wishk300.sys
     echo   Build it first:
-    echo     msbuild src_drv\adaptoid.sln /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+    echo     msbuild src_drv\adaptoid.sln /p:Configuration=!CONFIG! /p:Platform=!PLATFORM!
     exit /b 1
 )
 
@@ -109,7 +109,7 @@ if not exist "%PKG%\adaptoid.cat" (
     echo   above; the message names the INF directive at fault. Common
     echo   causes: DriverVer missing, in the wrong format, or dated in the
     echo   future; a CatalogFile name that does not match; or a file the
-    echo   INF references not being present in %PKG%.
+    echo   INF references not being present in !PKG!.
     echo   The .sys is still signed, but the package is NOT installable.
     exit /b 1
 )

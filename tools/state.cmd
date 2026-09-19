@@ -31,9 +31,15 @@ rem into a single sentence naming the real problem.
 set "OUT=%~1"
 if "%OUT%"=="" set "OUT=%~dp0adaptoid-state.txt"
 
+rem QUOTE A PATH INSIDE A BLOCK. cmd expands %VAR% while it PARSES the
+rem whole parenthesised block, before running any of it, so a value
+rem holding a closing paren ends the block early and the rest becomes a
+rem stray token. Under "C:\Program Files (x86)\Adaptoid\win64" that is
+rem "\Adaptoid\win64\... was unexpected at this time", and it happens
+rem even when the condition is FALSE, because parsing comes first.
 break > "%OUT%" 2>nul
 if not exist "%OUT%" (
-    echo   Cannot write %OUT%
+    echo   Cannot write "%OUT%"
     echo.
     echo   That folder is read-only. Either make it writable, or give
     echo   this script a path that is not:

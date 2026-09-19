@@ -29,7 +29,7 @@ if not exist "%OUT%" mkdir "%OUT%" >nul 2>&1
 if exist "%OUT%\adaptoid-test.pfx" (
     echo.
     echo   A certificate already exists:
-    echo     %OUT%\adaptoid-test.pfx
+    echo     !OUT!\adaptoid-test.pfx
     echo.
     echo   Delete it first if you really want a new one. Replacing it means
     echo   re-installing the .cer on every test machine that trusts it.
